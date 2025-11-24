@@ -1,0 +1,6 @@
+# ESP32S3 with large littlefs
+# Name, Type, SubType, Offset, Size, Flags
+nvs,      data, nvs,     0x9000,  0x4000,
+otadata,  data, ota,     0xd000,  0x2000,
+app,      app,  factory, 0x10000, 0x200000,
+spiffs,   data, spiffs,  0x210000,0x5f0000,
