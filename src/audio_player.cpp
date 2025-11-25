@@ -48,8 +48,6 @@ constexpr size_t kI2sChunkBytes = 2048;
 #endif
 
 constexpr EventBits_t AUDIO_TASK_DONE_BIT = BIT0;
-constexpr EventBits_t FILE_TASK_DONE_BIT = BIT1;
-constexpr EventBits_t PLAYBACK_TASKS_DONE = (AUDIO_TASK_DONE_BIT | FILE_TASK_DONE_BIT);
 } // namespace
 
 AudioConfig default_audio_config() {
@@ -85,16 +83,12 @@ AudioConfig default_audio_config() {
 
 AudioPlayer::AudioPlayer(const AudioConfig &cfg)
     : cfg_(cfg),
-      ring_buffer_size_active_(cfg.ring_buffer_size_psram),
-      ring_buffer_in_dram_(cfg.prefer_dram_ring),
-      producer_min_free_bytes_active_(cfg.producer_min_free_bytes),
       i2s_write_timeout_ms_(cfg.i2s_write_timeout_ms),
       current_sample_rate_(cfg.default_sample_rate),
       saved_volume_percent_(cfg.default_volume_percent),
       user_volume_percent_(cfg.default_volume_percent),
       current_volume_percent_(cfg.default_volume_percent) {
     reset_memory_stats();
-    update_producer_thresholds();
 }
 
 void AudioPlayer::set_callbacks(const PlayerCallbacks &cb) {
@@ -153,66 +147,6 @@ void AudioPlayer::schedule_recovery(FailureReason reason, const char *detail) {
     stop_requested_ = true;
 }
 
-BaseType_t AudioPlayer::ringbuffer_send_with_retry(RingbufHandle_t ringbuf, const void *buffer, size_t len) {
-    if (stop_requested_) {
-        return pdFALSE;
-    }
-    for (int attempt = 0; attempt < cfg_.max_ringbuffer_retry; attempt++) {
-        if (pause_flag_) {
-            vTaskDelay(pdMS_TO_TICKS(20));
-            attempt--;
-            continue;
-        }
-        if (xRingbufferSend(ringbuf, buffer, len, pdMS_TO_TICKS(cfg_.ringbuffer_send_timeout_ms)) == pdTRUE) {
-            return pdTRUE;
-        }
-        uint32_t backoff_ms = cfg_.backoff_base_ms * (1 << attempt);
-        if (!pause_flag_ && !stop_requested_) {
-            LOG_WARN("Ring buffer send failed, attempt %d/%d, retrying in %lu ms", attempt + 1, cfg_.max_ringbuffer_retry, backoff_ms);
-        }
-        vTaskDelay(pdMS_TO_TICKS(backoff_ms));
-    }
-    if (!pause_flag_ && !stop_requested_) {
-        LOG_ERROR("Ring buffer send failed after %d attempts, skipping chunk", cfg_.max_ringbuffer_retry);
-    }
-    return pdFALSE;
-}
-
-bool AudioPlayer::ringbuffer_receive_with_retry(void **item, size_t *item_size) {
-    if (stop_requested_) {
-        return false;
-    }
-    if (file_task_handle_ == NULL) {
-        size_t free_bytes = xRingbufferGetCurFreeSize(audio_ring_buffer_);
-        if (free_bytes == ring_buffer_size_active_) {
-            return false;
-        }
-    }
-    for (int attempt = 0; attempt < cfg_.max_ringbuffer_retry; attempt++) {
-        if (pause_flag_) {
-            vTaskDelay(pdMS_TO_TICKS(20));
-            attempt--;
-            continue;
-        }
-        void *local_item = xRingbufferReceive(audio_ring_buffer_, item_size, pdMS_TO_TICKS(cfg_.ringbuffer_receive_timeout_ms));
-        if (local_item != NULL) {
-            *item = local_item;
-            return true;
-        }
-        uint32_t backoff_ms = cfg_.backoff_base_ms * (1 << attempt);
-        if (!pause_flag_ && !stop_requested_) {
-            LOG_WARN("Ring buffer receive failed, attempt %d/%d, retrying in %lu ms", attempt + 1, cfg_.max_ringbuffer_retry, backoff_ms);
-        }
-        vTaskDelay(pdMS_TO_TICKS(backoff_ms));
-    }
-    if (!pause_flag_ && !stop_requested_) {
-        LOG_ERROR("Ring buffer receive failed after %d attempts", cfg_.max_ringbuffer_retry);
-    }
-    if (!stop_requested_ && !pause_flag_) {
-        schedule_recovery(FailureReason::RINGBUFFER_UNDERRUN, "ring buffer receive timeout");
-    }
-    return false;
-}
 
 void AudioPlayer::signal_task_done(EventBits_t bit) {
     if (playback_events_) {
@@ -225,18 +159,14 @@ void AudioPlayer::wait_for_task_shutdown(uint32_t timeout_ms) {
     while (waited < timeout_ms) {
         EventBits_t bits = playback_events_ ? xEventGroupGetBits(playback_events_) : 0;
         bool audio_done = (bits & AUDIO_TASK_DONE_BIT) || (audio_task_handle_ == NULL);
-        bool file_done = (bits & FILE_TASK_DONE_BIT) || (file_task_handle_ == NULL);
-        if (audio_done && file_done) {
+        if (audio_done) {
             if (playback_events_) {
-                xEventGroupClearBits(playback_events_, PLAYBACK_TASKS_DONE);
+                xEventGroupClearBits(playback_events_, AUDIO_TASK_DONE_BIT);
             }
             return;
         }
         if (audio_task_handle_) {
             xTaskAbortDelay(audio_task_handle_);
-        }
-        if (file_task_handle_) {
-            xTaskAbortDelay(file_task_handle_);
         }
         vTaskDelay(pdMS_TO_TICKS(20));
         waited += 20;
@@ -244,77 +174,18 @@ void AudioPlayer::wait_for_task_shutdown(uint32_t timeout_ms) {
 }
 
 void AudioPlayer::cleanup_ring_buffer_if_idle() {
-    if (audio_task_handle_ == NULL && file_task_handle_ == NULL) {
-        if (audio_ring_buffer_) {
-            vRingbufferDelete(audio_ring_buffer_);
-            audio_ring_buffer_ = NULL;
+    if (audio_task_handle_ == NULL) {
+        if (pcm_ring_buffer_) {
+            vRingbufferDelete(pcm_ring_buffer_);
+            pcm_ring_buffer_ = NULL;
         }
-        if (audio_ring_storage_) {
-            heap_caps_free(audio_ring_storage_);
-            audio_ring_storage_ = NULL;
+        if (pcm_ring_storage_) {
+            heap_caps_free(pcm_ring_storage_);
+            pcm_ring_storage_ = NULL;
         }
     }
 }
 
-size_t AudioPlayer::align_up(size_t value, size_t alignment) const {
-    return (value + (alignment - 1)) & ~(alignment - 1);
-}
-
-void AudioPlayer::update_producer_thresholds() {
-    producer_min_free_bytes_active_ = cfg_.producer_min_free_bytes;
-    size_t soft_cap = ring_buffer_size_active_ / 3;
-    if (soft_cap < (8 * 1024)) {
-        soft_cap = 8 * 1024;
-    }
-    if (producer_min_free_bytes_active_ > soft_cap) {
-        producer_min_free_bytes_active_ = soft_cap;
-    }
-    producer_min_free_bytes_active_ = align_up(producer_min_free_bytes_active_, 1024);
-
-    size_t resume_margin = align_up(cfg_.producer_resume_hysteresis_min, 1024);
-    if (resume_margin < producer_min_free_bytes_active_ / 4) {
-        resume_margin = producer_min_free_bytes_active_ / 2;
-        resume_margin = align_up(resume_margin, 1024);
-    }
-    producer_resume_free_bytes_active_ = producer_min_free_bytes_active_ + resume_margin;
-    if (producer_resume_free_bytes_active_ > ring_buffer_size_active_) {
-        producer_resume_free_bytes_active_ = ring_buffer_size_active_;
-    }
-    if (producer_resume_free_bytes_active_ <= producer_min_free_bytes_active_) {
-        producer_resume_free_bytes_active_ = producer_min_free_bytes_active_ + 1024;
-    }
-}
-
-void AudioPlayer::select_ring_buffer_size(uint32_t sample_rate_hint) {
-    uint32_t sr = sample_rate_hint ? sample_rate_hint : cfg_.default_sample_rate;
-    uint64_t target_bytes = (uint64_t)sr * kDefaultChannels * kBytesPerSample * cfg_.target_buffer_ms / 1000ULL;
-    if (target_bytes < cfg_.ring_buffer_min_bytes) {
-        target_bytes = cfg_.ring_buffer_min_bytes;
-    }
-    if (target_bytes > cfg_.ring_buffer_size_psram) {
-        target_bytes = cfg_.ring_buffer_size_psram;
-    }
-
-    size_t capped_target = static_cast<size_t>(target_bytes);
-    bool fits_dram = capped_target <= cfg_.ring_buffer_size_dram;
-    ring_buffer_in_dram_ = cfg_.prefer_dram_ring && fits_dram;
-    if (cfg_.prefer_dram_ring && !fits_dram) {
-        LOG_WARN("Dynamic ring sizing exceeds DRAM limit (%u > %u), using PSRAM",
-                 (unsigned)capped_target,
-                 (unsigned)cfg_.ring_buffer_size_dram);
-    }
-    ring_buffer_size_active_ = align_up(capped_target, 1024);
-
-    update_producer_thresholds();
-
-    LOG_INFO("Dynamic ring sizing: sr=%u Hz, target %ums -> %u bytes in %s (producer min free %u bytes, resume @ %u bytes)",
-             sr,
-             cfg_.target_buffer_ms,
-             (unsigned)ring_buffer_size_active_,
-             ring_buffer_in_dram_ ? "DRAM" : "PSRAM",
-             (unsigned)producer_min_free_bytes_active_,
-             (unsigned)producer_resume_free_bytes_active_);
-}
 
 void AudioPlayer::reset_memory_stats() {
     mem_stats_.heap_free_start = heap_caps_get_free_size(MALLOC_CAP_8BIT);
@@ -328,40 +199,6 @@ void AudioPlayer::update_memory_min() {
     }
 }
 
-bool AudioPlayer::allocate_ring_buffer_with_fallback() {
-    const size_t min_size = 16 * 1024;
-    size_t attempt_sizes[3] = {
-        ring_buffer_size_active_,
-        ring_buffer_size_active_ * 3 / 4,
-        ring_buffer_size_active_ / 2};
-
-    for (size_t attempt : attempt_sizes) {
-        if (attempt < min_size) {
-            continue;
-        }
-        size_t aligned = align_up(attempt, 1024);
-        uint32_t caps = ring_buffer_in_dram_ ? (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) : MALLOC_CAP_SPIRAM;
-        audio_ring_storage_ = static_cast<uint8_t *>(heap_caps_malloc(aligned, caps));
-        if (!audio_ring_storage_) {
-            LOG_WARN("Ring buffer alloc failed (%u bytes, %s), trying smaller",
-                     (unsigned)aligned,
-                     ring_buffer_in_dram_ ? "DRAM" : "PSRAM");
-            continue;
-        }
-        audio_ring_buffer_ = xRingbufferCreateStatic(aligned, RINGBUF_TYPE_BYTEBUF, audio_ring_storage_, &audio_ring_struct_);
-        if (audio_ring_buffer_) {
-            ring_buffer_size_active_ = aligned;
-            update_producer_thresholds();
-            if (aligned != attempt_sizes[0]) {
-                LOG_WARN("Ring buffer size reduced to %u bytes to fit available memory", (unsigned)aligned);
-            }
-            return true;
-        }
-        heap_caps_free(audio_ring_storage_);
-        audio_ring_storage_ = NULL;
-    }
-    return false;
-}
 
 uint32_t AudioPlayer::detect_mp3_bitrate_kbps(const char *path, uint32_t *header_sample_rate) {
     File f = LittleFS.open(path, "r");
@@ -446,48 +283,84 @@ void AudioPlayer::notify_metadata(const Metadata &meta, const char *path) {
     }
 }
 
-bool AudioPlayer::receive_ring_item(void **item, size_t *item_size) {
-    if (!audio_ring_buffer_) {
-        return false;
-    }
-    return ringbuffer_receive_with_retry(item, item_size);
-}
+bool AudioPlayer::select_source(const char* uri, SourceType hint) {
+    // Auto-detect da URI se hint è LITTLEFS (default)
+    SourceType type = hint;
 
-void AudioPlayer::return_ring_item(void *item) {
-    if (audio_ring_buffer_ && item) {
-        vRingbufferReturnItem(audio_ring_buffer_, item);
+    if (hint == SourceType::LITTLEFS) {
+        // Euristica per auto-detect
+        if (strncmp(uri, "http://", 7) == 0 || strncmp(uri, "https://", 8) == 0) {
+            type = SourceType::HTTP_STREAM;
+        } else if (strncmp(uri, "/sd/", 4) == 0) {
+            type = SourceType::SD_CARD;
+        } else {
+            type = SourceType::LITTLEFS;
+        }
     }
-}
 
-bool AudioPlayer::select_file(const String &path, const char *label) {
-    mp3_file_path_ = path;
+    // Crea DataSource appropriata
+    switch (type) {
+        case SourceType::LITTLEFS:
+            data_source_.reset(new LittleFSSource());
+            break;
+
+        case SourceType::SD_CARD:
+            data_source_.reset(new SDCardSource());
+            break;
+
+        case SourceType::HTTP_STREAM:
+            data_source_.reset(new HTTPStreamSource());
+            break;
+
+        default:
+            LOG_ERROR("Unknown source type: %d", (int)type);
+            return false;
+    }
+
+    current_uri_ = uri;
+    mp3_file_path_ = uri;
     file_armed_ = false;
     current_metadata_ = Metadata();
-    LOG_INFO("File selezionato: %s%s", mp3_file_path_.c_str(), label ? label : "");
+
+    LOG_INFO("Source selected: %s (type: %d)", uri, (int)type);
+
     return true;
 }
 
-bool AudioPlayer::arm_file() {
-    File f = LittleFS.open(mp3_file_path_.c_str(), "r");
-    if (!f) {
-        LOG_ERROR("File non trovato: %s", mp3_file_path_.c_str());
+bool AudioPlayer::arm_source() {
+    if (!data_source_) {
+        LOG_ERROR("No data source selected");
+        return false;
+    }
+
+    if (!data_source_->open(current_uri_.c_str())) {
+        LOG_ERROR("Failed to open: %s", current_uri_.c_str());
         file_armed_ = false;
         return false;
     }
-    armed_file_size_ = f.size();
-    armed_mp3_path_ = mp3_file_path_;
+
+    armed_file_size_ = data_source_->size();
+    armed_mp3_path_ = current_uri_;
     file_armed_ = true;
-    LOG_INFO("File caricato (armed): %s, size=%u bytes", armed_mp3_path_.c_str(), (unsigned)armed_file_size_);
-    f.close();
-    if (id3_parser_.parse(armed_mp3_path_.c_str(), current_metadata_)) {
-        const char *title = current_metadata_.title.length() ? current_metadata_.title.c_str() : "n/a";
-        const char *artist = current_metadata_.artist.length() ? current_metadata_.artist.c_str() : "n/a";
-        const char *album = current_metadata_.album.length() ? current_metadata_.album.c_str() : "n/a";
-        LOG_INFO("Metadata: title=\"%s\" artist=\"%s\" album=\"%s\"", title, artist, album);
-    } else {
-        LOG_INFO("Metadata ID3 non trovati o non parsabili");
+
+    LOG_INFO("Source armed: %s, size=%u bytes, seekable=%s",
+             current_uri_.c_str(),
+             (unsigned)armed_file_size_,
+             data_source_->is_seekable() ? "yes" : "no");
+
+    // Parse metadata solo per file locali (non HTTP)
+    if (data_source_->type() != SourceType::HTTP_STREAM) {
+        if (id3_parser_.parse(current_uri_.c_str(), current_metadata_)) {
+            const char *title = current_metadata_.title.length() ? current_metadata_.title.c_str() : "n/a";
+            const char *artist = current_metadata_.artist.length() ? current_metadata_.artist.c_str() : "n/a";
+            const char *album = current_metadata_.album.length() ? current_metadata_.album.c_str() : "n/a";
+            LOG_INFO("Metadata: title=\"%s\" artist=\"%s\" album=\"%s\"", title, artist, album);
+        } else {
+            LOG_INFO("Metadata ID3 not found or not parseable");
+        }
+        notify_metadata(current_metadata_, armed_mp3_path_.c_str());
     }
-    notify_metadata(current_metadata_, armed_mp3_path_.c_str());
+
     return true;
 }
 
@@ -520,11 +393,11 @@ void AudioPlayer::request_seek(int seconds) {
 }
 
 size_t AudioPlayer::ring_buffer_used() const {
-    if (!audio_ring_buffer_) {
+    if (!pcm_ring_buffer_) {
         return 0;
     }
-    size_t free_bytes = xRingbufferGetCurFreeSize(audio_ring_buffer_);
-    return ring_buffer_size_active_ - free_bytes;
+    size_t free_bytes = xRingbufferGetCurFreeSize(pcm_ring_buffer_);
+    return pcm_ring_size_ - free_bytes;
 }
 
 void AudioPlayer::start() {
@@ -532,60 +405,51 @@ void AudioPlayer::start() {
         LOG_INFO("Already active");
         return;
     }
-    if (!file_armed_) {
-        LOG_WARN("Nessun file armato. Usa 'l' prima di 'p'.");
+    if (!file_armed_ || !data_source_ || !data_source_->is_open()) {
+        LOG_WARN("No source armed. Use 'l' before 'p'");
         return;
     }
+
     LOG_INFO("Config profile: %s", kConfigProfile);
     reset_memory_stats();
+
     stop_requested_ = false;
     pause_flag_ = false;
     seek_seconds_ = -1;
     current_played_frames_ = 0;
     total_pcm_frames_ = 0;
-    mp3_file_size_ = 0;
+
     if (!playback_events_) {
         playback_events_ = xEventGroupCreate();
     }
     if (playback_events_) {
-        xEventGroupClearBits(playback_events_, PLAYBACK_TASKS_DONE);
-    }
-    active_mp3_path_ = armed_mp3_path_;
-    LOG_INFO("Playback file: %s", active_mp3_path_.c_str());
-    uint32_t header_sr = 0;
-    detect_mp3_bitrate_kbps(active_mp3_path_.c_str(), &header_sr);
-    select_ring_buffer_size(header_sr);
-    LOG_INFO("Allocating %u-byte audio ring in %s", (unsigned)ring_buffer_size_active_, ring_buffer_in_dram_ ? "DRAM" : "PSRAM");
-    if (!allocate_ring_buffer_with_fallback()) {
-        LOG_ERROR("Failed to allocate ring buffer in PSRAM/DRAM");
-        return;
+        xEventGroupClearBits(playback_events_, AUDIO_TASK_DONE_BIT);
     }
 
-    BaseType_t file_created = create_task_with_affinity(file_stream_task_entry,
-                                                        "FileTask",
-                                                        cfg_.file_task_stack,
-                                                        this,
-                                                        cfg_.file_task_priority,
-                                                        &file_task_handle_,
-                                                        cfg_.file_task_core);
-    BaseType_t audio_created = create_task_with_affinity(audio_task_entry,
-                                                         "AudioTask",
-                                                         cfg_.audio_task_stack,
-                                                         this,
-                                                         cfg_.audio_task_priority,
-                                                         &audio_task_handle_,
-                                                         cfg_.audio_task_core);
-    if (file_created != pdPASS || audio_created != pdPASS || file_task_handle_ == NULL || audio_task_handle_ == NULL) {
-        LOG_ERROR("Failed to create tasks (audio %ld, file %ld)", (long)audio_created, (long)file_created);
-        stop_requested_ = true;
-        wait_for_task_shutdown(500);
-        cleanup_ring_buffer_if_idle();
-        playing_ = false;
+    active_mp3_path_ = armed_mp3_path_;
+
+    LOG_INFO("Starting playback: %s", active_mp3_path_.c_str());
+
+    // Crea SOLO audio task (no file task!)
+    BaseType_t created = create_task_with_affinity(
+        audio_task_entry,
+        "AudioTask",
+        cfg_.audio_task_stack,
+        this,
+        cfg_.audio_task_priority,
+        &audio_task_handle_,
+        cfg_.audio_task_core
+    );
+
+    if (created != pdPASS || audio_task_handle_ == NULL) {
+        LOG_ERROR("Failed to create audio task");
         player_state_ = PlayerState::ERROR;
         return;
     }
+
     playing_ = true;
     player_state_ = PlayerState::PLAYING;
+
     LOG_INFO("Playback started");
     notify_start(active_mp3_path_.c_str());
 }
@@ -613,7 +477,7 @@ void AudioPlayer::stop() {
 }
 
 void AudioPlayer::handle_recovery_if_needed() {
-    if (recovery_scheduled_ && !playing_ && player_state_ == PlayerState::ERROR && audio_task_handle_ == NULL && file_task_handle_ == NULL) {
+    if (recovery_scheduled_ && !playing_ && player_state_ == PlayerState::ERROR && audio_task_handle_ == NULL) {
         LOG_INFO("Auto recovery attempt %u/%u after %s", recovery_attempts_, cfg_.max_recovery_attempts, failure_reason_to_str(last_failure_reason_));
         recovery_scheduled_ = false;
         player_state_ = PlayerState::STOPPED;
@@ -645,7 +509,7 @@ void AudioPlayer::print_status() const {
     LOG_INFO("State: %s", state_str);
     LOG_INFO("Volume: %d%% (saved: %d%%)", current_volume_percent_, saved_volume_percent_);
     LOG_INFO("Sample Rate: %u Hz", current_sample_rate_);
-    LOG_INFO("Ring buffer (%s) -> %u/%u bytes used", ring_buffer_in_dram_ ? "DRAM" : "PSRAM", (unsigned)ring_used, (unsigned)ring_buffer_size_active_);
+    LOG_INFO("PCM ring buffer -> %u/%u bytes used", (unsigned)ring_used, (unsigned)pcm_ring_size_);
     LOG_INFO("File selected: %s | armed: %s | active: %s | armed=%s size=%u",
              mp3_file_path_.c_str(),
              armed_mp3_path_.c_str(),
@@ -662,7 +526,7 @@ void AudioPlayer::print_status() const {
     const char *custom = current_metadata_.custom.length() ? current_metadata_.custom.c_str() : "n/a";
     LOG_INFO("Metadata: title=\"%s\" artist=\"%s\" album=\"%s\" genre=\"%s\" track=\"%s\" year=\"%s\" cover=%s", title, artist, album, genre, track, year, current_metadata_.cover_present ? "yes" : "no");
     LOG_INFO("Metadata extra: comment=\"%s\" custom=\"%s\"", comment, custom);
-    LOG_INFO("Tasks -> audio: %s, file: %s", audio_task_handle_ ? "alive" : "none", file_task_handle_ ? "alive" : "none");
+    LOG_INFO("Task -> audio: %s", audio_task_handle_ ? "alive" : "none");
     LOG_INFO("Frames played: %llu / %llu", current_played_frames_, total_pcm_frames_);
     LOG_INFO("Stop flag: %s, Pause flag: %s", stop_requested_ ? "true" : "false", pause_flag_ ? "true" : "false");
     LOG_INFO("Recovery: %s (reason: %s) attempts %u/%u",
@@ -677,13 +541,6 @@ void AudioPlayer::print_status() const {
     LOG_INFO("=====================");
 }
 
-void AudioPlayer::file_stream_task_entry(void *param) {
-    auto *self = static_cast<AudioPlayer *>(param);
-    if (self) {
-        self->file_stream_task();
-    }
-}
-
 void AudioPlayer::audio_task_entry(void *param) {
     auto *self = static_cast<AudioPlayer *>(param);
     if (self) {
@@ -691,254 +548,257 @@ void AudioPlayer::audio_task_entry(void *param) {
     }
 }
 
-void AudioPlayer::file_stream_task() {
-    LOG_INFO("Task file avviato (core %d, prio %u).", (int)xPortGetCoreID(), (unsigned)uxTaskPriorityGet(NULL));
-
-    File mp3 = LittleFS.open(active_mp3_path_.c_str(), "r");
-    if (!mp3) {
-        LOG_ERROR("Impossibile aprire il file MP3: %s", active_mp3_path_.c_str());
-        signal_task_done(FILE_TASK_DONE_BIT);
-        file_task_handle_ = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-
-    LOG_INFO("Riproduzione da LittleFS: %s, size=%u bytes", active_mp3_path_.c_str(), (unsigned)mp3.size());
-    mp3_file_size_ = mp3.size();
-
-    uint8_t buffer[cfg_.file_read_chunk];
-    uint32_t high_watermark_hits = 0;
-    size_t min_free_seen = ring_buffer_size_active_;
-    while (!stop_requested_) {
-        if (!audio_ring_buffer_) {
-            LOG_WARN("Ring buffer non disponibile, fermo il task file.");
-            break;
-        }
-        if (pause_flag_) {
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
-        size_t free_bytes = xRingbufferGetCurFreeSize(audio_ring_buffer_);
-        size_t used_bytes = ring_buffer_size_active_ - free_bytes;
-        if (free_bytes < min_free_seen) {
-            min_free_seen = free_bytes;
-        }
-        if (free_bytes < producer_min_free_bytes_active_) {
-            high_watermark_hits++;
-            vTaskDelay(pdMS_TO_TICKS(15));
-            continue;
-        } else if (free_bytes > producer_resume_free_bytes_active_) {
-            high_watermark_hits = 0;
-        }
-        if (free_bytes < sizeof(buffer)) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
-        int len = mp3.read(buffer, sizeof(buffer));
-        if (len <= 0) {
-            LOG_INFO("Fine file MP3.");
-            break;
-        }
-        while (!stop_requested_ && ringbuffer_send_with_retry(audio_ring_buffer_, buffer, len) != pdTRUE) {
-            LOG_WARN("Ring buffer pieno: ritento stesso chunk (%d bytes)", len);
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-
-    mp3.close();
-
-    LOG_INFO("File task exit: ring buffer min free %u bytes, high watermark hits %u", (unsigned)min_free_seen, (unsigned)high_watermark_hits);
-
-    if (stop_requested_) {
-        LOG_INFO("File task stopped by user.");
-    } else {
-        LOG_INFO("File task terminato.");
-    }
-    signal_task_done(FILE_TASK_DONE_BIT);
-    file_task_handle_ = NULL;
-    vTaskDelete(NULL);
-}
-
 void AudioPlayer::audio_task() {
-    LOG_INFO("Audio task avviato (core %d, prio %u). In attesa di dati nel buffer...",
-             (int)xPortGetCoreID(),
-             (unsigned)uxTaskPriorityGet(NULL));
+    LOG_INFO("Audio task started (core %d)", (int)xPortGetCoreID());
 
+    // Declare all variables before goto to avoid crossing initialization
     bool i2s_ready = false;
     const uint32_t frames_per_chunk = 2048;
-    size_t min_ring_free_during_play = ring_buffer_size_active_;
-    TickType_t prefill_start = 0;
-    size_t leftover_capacity = ring_buffer_size_active_;
+    uint32_t channels = 0;
+    uint32_t sample_rate = 0;
 
-    do {
-        if (!decoder_.init(this, frames_per_chunk, leftover_capacity)) {
-            schedule_recovery(FailureReason::DECODER_INIT, "decoder init failed");
-            break;
+    if (!data_source_ || !data_source_->is_open()) {
+        LOG_ERROR("DataSource not available");
+        goto cleanup;
+    }
+
+    // ===== INIT DECODER =====
+    if (!decoder_.init(data_source_.get(), frames_per_chunk)) {
+        LOG_ERROR("Failed to init decoder");
+        schedule_recovery(FailureReason::DECODER_INIT, "decoder init failed");
+        goto cleanup;
+    }
+
+    channels = decoder_.channels();
+    sample_rate = decoder_.sample_rate();
+
+    if (channels == 0 || sample_rate == 0) {
+        LOG_ERROR("Invalid audio format");
+        schedule_recovery(FailureReason::DECODER_INIT, "invalid format");
+        goto cleanup;
+    }
+
+    LOG_INFO("Decoder initialized: %u Hz, %u channels", sample_rate, channels);
+
+    total_pcm_frames_ = decoder_.total_frames();
+    current_sample_rate_ = sample_rate;
+
+    // Stima durata se non disponibile
+    if (total_pcm_frames_ == 0 && data_source_->size() > 0) {
+        uint32_t header_sr = 0;
+        uint32_t bitrate_kbps = detect_mp3_bitrate_kbps(current_uri_.c_str(), &header_sr);
+        if (bitrate_kbps > 0) {
+            total_pcm_frames_ = (data_source_->size() * 8ULL * sample_rate) / (bitrate_kbps * 1000ULL);
+            LOG_INFO("Estimated duration: %llu frames (~%u seconds)",
+                     total_pcm_frames_,
+                     (unsigned)(total_pcm_frames_ / sample_rate));
         }
+    }
 
-        auto &buffers = decoder_.buffers();
-        int16_t *pcm_s16 = buffers.pcm;
+    // ===== ALLOCA RING BUFFER PCM =====
+    // Molto più piccolo del ring MP3: 32KB = ~180ms @ 44.1kHz stereo
+    pcm_ring_size_ = 32 * 1024;
+    pcm_ring_storage_ = static_cast<uint8_t*>(
+        heap_caps_malloc(pcm_ring_size_, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+    );
 
-        prefill_start = xTaskGetTickCount();
-        while (!stop_requested_ && audio_ring_buffer_ && xRingbufferGetCurFreeSize(audio_ring_buffer_) == ring_buffer_size_active_) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            if (((xTaskGetTickCount() - prefill_start) * portTICK_PERIOD_MS) > 1000) {
-                LOG_WARN("Attesa dati ring >1s, continuo comunque");
-                break;
-            }
-        }
+    if (!pcm_ring_storage_) {
+        LOG_ERROR("Failed to allocate PCM ring buffer");
+        goto cleanup;
+    }
 
-        uint32_t channels = decoder_.channels();
-        uint32_t sample_rate = decoder_.sample_rate();
-        if (channels == 0 || sample_rate == 0) {
-            schedule_recovery(FailureReason::DECODER_INIT, "decoder missing format");
-            break;
-        }
+    pcm_ring_buffer_ = xRingbufferCreateStatic(
+        pcm_ring_size_,
+        RINGBUF_TYPE_BYTEBUF,
+        pcm_ring_storage_,
+        &pcm_ring_struct_
+    );
 
-        LOG_INFO("Decodificatore MP3 inizializzato. Canali: %u, Sample Rate: %u", channels, sample_rate);
-        total_pcm_frames_ = decoder_.total_frames();
-        current_sample_rate_ = sample_rate;
-        if (total_pcm_frames_ == 0 && mp3_file_size_ > 0) {
-            uint32_t header_sr = 0;
-            uint32_t header_bitrate_kbps = detect_mp3_bitrate_kbps(active_mp3_path_.c_str(), &header_sr);
-            uint32_t sr_for_est = header_sr ? header_sr : current_sample_rate_;
-            if (header_bitrate_kbps > 0) {
-                total_pcm_frames_ = (mp3_file_size_ * 8ULL * sr_for_est) / (header_bitrate_kbps * 1000ULL);
-                LOG_INFO("Estimated total frames: %llu (bitrate %u kbps, sr %u)", total_pcm_frames_, header_bitrate_kbps, sr_for_est);
-            } else {
-                uint32_t assumed_bitrate = 128 * 1024;
-                total_pcm_frames_ = (mp3_file_size_ * 8ULL * current_sample_rate_) / assumed_bitrate;
-                LOG_INFO("Estimated total frames: %llu (fallback 128kbps)", total_pcm_frames_);
-            }
-        }
+    if (!pcm_ring_buffer_) {
+        LOG_ERROR("Failed to create PCM ring buffer");
+        goto cleanup;
+    }
 
-        if (!codec_.init(sample_rate, kApEnable, kI2cSda, kI2cScl, kI2cSpeed, cfg_.default_volume_percent)) {
-            schedule_recovery(FailureReason::DECODER_INIT, "codec init failed");
-            break;
-        }
-        i2s_driver_.init(sample_rate, cfg_, kBytesPerSample, kDefaultChannels, kI2sBck, kI2sWs, kI2sDout);
-        codec_.set_volume(user_volume_percent_);
-        i2s_ready = true;
+    LOG_INFO("PCM ring buffer: %u bytes (%.1f ms @ %u Hz)",
+             (unsigned)pcm_ring_size_,
+             (pcm_ring_size_ * 1000.0f) / (sample_rate * channels * sizeof(int16_t)),
+             sample_rate);
 
-        LOG_INFO("Inizio decodifica e riproduzione...");
-        while (true) {
+    // ===== INIT CODEC & I2S =====
+    if (!codec_.init(sample_rate, kApEnable, kI2cSda, kI2cScl, kI2cSpeed, cfg_.default_volume_percent)) {
+        LOG_ERROR("Codec init failed");
+        schedule_recovery(FailureReason::DECODER_INIT, "codec init failed");
+        goto cleanup;
+    }
+
+    i2s_driver_.init(sample_rate, cfg_, kBytesPerSample, channels, kI2sBck, kI2sWs, kI2sDout);
+    codec_.set_volume(user_volume_percent_);
+    i2s_ready = true;
+
+    // ===== MAIN PLAYBACK LOOP =====
+    {
+        auto& buffers = decoder_.buffers();
+        int16_t* pcm_buffer = buffers.pcm;
+        const size_t max_frames = buffers.pcm_capacity_frames;
+
+        LOG_INFO("Starting playback loop...");
+
+        while (!stop_requested_) {
+            // PAUSE handling
             while (pause_flag_ && !stop_requested_) {
                 vTaskDelay(pdMS_TO_TICKS(20));
                 update_memory_min();
             }
-            if (stop_requested_) {
-                if (player_state_ != PlayerState::ERROR) {
-                    player_state_ = PlayerState::STOPPED;
+
+            if (stop_requested_) break;
+
+            // SEEK handling - ORA FUNZIONA ANCHE IN PAUSA!
+            if (seek_seconds_ >= 0) {
+                uint64_t target_frame = (uint64_t)seek_seconds_ * sample_rate;
+                if (target_frame > total_pcm_frames_) {
+                    target_frame = total_pcm_frames_;
                 }
-                break;
-            }
-            update_memory_min();
-            drmp3_uint64 frames_decoded = decoder_.read_frames(pcm_s16, frames_per_chunk);
-            if (frames_decoded == 0) {
-                if (stop_requested_ && player_state_ == PlayerState::ERROR) {
-                    LOG_WARN("Decodificatore fermato per recovery.");
-                } else if (stop_requested_) {
-                    player_state_ = PlayerState::STOPPED;
-                } else if (file_task_handle_ == NULL && !recovery_scheduled_) {
-                    LOG_INFO("Fine decodifica (stream terminato?).");
-                    player_state_ = PlayerState::ENDED;
+
+                uint32_t seek_start_ms = millis();
+                uint64_t seek_distance = (target_frame > current_played_frames_)
+                    ? (target_frame - current_played_frames_)
+                    : (current_played_frames_ - target_frame);
+
+                LOG_INFO("=== SEEK START: from frame %llu to %llu (distance: %llu frames, %u sec) ===",
+                         current_played_frames_, target_frame, seek_distance, seek_seconds_);
+
+                // Pulisci buffer DMA I2S per evitare suoni ripetuti durante seek
+                i2s_zero_dma_buffer(I2S_NUM_0);
+                uint32_t after_i2s_clear_ms = millis();
+
+                bool seek_success = decoder_.seek_to_frame(target_frame);
+                uint32_t after_decoder_seek_ms = millis();
+
+                if (seek_success) {
+                    current_played_frames_ = target_frame;
+
+                    // Svuota ring buffer PCM
+                    void* item;
+                    size_t size;
+                    while ((item = xRingbufferReceive(pcm_ring_buffer_, &size, 0)) != NULL) {
+                        vRingbufferReturnItem(pcm_ring_buffer_, item);
+                    }
+
+                    uint32_t seek_end_ms = millis();
+                    uint32_t total_time = seek_end_ms - seek_start_ms;
+                    uint32_t decoder_time = after_decoder_seek_ms - after_i2s_clear_ms;
+                    uint32_t i2s_clear_time = after_i2s_clear_ms - seek_start_ms;
+
+                    LOG_INFO("=== SEEK COMPLETED: Total %u ms (I2S clear: %u ms, Decoder seek: %u ms) ===",
+                             total_time, i2s_clear_time, decoder_time);
                 } else {
-                    schedule_recovery(FailureReason::RINGBUFFER_UNDERRUN, "decoder got zero frames");
+                    LOG_WARN("Native seek failed, falling back to brute force");
+                    uint32_t brute_start_ms = millis();
+                    // Fallback a brute force per stream non-seekable
+                    while (current_played_frames_ < target_frame && !stop_requested_) {
+                        drmp3_uint64 discard = decoder_.read_frames(pcm_buffer, 1024 / channels);
+                        if (discard == 0) break;
+                        current_played_frames_ += discard;
+                    }
+                    uint32_t brute_end_ms = millis();
+                    LOG_INFO("=== BRUTE FORCE SEEK completed in %u ms ===", brute_end_ms - brute_start_ms);
                 }
-                break;
+
+                seek_seconds_ = -1;
             }
-            if (stop_requested_) {
-                LOG_INFO("Playback stopped by user");
-                player_state_ = PlayerState::STOPPED;
-                break;
+
+            update_memory_min();
+
+            // DECODE: DataSource → PCM
+            drmp3_uint64 frames_decoded = decoder_.read_frames(pcm_buffer, max_frames);
+
+            if (frames_decoded == 0) {
+                if (stop_requested_) {
+                    break;
+                } else {
+                    LOG_INFO("End of stream");
+                    player_state_ = PlayerState::ENDED;
+                    break;
+                }
             }
 
             current_played_frames_ += frames_decoded;
 
-            if (seek_seconds_ >= 0) {
-                uint64_t seek_frames = (uint64_t)seek_seconds_ * current_sample_rate_;
-                if (seek_frames > total_pcm_frames_) seek_frames = total_pcm_frames_;
-                while (current_played_frames_ < seek_frames) {
-                    drmp3_uint64 discard = decoder_.read_frames(pcm_s16, 1024 / channels);
-                    if (discard == 0) break;
-                    current_played_frames_ += discard;
-                }
-                seek_seconds_ = -1;
-                LOG_INFO("Seek to %llu frames", current_played_frames_);
-                LOG_INFO("Seek completed to %llu seconds", seek_frames / current_sample_rate_);
-            }
-
             if (!pause_flag_) {
-                const size_t bytes_to_write = frames_decoded * channels * sizeof(int16_t);
-                const uint8_t *write_ptr = reinterpret_cast<const uint8_t *>(pcm_s16);
-                size_t remaining = bytes_to_write;
-                uint32_t zero_writes = 0;
-                size_t ring_free = audio_ring_buffer_ ? xRingbufferGetCurFreeSize(audio_ring_buffer_) : 0;
-                size_t ring_used = audio_ring_buffer_ ? ring_buffer_size_active_ - ring_free : 0;
-                if (ring_free < min_ring_free_during_play) {
-                    min_ring_free_during_play = ring_free;
-                }
+                // Write PCM direttamente a I2S (semplificato, senza ring intermediario)
+                size_t pcm_bytes = frames_decoded * channels * sizeof(int16_t);
+                const uint8_t* write_ptr = reinterpret_cast<const uint8_t*>(pcm_buffer);
+                size_t remaining = pcm_bytes;
 
                 while (remaining > 0 && !stop_requested_) {
                     size_t chunk = remaining;
                     if (chunk > i2s_driver_.chunk_bytes()) {
                         chunk = i2s_driver_.chunk_bytes();
                     }
+
                     size_t written = 0;
-                    esp_err_t result = i2s_write(I2S_NUM_0, write_ptr, chunk, &written, pdMS_TO_TICKS(cfg_.i2s_write_timeout_ms));
+                    esp_err_t result = i2s_write(I2S_NUM_0,
+                                                write_ptr,
+                                                chunk,
+                                                &written,
+                                                pdMS_TO_TICKS(cfg_.i2s_write_timeout_ms));
+
                     if (result != ESP_OK) {
-                        LOG_ERROR("Errore scrittura I2S: %s, richiesti %u bytes (ring %u used / %u free)",
-                                  esp_err_to_name(result),
-                                  (unsigned)chunk,
-                                  (unsigned)ring_used,
-                                  (unsigned)ring_free);
-                        if (!stop_requested_) {
-                            schedule_recovery(FailureReason::I2S_WRITE, "i2s write failed");
-                            if (player_state_ != PlayerState::ERROR) {
-                                player_state_ = PlayerState::ERROR;
-                            }
-                        }
+                        LOG_ERROR("I2S write error: %s", esp_err_to_name(result));
+                        schedule_recovery(FailureReason::I2S_WRITE, "i2s write failed");
+                        player_state_ = PlayerState::ERROR;
                         break;
                     }
 
                     if (written == 0) {
-                        zero_writes++;
-                        if (zero_writes >= 3) {
-                            LOG_ERROR("I2S write returned 0 bytes per 3 tentativi consecutivi (ring %u used / %u free)", (unsigned)ring_used, (unsigned)ring_free);
-                            schedule_recovery(FailureReason::I2S_WRITE, "i2s wrote zero bytes");
-                            player_state_ = PlayerState::ERROR;
-                            break;
-                        }
-                        continue;
+                        LOG_ERROR("I2S write returned 0 bytes");
+                        schedule_recovery(FailureReason::I2S_WRITE, "i2s wrote zero bytes");
+                        player_state_ = PlayerState::ERROR;
+                        break;
                     }
 
-                    if (written < chunk) {
-                        LOG_WARN("I2S partial write: %u/%u bytes (ring %u used / %u free)", (unsigned)written, (unsigned)chunk, (unsigned)ring_used, (unsigned)ring_free);
-                    }
-
-                    zero_writes = 0;
                     remaining -= written;
                     write_ptr += written;
                 }
             }
         }
-    } while (false);
+    }
 
+cleanup:
+    // Cleanup
     decoder_.shutdown();
+
+    if (pcm_ring_buffer_) {
+        vRingbufferDelete(pcm_ring_buffer_);
+        pcm_ring_buffer_ = NULL;
+    }
+
+    if (pcm_ring_storage_) {
+        heap_caps_free(pcm_ring_storage_);
+        pcm_ring_storage_ = NULL;
+    }
+
     if (i2s_ready) {
         i2s_driver_.uninstall();
     }
+
+    if (data_source_) {
+        data_source_->close();
+    }
+
     PlayerState final_state = player_state_;
     String path_copy = active_mp3_path_;
     playing_ = false;
     signal_task_done(AUDIO_TASK_DONE_BIT);
     audio_task_handle_ = NULL;
-    LOG_INFO("Audio task terminato. Min ring free during play: %u bytes", (unsigned)min_ring_free_during_play);
+
+    LOG_INFO("Audio task terminated");
+
     if (final_state == PlayerState::ENDED) {
         notify_end(path_copy.c_str());
     } else if (final_state == PlayerState::ERROR) {
         notify_error(path_copy.c_str(), "audio task exit");
     }
+
     vTaskDelete(NULL);
 }

@@ -1,0 +1,31 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+enum class SourceType {
+    LITTLEFS,
+    SD_CARD,
+    HTTP_STREAM
+};
+
+class IDataSource {
+public:
+    virtual ~IDataSource() = default;
+
+    // Core I/O operations
+    virtual size_t read(void* buffer, size_t size) = 0;
+    virtual bool seek(size_t position) = 0;
+    virtual size_t tell() const = 0;
+    virtual size_t size() const = 0;
+
+    // Lifecycle
+    virtual bool open(const char* uri) = 0;
+    virtual void close() = 0;
+    virtual bool is_open() const = 0;
+
+    // Capabilities
+    virtual bool is_seekable() const = 0;
+    virtual SourceType type() const = 0;
+    virtual const char* uri() const = 0;
+};

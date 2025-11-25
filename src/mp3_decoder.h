@@ -3,40 +3,48 @@
 #include <cstddef>
 #include <cstdint>
 #include "dr_mp3.h"
-
-class AudioPlayer;
+#include "data_source.h"
+#include "mp3_seek_table.h"
 
 class Mp3Decoder {
 public:
     struct Buffers {
         int16_t *pcm = nullptr;
         size_t pcm_capacity_frames = 0;
-        uint8_t *leftover = nullptr;
-        size_t leftover_capacity = 0;
     };
 
     Mp3Decoder() = default;
     ~Mp3Decoder();
 
-    bool init(AudioPlayer *owner, size_t frames_per_chunk, size_t leftover_capacity);
+    bool init(IDataSource* source, size_t frames_per_chunk, bool build_seek_table = true);
     drmp3_uint64 read_frames(int16_t *dst, drmp3_uint64 frames);
+    bool seek_to_frame(drmp3_uint64 frame_index);
     void shutdown();
+
+    bool has_seek_table() const { return seek_table_.is_ready(); }
 
     uint32_t sample_rate() const { return mp3_ ? mp3_->sampleRate : 0; }
     uint32_t channels() const { return mp3_ ? mp3_->channels : 0; }
     drmp3_uint64 total_frames() const;
     Buffers &buffers() { return buffers_; }
     bool initialized() const { return initialized_; }
+    drmp3* mp3() { return mp3_; }
 
 private:
     static size_t on_read_cb(void *user, void *buffer, size_t bytesToRead);
-    size_t fill_buffer(uint8_t *out, size_t bytes_to_read);
-    bool ensure_buffers(size_t pcm_frames, size_t leftover_bytes);
+    static drmp3_bool32 on_seek_cb(void *user, int offset, drmp3_seek_origin origin);
+    static drmp3_bool32 on_tell_cb(void *user, drmp3_int64 *pCursor);
 
-    AudioPlayer *owner_ = nullptr;
+    size_t do_read(void* buffer, size_t bytes_to_read);
+    bool do_seek(int offset, drmp3_seek_origin origin);
+    drmp3_int64 do_tell();
+    bool ensure_buffers(size_t pcm_frames);
+
+    IDataSource* source_ = nullptr;
     drmp3 *mp3_ = nullptr;
     Buffers buffers_;
-    size_t leftover_size_ = 0;
-    size_t leftover_offset_ = 0;
     bool initialized_ = false;
+    Mp3SeekTable seek_table_;
+    uint8_t* mp3_file_cache_ = nullptr;  // Cache del file MP3 per seek table
+    size_t mp3_file_size_ = 0;
 };

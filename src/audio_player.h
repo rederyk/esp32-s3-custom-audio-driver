@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <esp_heap_caps.h>
+#include <memory>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/ringbuf.h"
@@ -13,6 +14,10 @@
 #include "i2s_driver.h"
 #include "logger.h"
 #include "mp3_decoder.h"
+#include "data_source.h"
+#include "data_source_littlefs.h"
+#include "data_source_sdcard.h"
+#include "data_source_http.h"
 
 enum class PlayerState {
     STOPPED,
@@ -44,8 +49,8 @@ public:
     explicit AudioPlayer(const AudioConfig &cfg = default_audio_config());
 
     void set_callbacks(const PlayerCallbacks &cb);
-    bool select_file(const String &path, const char *label = nullptr);
-    bool arm_file();
+    bool select_source(const char* uri, SourceType hint = SourceType::LITTLEFS);
+    bool arm_source();
     void start();
     void stop();
     void toggle_pause();
@@ -67,8 +72,7 @@ public:
 
     // ring buffer exposed for CLI status
     size_t ring_buffer_used() const;
-    size_t ring_buffer_size() const { return ring_buffer_size_active_; }
-    bool ring_in_dram() const { return ring_buffer_in_dram_; }
+    size_t ring_buffer_size() const { return pcm_ring_size_; }
     uint32_t current_sample_rate() const { return current_sample_rate_; }
     uint64_t total_frames() const { return total_pcm_frames_; }
     uint64_t played_frames() const { return current_played_frames_; }
@@ -76,14 +80,8 @@ public:
     int saved_volume() const { return saved_volume_percent_; }
     int user_volume() const { return user_volume_percent_; }
 
-    // Used by decoder callback
-    bool receive_ring_item(void **item, size_t *item_size);
-    void return_ring_item(void *item);
-    bool should_stop() const { return stop_requested_; }
-
 private:
-    // Tasks
-    static void file_stream_task_entry(void *param);
+    // Task
     static void audio_task_entry(void *param);
     BaseType_t create_task_with_affinity(TaskFunction_t task_fn,
                                          const char *name,
@@ -115,8 +113,7 @@ private:
     void notify_error(const char *path, const char *detail);
     void notify_metadata(const Metadata &meta, const char *path);
 
-    // Task bodies
-    void file_stream_task();
+    // Task body
     void audio_task();
 
     // Config/static values
@@ -125,19 +122,20 @@ private:
     static constexpr uint32_t kDefaultChannels = 2;
 
     // State
+    std::unique_ptr<IDataSource> data_source_;
+    String current_uri_;
     String mp3_file_path_;
     String active_mp3_path_;
     String armed_mp3_path_;
     bool file_armed_ = false;
     size_t armed_file_size_ = 0;
 
-    RingbufHandle_t audio_ring_buffer_ = NULL;
-    StaticRingbuffer_t audio_ring_struct_ = {};
-    uint8_t *audio_ring_storage_ = NULL;
-    size_t ring_buffer_size_active_ = 0;
-    bool ring_buffer_in_dram_ = false;
-    size_t producer_min_free_bytes_active_ = 0;
-    size_t producer_resume_free_bytes_active_ = 0;
+    // Ring buffer PCM (più piccolo del precedente MP3 buffer)
+    RingbufHandle_t pcm_ring_buffer_ = NULL;
+    StaticRingbuffer_t pcm_ring_struct_ = {};
+    uint8_t *pcm_ring_storage_ = NULL;
+    size_t pcm_ring_size_ = 0;
+
     uint32_t i2s_write_timeout_ms_ = 0;
 
     struct MemoryStats {
@@ -167,7 +165,6 @@ private:
     volatile uint32_t recovery_attempts_ = 0;
 
     TaskHandle_t audio_task_handle_ = NULL;
-    TaskHandle_t file_task_handle_ = NULL;
     EventGroupHandle_t playback_events_ = NULL;
 
     // Components

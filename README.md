@@ -1,5 +1,4 @@
-# 🎵 ESP32-S3 MP3 Audio Player (Apache 2.0 License)
-
+# 🎵 ESP32-S3 MP3 Audio Player 
 Libreria audio completamente open-source come alternativa GPL-free alla ESP32-audioI2S, scritta da zero per ESP32-S3 con Freenove Display. Supporta MP3 stereo fino a 44.1kHz via LittleFS, con controllo completo e prestazioni ottimali.
 
 ## 📋 Panoramica
@@ -12,7 +11,6 @@ Implementazione professionale basata su classe `AudioPlayer` con due task FreeRT
 - **audio_task**: Decodifica dr_mp3 + output I2S consumer
 
 ### Caratteristiche Tecniche
-- **Licenza**: Apache 2.0 (alternativa GPL-free completa)
 - **Decodificatore**: dr_mp3 (pubblico dominio/MIT-0)
 - **Codec**: ES8311 integrato (configurato da I2C/SCLK)
 - **Filesystem**: LittleFS flash (5MB partizionati)
