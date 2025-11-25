@@ -142,7 +142,7 @@ void AudioPlayer::schedule_recovery(FailureReason reason, const char *detail) {
         last_failure_reason_ = reason;
         player_state_ = PlayerState::ERROR;
         LOG_WARN("Scheduling auto recovery (%s). Attempt %u/%u", detail, recovery_attempts_, cfg_.max_recovery_attempts);
-        notify_error(active_mp3_path_.c_str(), detail);
+        notify_error(data_source_ ? data_source_->uri() : "n/a", detail);
     }
     stop_requested_ = true;
 }
@@ -263,14 +263,10 @@ bool AudioPlayer::select_source(const char* uri, SourceType hint) {
             return false;
     }
 
-    current_uri_ = uri;
-    mp3_file_path_ = uri;
-    file_armed_ = false;
     current_metadata_ = Metadata();
 
     LOG_INFO("Source selected: %s (type: %d)", uri, (int)type);
-
-    return true;
+    return data_source_->open(uri);
 }
 
 bool AudioPlayer::arm_source() {
@@ -279,32 +275,27 @@ bool AudioPlayer::arm_source() {
         return false;
     }
 
-    if (!data_source_->open(current_uri_.c_str())) {
-        LOG_ERROR("Failed to open: %s", current_uri_.c_str());
-        file_armed_ = false;
-        return false;
+    // Se la sorgente non è già aperta, prova ad aprirla.
+    // Questo rende 'arm_source' idempotente.
+    if (!data_source_->is_open()) {
+        if (!data_source_->open(data_source_->uri())) {
+            LOG_ERROR("Failed to open: %s", data_source_->uri());
+            return false;
+        }
     }
 
-    armed_file_size_ = data_source_->size();
-    armed_mp3_path_ = current_uri_;
-    file_armed_ = true;
-
     LOG_INFO("Source armed: %s, size=%u bytes, seekable=%s",
-             current_uri_.c_str(),
-             (unsigned)armed_file_size_,
+             data_source_->uri(),
+             (unsigned)data_source_->size(),
              data_source_->is_seekable() ? "yes" : "no");
 
-    // Parse metadata solo per file locali (non HTTP)
     if (data_source_->is_seekable()) {
         if (id3_parser_.parse(data_source_.get(), current_metadata_)) {
-            const char *title = current_metadata_.title.length() ? current_metadata_.title.c_str() : "n/a";
-            const char *artist = current_metadata_.artist.length() ? current_metadata_.artist.c_str() : "n/a";
-            const char *album = current_metadata_.album.length() ? current_metadata_.album.c_str() : "n/a";
-            LOG_INFO("Metadata: title=\"%s\" artist=\"%s\" album=\"%s\"", title, artist, album);
+            LOG_INFO("Metadata: title=\"%s\" artist=\"%s\" album=\"%s\"", current_metadata_.title.c_str(), current_metadata_.artist.c_str(), current_metadata_.album.c_str());
         } else {
             LOG_INFO("Metadata ID3 not found or not parseable");
         }
-        notify_metadata(current_metadata_, armed_mp3_path_.c_str());
+        notify_metadata(current_metadata_, data_source_->uri());
     }
 
     return true;
@@ -351,7 +342,7 @@ void AudioPlayer::start() {
         LOG_INFO("Already active");
         return;
     }
-    if (!file_armed_ || !data_source_ || !data_source_->is_open()) {
+    if (!data_source_ || !data_source_->is_open()) {
         LOG_WARN("No source armed. Use 'l' before 'p'");
         return;
     }
@@ -372,9 +363,7 @@ void AudioPlayer::start() {
         xEventGroupClearBits(playback_events_, AUDIO_TASK_DONE_BIT);
     }
 
-    active_mp3_path_ = armed_mp3_path_;
-
-    LOG_INFO("Starting playback: %s", active_mp3_path_.c_str());
+    LOG_INFO("Starting playback: %s", data_source_->uri());
 
     // Crea SOLO audio task (no file task!)
     BaseType_t created = create_task_with_affinity(
@@ -397,7 +386,7 @@ void AudioPlayer::start() {
     player_state_ = PlayerState::PLAYING;
 
     LOG_INFO("Playback started");
-    notify_start(active_mp3_path_.c_str());
+    notify_start(data_source_->uri());
 }
 
 void AudioPlayer::stop() {
@@ -406,7 +395,7 @@ void AudioPlayer::stop() {
         LOG_INFO("Not playing.");
         return;
     }
-    String stopped_path = active_mp3_path_;
+    String stopped_path = data_source_ ? data_source_->uri() : "";
     stop_requested_ = true;
     pause_flag_ = false;
     wait_for_task_shutdown(2500);
@@ -456,12 +445,14 @@ void AudioPlayer::print_status() const {
     LOG_INFO("Volume: %d%% (saved: %d%%)", current_volume_percent_, saved_volume_percent_);
     LOG_INFO("Sample Rate: %u Hz", current_sample_rate_);
     LOG_INFO("PCM ring buffer -> %u/%u bytes used", (unsigned)ring_used, (unsigned)pcm_ring_size_);
-    LOG_INFO("File selected: %s | armed: %s | active: %s | armed=%s size=%u",
-             mp3_file_path_.c_str(),
-             armed_mp3_path_.c_str(),
-             active_mp3_path_.c_str(),
-             file_armed_ ? "true" : "false",
-             (unsigned)armed_file_size_);
+    if (data_source_) {
+        LOG_INFO("Source: %s | open: %s | size: %u bytes",
+                 data_source_->uri(),
+                 data_source_->is_open() ? "yes" : "no",
+                 (unsigned)data_source_->size());
+    } else {
+        LOG_INFO("Source: not selected");
+    }
     const char *title = current_metadata_.title.length() ? current_metadata_.title.c_str() : "n/a";
     const char *artist = current_metadata_.artist.length() ? current_metadata_.artist.c_str() : "n/a";
     const char *album = current_metadata_.album.length() ? current_metadata_.album.c_str() : "n/a";
@@ -728,7 +719,7 @@ cleanup:
     }
 
     PlayerState final_state = player_state_;
-    String path_copy = active_mp3_path_;
+    String path_copy = data_source_ ? data_source_->uri() : "";
     playing_ = false;
     signal_task_done(AUDIO_TASK_DONE_BIT);
     audio_task_handle_ = NULL;

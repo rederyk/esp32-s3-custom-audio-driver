@@ -1,7 +1,6 @@
 #pragma once
 
 #include <Arduino.h>
-#include <LittleFS.h>
 #include <esp_heap_caps.h>
 #include <memory>
 #include "freertos/FreeRTOS.h"
@@ -63,12 +62,8 @@ public:
     // Info for CLI
     bool is_playing() const { return playing_; }
     PlayerState state() const { return player_state_; }
-    const String &selected_path() const { return mp3_file_path_; }
-    const String &armed_path() const { return armed_mp3_path_; }
-    const String &active_path() const { return active_mp3_path_; }
-    bool file_armed() const { return file_armed_; }
-    size_t armed_file_size() const { return armed_file_size_; }
     const Metadata &metadata() const { return current_metadata_; }
+    const IDataSource* data_source() const { return data_source_.get(); }
 
     // ring buffer exposed for CLI status
     size_t ring_buffer_used() const;
@@ -122,12 +117,6 @@ private:
 
     // State
     std::unique_ptr<IDataSource> data_source_;
-    String current_uri_;
-    String mp3_file_path_;
-    String active_mp3_path_;
-    String armed_mp3_path_;
-    bool file_armed_ = false;
-    size_t armed_file_size_ = 0;
 
     // Ring buffer PCM (più piccolo del precedente MP3 buffer)
     RingbufHandle_t pcm_ring_buffer_ = NULL;

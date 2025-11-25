@@ -131,7 +131,7 @@ static void handle_command_string(String cmd)
             }
             else
             {
-                if (!player.file_armed())
+                if (!player.data_source() || !player.data_source()->is_open())
                 {
                     LOG_WARN("Nessun file armato. Usa 'l' per caricare prima di play.");
                     break;
