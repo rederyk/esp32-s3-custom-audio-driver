@@ -1,5 +1,6 @@
 #include "id3_parser.h"
 
+#include "data_source.h" // Aggiunto per IDataSource
 #include <cstring>
 
 static constexpr size_t kMaxTextFrameRead = 512;
@@ -101,20 +102,20 @@ String Id3Parser::decode_id3_text(const uint8_t *buf, size_t len) {
     return decode_id3_text_payload(encoding, data, data_len);
 }
 
-bool Id3Parser::read_id3v1(File &f, Metadata &out) {
+bool Id3Parser::read_id3v1(IDataSource* source, Metadata &out) {
     const size_t kTagSize = 128;
-    size_t file_size = f.size();
+    size_t file_size = source->size();
     if (file_size < kTagSize) {
         return false;
     }
-    if (!f.seek(file_size - kTagSize)) {
+    if (!source->seek(file_size - kTagSize)) {
         return false;
     }
     uint8_t buf[kTagSize];
-    if (f.read(buf, kTagSize) != kTagSize) {
+    if (source->read(buf, kTagSize) != kTagSize) {
         return false;
     }
-    if (memcmp(buf, "TAG", 3) != 0) {
+    if (memcmp(buf, "TAG", 3) != 0) { // Controlla il magic number "TAG"
         return false;
     }
 
@@ -148,12 +149,12 @@ bool Id3Parser::read_id3v1(File &f, Metadata &out) {
     return out.title.length() || out.artist.length() || out.album.length();
 }
 
-bool Id3Parser::read_id3v2(File &f, Metadata &out) {
-    if (!f.seek(0)) {
+bool Id3Parser::read_id3v2(IDataSource* source, Metadata &out) {
+    if (!source->seek(0)) {
         return false;
     }
     uint8_t header[10];
-    if (f.read(header, sizeof(header)) != sizeof(header)) {
+    if (source->read(header, sizeof(header)) != sizeof(header)) {
         return false;
     }
     if (memcmp(header, "ID3", 3) != 0) {
@@ -162,26 +163,26 @@ bool Id3Parser::read_id3v2(File &f, Metadata &out) {
     uint8_t version_major = header[3];
     uint8_t flags = header[5];
     uint32_t tag_size = parse_synchsafe32(&header[6]);
-    uint32_t tag_end = 10 + tag_size;
-    if (tag_end > f.size()) {
-        tag_end = f.size();
+    uint32_t tag_end = 10 + tag_size; // L'header non è incluso nella dimensione
+    if (tag_end > source->size()) {
+        tag_end = source->size();
     }
 
     if (flags & 0x40) { // extended header
         uint8_t ext_header[4];
-        if (f.read(ext_header, sizeof(ext_header)) != sizeof(ext_header)) {
+        if (source->read(ext_header, sizeof(ext_header)) != sizeof(ext_header)) {
             return false;
         }
         uint32_t ext_size = (version_major == 4) ? parse_synchsafe32(ext_header) : parse_be32(ext_header);
         if (version_major == 3 && ext_size >= 4) {
             ext_size -= 4; // v2.3 size includes these 4 bytes
         }
-        f.seek(f.position() + ext_size);
+        source->seek(source->tell() + ext_size);
     }
 
-    while (f.position() + 10 <= tag_end) {
+    while (source->tell() + 10 <= tag_end) {
         uint8_t frame_hdr[10];
-        if (f.read(frame_hdr, sizeof(frame_hdr)) != sizeof(frame_hdr)) {
+        if (source->read(frame_hdr, sizeof(frame_hdr)) != sizeof(frame_hdr)) {
             break;
         }
         if (frame_hdr[0] == 0) {
@@ -195,7 +196,7 @@ bool Id3Parser::read_id3v2(File &f, Metadata &out) {
         if (frame_size == 0) {
             break;
         }
-        uint32_t frame_end = f.position() + frame_size;
+        uint32_t frame_end = source->tell() + frame_size;
         bool handled = false;
 
         if (strcmp(id, "TIT2") == 0 || strcmp(id, "TPE1") == 0 || strcmp(id, "TALB") == 0 ||
@@ -205,7 +206,7 @@ bool Id3Parser::read_id3v2(File &f, Metadata &out) {
                 to_read = kMaxTextFrameRead; // limit to keep stack small
             }
             uint8_t buf[kMaxTextFrameRead];
-            size_t n = f.read(buf, to_read);
+            size_t n = source->read(buf, to_read);
             if (n > 0) {
                 String value = decode_id3_text(buf, n);
                 if (strcmp(id, "TIT2") == 0 && out.title.length() == 0 && value.length()) {
@@ -224,12 +225,12 @@ bool Id3Parser::read_id3v2(File &f, Metadata &out) {
                 handled = true;
             }
             if (n < frame_size) {
-                f.seek(frame_end);
+                source->seek(frame_end);
             }
         } else if (strcmp(id, "APIC") == 0) {
             // Do not read the whole image, just mark presence.
             out.cover_present = true;
-            f.seek(frame_end);
+            source->seek(frame_end);
             handled = true;
         } else if (strcmp(id, "COMM") == 0) {
             size_t to_read = frame_size;
@@ -237,7 +238,7 @@ bool Id3Parser::read_id3v2(File &f, Metadata &out) {
                 to_read = kMaxTextFrameRead;
             }
             uint8_t buf[kMaxTextFrameRead];
-            size_t n = f.read(buf, to_read);
+            size_t n = source->read(buf, to_read);
             if (n > 4) {
                 uint8_t encoding = buf[0];
                 size_t pos = 4; // skip encoding + 3-byte lang
@@ -258,21 +259,21 @@ bool Id3Parser::read_id3v2(File &f, Metadata &out) {
                 handled = true;
             }
             if (n < frame_size) {
-                f.seek(frame_end);
+                source->seek(frame_end);
             }
         }
 
         if (!handled) {
-            f.seek(frame_end);
+            source->seek(frame_end);
         }
-        if (f.position() < frame_end) {
-            f.seek(frame_end);
+        if (source->tell() < frame_end) {
+            source->seek(frame_end);
         }
 
         if (out.title.length() && out.artist.length() && out.album.length()) {
             break;
         }
-        if (f.position() >= tag_end) {
+        if (source->tell() >= tag_end) {
             break;
         }
     }
@@ -280,15 +281,14 @@ bool Id3Parser::read_id3v2(File &f, Metadata &out) {
     return out.title.length() || out.artist.length() || out.album.length();
 }
 
-bool Id3Parser::parse(const char *path, Metadata &out) {
+bool Id3Parser::parse(IDataSource* source, Metadata &out) {
     clear_metadata(out);
-    File f = LittleFS.open(path, "r");
-    if (!f) {
+    if (!source || !source->is_open() || !source->is_seekable()) {
         return false;
     }
-    bool found = read_id3v2(f, out);
+
+    bool found = read_id3v2(source, out);
     // Fall back or fill missing fields with ID3v1 if present.
-    read_id3v1(f, out);
-    f.close();
+    read_id3v1(source, out);
     return found || out.title.length() || out.artist.length() || out.album.length();
 }

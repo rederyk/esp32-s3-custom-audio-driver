@@ -106,7 +106,6 @@ private:
     void update_memory_min();
     void reset_memory_stats();
     bool allocate_ring_buffer_with_fallback();
-    uint32_t detect_mp3_bitrate_kbps(const char *path, uint32_t *header_sample_rate);
     void notify_start(const char *path);
     void notify_stop(const char *path, PlayerState state);
     void notify_end(const char *path);

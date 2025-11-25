@@ -199,60 +199,6 @@ void AudioPlayer::update_memory_min() {
     }
 }
 
-
-uint32_t AudioPlayer::detect_mp3_bitrate_kbps(const char *path, uint32_t *header_sample_rate) {
-    File f = LittleFS.open(path, "r");
-    if (!f) {
-        return 0;
-    }
-
-    uint8_t buf[1024];
-    int len = f.read(buf, sizeof(buf));
-    f.close();
-    if (len < 4) return 0;
-
-    const uint16_t bitrate_mpeg1_l3[16] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0};
-    const uint16_t bitrate_mpeg2_l3[16] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0};
-    const uint32_t sr_table_mpeg1[3] = {44100, 48000, 32000};
-    const uint32_t sr_table_mpeg2[3] = {22050, 24000, 16000};
-    const uint32_t sr_table_mpeg25[3] = {11025, 12000, 8000};
-
-    for (int i = 0; i <= len - 4; i++) {
-        if (buf[i] == 0xFF && (buf[i + 1] & 0xE0) == 0xE0) {
-            uint8_t b1 = buf[i + 1];
-            uint8_t b2 = buf[i + 2];
-            int version_id = (b1 >> 3) & 0x03;
-            int layer_idx = (b1 >> 1) & 0x03;
-            int bitrate_idx = (b2 >> 4) & 0x0F;
-            int sr_idx = (b2 >> 2) & 0x03;
-            if (layer_idx != 0x01 || bitrate_idx == 0x0F || sr_idx == 0x03) {
-                continue;
-            }
-
-            uint32_t sample_rate = 0;
-            uint16_t bitrate_kbps = 0;
-            if (version_id == 0x03) {
-                sample_rate = sr_table_mpeg1[sr_idx];
-                bitrate_kbps = bitrate_mpeg1_l3[bitrate_idx];
-            } else if (version_id == 0x02) {
-                sample_rate = sr_table_mpeg2[sr_idx];
-                bitrate_kbps = bitrate_mpeg2_l3[bitrate_idx];
-            } else if (version_id == 0x00) {
-                sample_rate = sr_table_mpeg25[sr_idx];
-                bitrate_kbps = bitrate_mpeg2_l3[bitrate_idx];
-            } else {
-                continue;
-            }
-
-            if (header_sample_rate) {
-                *header_sample_rate = sample_rate;
-            }
-            return bitrate_kbps;
-        }
-    }
-    return 0;
-}
-
 void AudioPlayer::notify_start(const char *path) {
     if (callbacks_.on_start) {
         callbacks_.on_start(path);
@@ -349,8 +295,8 @@ bool AudioPlayer::arm_source() {
              data_source_->is_seekable() ? "yes" : "no");
 
     // Parse metadata solo per file locali (non HTTP)
-    if (data_source_->type() != SourceType::HTTP_STREAM) {
-        if (id3_parser_.parse(current_uri_.c_str(), current_metadata_)) {
+    if (data_source_->is_seekable()) {
+        if (id3_parser_.parse(data_source_.get(), current_metadata_)) {
             const char *title = current_metadata_.title.length() ? current_metadata_.title.c_str() : "n/a";
             const char *artist = current_metadata_.artist.length() ? current_metadata_.artist.c_str() : "n/a";
             const char *album = current_metadata_.album.length() ? current_metadata_.album.c_str() : "n/a";
@@ -585,14 +531,9 @@ void AudioPlayer::audio_task() {
 
     // Stima durata se non disponibile
     if (total_pcm_frames_ == 0 && data_source_->size() > 0) {
-        uint32_t header_sr = 0;
-        uint32_t bitrate_kbps = detect_mp3_bitrate_kbps(current_uri_.c_str(), &header_sr);
-        if (bitrate_kbps > 0) {
-            total_pcm_frames_ = (data_source_->size() * 8ULL * sample_rate) / (bitrate_kbps * 1000ULL);
-            LOG_INFO("Estimated duration: %llu frames (~%u seconds)",
-                     total_pcm_frames_,
-                     (unsigned)(total_pcm_frames_ / sample_rate));
-        }
+        // La stima del bitrate è stata rimossa per evitare dipendenze dal filesystem.
+        // La durata sarà nota solo se il file MP3 ha un header Xing/VBRI,
+        // che dr_mp3 legge automaticamente.
     }
 
     // ===== ALLOCA RING BUFFER PCM =====
