@@ -82,7 +82,7 @@ public:
                 continue;
             }
 
-            // 2. Ricarica da stream HTTP
+            // 2. Ricarica da stream HTTP provando a saturare la richiesta
             if (!stream_ || !stream_->connected()) {
                 LOG_WARN("HTTP stream disconnected, reconnecting (%d/%d)",
                          retry_count + 1, max_retry);
@@ -93,32 +93,18 @@ public:
                 break;
             }
 
-            int avail = stream_->available();
-            if (avail <= 0) {
-                // Attendi dati con timeout
-                int wait_ms = 0;
-                while (wait_ms < 1000 && stream_->connected()) {
-                    avail = stream_->available();
-                    if (avail > 0) break;
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                    wait_ms += 10;
-                }
+            size_t to_read = (size - total_read > sizeof(local_buffer_))
+                                 ? sizeof(local_buffer_)
+                                 : (size - total_read);
 
-                if (avail <= 0) {
-                    LOG_WARN("HTTP stream timeout waiting for data");
-                    retry_count++;
-                    continue;
-                }
-            }
-
-            // Leggi chunk in buffer locale
-            size_t to_read = (avail < (int)sizeof(local_buffer_)) ? avail : sizeof(local_buffer_);
+            // readBytes blocca fino a timeout per ottenere tutti i bytes richiesti
             buffer_fill_ = stream_->readBytes(local_buffer_, to_read);
             buffer_pos_ = 0;
 
             if (buffer_fill_ == 0) {
                 LOG_WARN("HTTP read returned 0 bytes");
                 retry_count++;
+                continue;
             }
         }
 
@@ -186,6 +172,9 @@ private:
         }
 
         stream_ = http_.getStreamPtr();
+        if (stream_) {
+            stream_->setTimeout(3000);  // blocco massimo per readBytes
+        }
         position_ = from_position;
         buffer_fill_ = 0;
         buffer_pos_ = 0;

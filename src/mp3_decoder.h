@@ -40,6 +40,8 @@ private:
     drmp3_int64 do_tell();
     bool ensure_buffers(size_t pcm_frames);
     bool reinit_decoder();
+    drmp3_seek_proc current_seek_cb() const;
+    drmp3_tell_proc current_tell_cb() const;
 
     IDataSource* source_ = nullptr;
     drmp3 *mp3_ = nullptr;

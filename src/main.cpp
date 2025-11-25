@@ -6,8 +6,8 @@
 #include <esp_heap_caps.h>
 
 // WiFi credentials - CONFIGURA QUI LE TUE CREDENZIALI
-static const char *kWiFiSSID = "YOUR_WIFI_SSID";
-static const char *kWiFiPassword = "YOUR_WIFI_PASSWORD";
+static const char *kWiFiSSID = "FASTWEB-2";
+static const char *kWiFiPassword = "mailmioWIFIfaschifo";
 
 static const char *kTestFilePath = "/sample-rich.mp3";
 static const char *kSampleFilePath = "/audioontag.mp3";

@@ -51,8 +51,8 @@ bool Mp3Decoder::init(IDataSource* source, size_t frames_per_chunk, bool build_s
         return false;
     }
 
-    // Inizializza dr_mp3 con callbacks per read, seek e tell
-    if (!drmp3_init(mp3_, on_read_cb, on_seek_cb, on_tell_cb, NULL, this, NULL)) {
+    // Inizializza dr_mp3 con callbacks per read, seek e tell (solo se la sorgente è seekable)
+    if (!drmp3_init(mp3_, on_read_cb, current_seek_cb(), current_tell_cb(), NULL, this, NULL)) {
         LOG_ERROR("Failed to initialize dr_mp3");
         heap_caps_free(mp3_);
         mp3_ = nullptr;
@@ -360,7 +360,7 @@ bool Mp3Decoder::reinit_decoder() {
     drmp3_uninit(mp3_);
     memset(mp3_, 0, sizeof(drmp3));
 
-    if (!drmp3_init(mp3_, on_read_cb, on_seek_cb, on_tell_cb, NULL, this, NULL)) {
+    if (!drmp3_init(mp3_, on_read_cb, current_seek_cb(), current_tell_cb(), NULL, this, NULL)) {
         LOG_ERROR("Failed to reinitialize dr_mp3");
         initialized_ = false;
         return false;
@@ -368,4 +368,12 @@ bool Mp3Decoder::reinit_decoder() {
 
     initialized_ = true;
     return true;
+}
+
+drmp3_seek_proc Mp3Decoder::current_seek_cb() const {
+    return (source_ && source_->is_seekable()) ? on_seek_cb : nullptr;
+}
+
+drmp3_tell_proc Mp3Decoder::current_tell_cb() const {
+    return (source_ && source_->is_seekable()) ? on_tell_cb : nullptr;
 }
