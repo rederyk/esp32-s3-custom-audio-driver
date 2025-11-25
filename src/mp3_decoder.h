@@ -39,6 +39,7 @@ private:
     bool do_seek(int offset, drmp3_seek_origin origin);
     drmp3_int64 do_tell();
     bool ensure_buffers(size_t pcm_frames);
+    bool reinit_decoder();
 
     IDataSource* source_ = nullptr;
     drmp3 *mp3_ = nullptr;
@@ -47,4 +48,6 @@ private:
     Mp3SeekTable seek_table_;
     uint8_t* mp3_file_cache_ = nullptr;  // Cache del file MP3 per seek table
     size_t mp3_file_size_ = 0;
+    size_t stream_base_offset_ = 0;      // Offset di base usato come "inizio" logico per dr_mp3
+    size_t stream_size_ = 0;             // Cache della size() della sorgente per SEEK_END
 };

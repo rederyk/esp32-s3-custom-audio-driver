@@ -37,6 +37,8 @@ bool Mp3Decoder::init(IDataSource* source, size_t frames_per_chunk, bool build_s
     }
 
     source_ = source;
+    stream_base_offset_ = 0;
+    stream_size_ = source_->size();
 
     if (!ensure_buffers(frames_per_chunk)) {
         LOG_ERROR("Failed to allocate PCM buffer (%u frames)", static_cast<unsigned>(frames_per_chunk));
@@ -129,6 +131,8 @@ void Mp3Decoder::shutdown() {
     seek_table_.clear();
     source_ = nullptr;
     initialized_ = false;
+    stream_base_offset_ = 0;
+    stream_size_ = 0;
 }
 
 drmp3_uint64 Mp3Decoder::read_frames(int16_t *dst, drmp3_uint64 frames) {
@@ -148,79 +152,68 @@ bool Mp3Decoder::seek_to_frame(drmp3_uint64 frame_index) {
         return false;
     }
 
-    uint32_t current_pos = source_->tell();
     uint32_t seek_start = millis();
+    stream_size_ = source_->size();
 
-    // Usa seek table se disponibile
+    // Usa seek table: re-inizializza dr_mp3 facendo credere che l'offset sia l'inizio del file
     if (seek_table_.is_ready()) {
         uint64_t byte_offset = 0;
         uint64_t nearest_frame = 0;
 
-        if (seek_table_.find_seek_point(frame_index, &byte_offset, &nearest_frame)) {
-            LOG_DEBUG("Seek table: target=%llu, nearest=%llu (delta=%lld frames), byte=%llu",
-                      frame_index, nearest_frame,
-                      (int64_t)(frame_index - nearest_frame),
-                      byte_offset);
+        if (seek_table_.find_seek_point(frame_index, &byte_offset, &nearest_frame) && nearest_frame <= frame_index) {
+            stream_base_offset_ = static_cast<size_t>(byte_offset);
 
-            // Seek diretto alla posizione byte
-            if (source_->seek(byte_offset)) {
-                // Reinizializza dr_mp3 dalla nuova posizione senza fare seek interno
-                // Questo resetterà il suo buffer interno e ripartirà dalla posizione corrente del file
-                drmp3_uninit(mp3_);
-                if (!drmp3_init(mp3_, on_read_cb, on_seek_cb, on_tell_cb, NULL, this, NULL)) {
-                    LOG_ERROR("Failed to reinit dr_mp3 after seek table jump");
-                    return false;
-                }
+            if (!reinit_decoder()) {
+                stream_base_offset_ = 0;
+                return false;
+            }
 
-                // Ora il decoder è alla posizione nearest_frame nel file
-                // Decode e scarta frame fino al target esatto
-                uint64_t frames_to_skip = frame_index - nearest_frame;
+            uint64_t frames_to_skip = frame_index - nearest_frame;
 
-                if (frames_to_skip > 0) {
-                    int16_t temp_buf[2048];
-                    uint64_t total_skipped = 0;
+            if (frames_to_skip > 0) {
+                int16_t temp_buf[2048];
+                uint64_t total_skipped = 0;
 
-                    while (total_skipped < frames_to_skip) {
-                        uint64_t skip_now = (frames_to_skip - total_skipped > 1024) ? 1024 : (frames_to_skip - total_skipped);
-                        uint64_t skipped = drmp3_read_pcm_frames_s16(mp3_, skip_now, temp_buf);
+                while (total_skipped < frames_to_skip) {
+                    uint64_t skip_now = (frames_to_skip - total_skipped > 1024)
+                        ? 1024
+                        : (frames_to_skip - total_skipped);
+                    uint64_t skipped = drmp3_read_pcm_frames_s16(mp3_, skip_now, temp_buf);
 
-                        if (skipped == 0) {
-                            LOG_WARN("Unexpected EOF while skipping frames (skipped %llu/%llu)",
-                                     total_skipped, frames_to_skip);
-                            break;
-                        }
-
-                        total_skipped += skipped;
+                    if (skipped == 0) {
+                        LOG_WARN("Unexpected EOF while skipping frames (skipped %llu/%llu)",
+                                 total_skipped, frames_to_skip);
+                        break;
                     }
 
-                    LOG_DEBUG("Skipped %llu frames to reach target", total_skipped);
+                    total_skipped += skipped;
                 }
 
-                uint32_t seek_end = millis();
-                LOG_INFO("SEEK TABLE used: %u ms (target frame=%llu)",
-                         seek_end - seek_start, frame_index);
-                return true;
-            } else {
-                LOG_ERROR("Seek table byte seek failed, falling back to dr_mp3");
+                LOG_DEBUG("Skipped %llu frames to reach target", total_skipped);
             }
+
+            uint32_t seek_end = millis();
+            LOG_INFO("SEEK TABLE used: %u ms (target frame=%llu)",
+                     seek_end - seek_start, frame_index);
+            return true;
         }
+        LOG_DEBUG("Seek table does not cover target frame %llu, using dr_mp3 seek", frame_index);
     }
 
-    // Fallback a dr_mp3 seek (lento)
-    LOG_DEBUG("Decoder seek_to_frame (dr_mp3 fallback): current file pos=%u, target frame=%llu",
-              (unsigned)current_pos, frame_index);
+    // Fallback a dr_mp3 seek standard
+    stream_base_offset_ = 0;
+
+    if (!reinit_decoder()) {
+        return false;
+    }
 
     drmp3_bool32 result = drmp3_seek_to_pcm_frame(mp3_, frame_index);
     uint32_t seek_end = millis();
 
-    uint32_t new_pos = source_->tell();
+    size_t current_pos = source_->tell();
 
     if (result == DRMP3_TRUE) {
-        LOG_INFO("dr_mp3 seek: %u ms, file pos %u -> %u (jumped %d bytes)",
-                 seek_end - seek_start,
-                 (unsigned)current_pos,
-                 (unsigned)new_pos,
-                 (int)(new_pos - current_pos));
+        LOG_INFO("dr_mp3 seek: %u ms, file pos -> %u", seek_end - seek_start, (unsigned)current_pos);
         return true;
     } else {
         LOG_ERROR("dr_mp3 seek FAILED after %u ms", seek_end - seek_start);
@@ -273,25 +266,43 @@ bool Mp3Decoder::do_seek(int offset, drmp3_seek_origin origin) {
         return false;
     }
 
-    size_t current_pos = source_->tell();
-    size_t target_pos = 0;
+    size_t current_abs = source_->tell();
+    size_t current_pos = (current_abs >= stream_base_offset_) ? (current_abs - stream_base_offset_) : 0;
+    size_t target_pos = current_pos;
 
     switch (origin) {
         case DRMP3_SEEK_SET:
-            target_pos = offset;
+            if (offset < 0) {
+                target_pos = 0;
+            } else {
+                target_pos = static_cast<size_t>(offset);
+            }
             break;
 
         case DRMP3_SEEK_CUR:
-            target_pos = current_pos + offset;
+            if (offset < 0) {
+                size_t delta = static_cast<size_t>(-offset);
+                target_pos = (delta > current_pos) ? 0 : (current_pos - delta);
+            } else {
+                target_pos = current_pos + static_cast<size_t>(offset);
+            }
             break;
 
         case DRMP3_SEEK_END:
             // Seek from end: offset è negativo dalla fine del file
-            if (source_->size() == 0) {
+            if (source_->size() == 0 || stream_size_ == 0) {
                 LOG_WARN("Cannot seek from end: file size unknown");
                 return false;
             }
-            target_pos = source_->size() + offset;  // offset è negativo
+            {
+                size_t effective_size = (stream_size_ > stream_base_offset_) ? (stream_size_ - stream_base_offset_) : 0;
+                if (offset < 0) {
+                    size_t delta = static_cast<size_t>(-offset);
+                    target_pos = (delta > effective_size) ? 0 : (effective_size - delta);
+                } else {
+                    target_pos = effective_size + static_cast<size_t>(offset);
+                }
+            }
             break;
 
         default:
@@ -299,22 +310,32 @@ bool Mp3Decoder::do_seek(int offset, drmp3_seek_origin origin) {
             return false;
     }
 
+    // Clamp to stream size if known
+    if (stream_size_ > 0) {
+        size_t effective_size = (stream_size_ > stream_base_offset_) ? (stream_size_ - stream_base_offset_) : 0;
+        if (target_pos > effective_size) {
+            target_pos = effective_size;
+        }
+    }
+
     // Esegui seek sulla DataSource
     uint32_t seek_start = millis();
-    bool success = source_->seek(target_pos);
+    size_t absolute_target = stream_base_offset_ + target_pos;
+    bool success = source_->seek(absolute_target);
     uint32_t seek_end = millis();
 
     static int seek_call_count = 0;
     seek_call_count++;
 
     if (success) {
-        LOG_DEBUG("do_seek #%d: origin=%d, %u -> %u (%+d bytes) in %u ms",
+        LOG_DEBUG("do_seek #%d: origin=%d, rel %u -> %u (abs %u) (%+d bytes) in %u ms",
                   seek_call_count, (int)origin,
                   (unsigned)current_pos, (unsigned)target_pos,
+                  (unsigned)absolute_target,
                   (int)(target_pos - current_pos),
                   seek_end - seek_start);
     } else {
-        LOG_ERROR("do_seek #%d FAILED: target byte %u", seek_call_count, (unsigned)target_pos);
+        LOG_ERROR("do_seek #%d FAILED: target byte %u (abs %u)", seek_call_count, (unsigned)target_pos, (unsigned)absolute_target);
     }
 
     return success;
@@ -324,5 +345,27 @@ drmp3_int64 Mp3Decoder::do_tell() {
     if (!source_ || !source_->is_open()) {
         return 0;
     }
-    return static_cast<drmp3_int64>(source_->tell());
+    size_t abs_pos = source_->tell();
+    if (abs_pos < stream_base_offset_) {
+        return 0;
+    }
+    return static_cast<drmp3_int64>(abs_pos - stream_base_offset_);
+}
+
+bool Mp3Decoder::reinit_decoder() {
+    if (!mp3_) {
+        return false;
+    }
+
+    drmp3_uninit(mp3_);
+    memset(mp3_, 0, sizeof(drmp3));
+
+    if (!drmp3_init(mp3_, on_read_cb, on_seek_cb, on_tell_cb, NULL, this, NULL)) {
+        LOG_ERROR("Failed to reinitialize dr_mp3");
+        initialized_ = false;
+        return false;
+    }
+
+    initialized_ = true;
+    return true;
 }
