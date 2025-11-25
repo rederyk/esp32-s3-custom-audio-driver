@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include "audio_player.h"
 #include "logger.h"
+#include "drivers/sd_card_driver.h"
 #include <esp_heap_caps.h>
 
 // WiFi credentials - CONFIGURA QUI LE TUE CREDENZIALI
@@ -16,7 +17,7 @@ static const char *kRadioStreamURL = "http://stream.radioparadise.com/mp3-128";
 
 static AudioPlayer player;
 
-static void list_files(const char *path)
+static void list_littlefs_files(const char *path)
 {
     File root = LittleFS.open(path);
     if (!root)
@@ -53,6 +54,28 @@ static void list_files(const char *path)
     root.close();
 }
 
+static void list_sd_files(const char *path)
+{
+    auto &sd = SdCardDriver::getInstance();
+    if (!sd.isMounted())
+    {
+        LOG_WARN("SD card not mounted. Cannot list files.");
+        return;
+    }
+
+    LOG_INFO("Contenuto di SD:%s:", path);
+    auto entries = sd.listDirectory(path);
+    if (entries.empty())
+    {
+        LOG_INFO("(vuoto)");
+    }
+    for (const auto &entry : entries)
+    {
+        LOG_INFO("%s %s (%llu bytes)",
+                 entry.isDirectory ? "DIR " : "FILE", entry.name.c_str(), entry.sizeBytes);
+    }
+}
+
 static void select_source_path(const char *path)
 {
     player.select_source(path);
@@ -79,10 +102,11 @@ static void handle_command_string(String cmd)
             LOG_INFO("l - Carica/verifica file selezionato (no play)");
             LOG_INFO("p - Play/Pause toggle");
             LOG_INFO("q - Stop playback");
-            LOG_INFO("d - Lista i file in LittleFS (usa d/path per directory specifica)");
+            LOG_INFO("d <path> - Lista i file (es. 'd /' per LittleFS, 'd /sd/' per SD card)");
             LOG_INFO("m - Memory stats (start/min/current)");
-            LOG_INFO("f<path> - Seleziona file custom (es. fmy.mp3)");
+            LOG_INFO("f<path> - Seleziona file custom (es. f/my.mp3 o f/sd/song.mp3)");
             LOG_INFO("i - Player status");
+            LOG_INFO("x - Stato della scheda SD");
             LOG_INFO("v## - Set volume to ##% (e.g. v75)");
             LOG_INFO("s## - Seek to ## seconds (e.g. s123)");
             break;
@@ -121,7 +145,7 @@ static void handle_command_string(String cmd)
             break;
         case 'd':
         case 'D':
-            list_files("/");
+            list_littlefs_files("/");
             break;
         case 't':
         case 'T':
@@ -146,6 +170,21 @@ static void handle_command_string(String cmd)
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
                      (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+            break;
+        case 'x':
+        case 'X':
+        {
+            auto &sd = SdCardDriver::getInstance();
+            LOG_INFO("--- SD Card Status ---");
+            if (sd.isMounted()) {
+                LOG_INFO("Status: Mounted");
+                LOG_INFO("Card Type: %s", sd.cardTypeString().c_str());
+                LOG_INFO("Size: %llu MB, Used: %llu MB", sd.totalBytes() / (1024 * 1024), sd.usedBytes() / (1024 * 1024));
+            } else {
+                LOG_INFO("Status: Not Mounted");
+                LOG_INFO("Last Error: %s", sd.lastError().c_str());
+            }
+        }
             break;
         default:
             LOG_WARN("Unknown command: %s. Type 'h' for help.", cmd.c_str());
@@ -172,11 +211,15 @@ static void handle_command_string(String cmd)
             {
                 path = "/";
             }
-            if (path.charAt(0) != '/')
-            {
-                path = "/" + path;
+            if (path.startsWith("/sd")) {
+                list_sd_files(path.c_str());
+            } else {
+                if (path.charAt(0) != '/')
+                {
+                    path = "/" + path;
+                }
+                list_littlefs_files(path.c_str());
             }
-            list_files(path.c_str());
         }
         else if (first_char == 'f' || first_char == 'F')
         {
@@ -212,6 +255,14 @@ void setup()
     {
         LOG_ERROR("LittleFS mount failed. Upload filesystem with 'pio run -t uploadfs'.");
         return;
+    }
+
+    // Inizializza SD Card
+    LOG_INFO("Initializing SD card...");
+    if (SdCardDriver::getInstance().begin()) {
+        LOG_INFO("SD card mounted successfully.");
+    } else {
+        LOG_WARN("SD card mount failed: %s", SdCardDriver::getInstance().lastError().c_str());
     }
 
     // Inizializza WiFi se configurato (necessario per stream HTTP)

@@ -1,24 +1,32 @@
 #pragma once
 
 #include "data_source.h"
-#include <SD.h>
+#include <SD_MMC.h>
+#include "drivers/sd_card_driver.h"
 #include <Arduino.h>
 
 class SDCardSource : public IDataSource {
 public:
     SDCardSource() = default;
     ~SDCardSource() override { close(); }
-
+ 
     bool open(const char* uri) override {
         close();
+
+        auto& sd_driver = SdCardDriver::getInstance();
+        if (!sd_driver.isMounted()) {
+            // Prova a montare se non lo è già
+            if (!sd_driver.begin()) {
+                return false;
+            }
+        }
 
         // Rimuovi prefix "/sd/" se presente per ottenere path reale
         const char* path = uri;
         if (strncmp(uri, "/sd/", 4) == 0) {
             path = uri + 3;  // Mantieni il "/" iniziale
         }
-
-        file_ = SD.open(path, FILE_READ);
+        file_ = SD_MMC.open(path, FILE_READ);
         if (file_) {
             uri_ = uri;
             size_ = file_.size();
