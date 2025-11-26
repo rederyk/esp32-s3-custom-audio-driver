@@ -43,8 +43,14 @@ public:
     size_t total_downloaded_bytes() const;
     float buffer_duration_seconds() const;
 
+    // Temporal seek (NEW)
+    size_t seek_to_time(uint32_t target_ms);     // Seek to timestamp, returns byte offset
+    uint32_t total_duration_ms() const;          // Total available duration
+    uint32_t current_position_ms() const;        // Current playback position in ms
+
 private:
-    static const size_t BUFFER_SIZE = 128 * 1024;       // 128KB per buffer
+    static const size_t BUFFER_SIZE = 128 * 1024;       // 128KB recording buffer
+    static const size_t PLAYBACK_BUFFER_SIZE = 256 * 1024;  // 256KB playback buffer (2 chunks)
     static const size_t CHUNK_SIZE = 512 * 1024;        // 512KB SD chunks
     static const size_t INVALID_CHUNK_ID = SIZE_MAX;
 
@@ -62,6 +68,11 @@ private:
         std::string filename;
         ChunkState state;
         uint32_t crc32;          // Per validazione (opzionale)
+
+        // Temporal information
+        uint32_t start_time_ms = 0;    // Timestamp inizio chunk (millisecondi)
+        uint32_t duration_ms = 0;      // Durata chunk in millisecondi
+        uint32_t total_frames = 0;     // Frame PCM totali nel chunk
     };
 
     // RECORDING BUFFER (Write-Only by download task)
@@ -75,6 +86,7 @@ private:
     uint8_t* playback_buffer_ = nullptr;
     size_t current_playback_chunk_id_ = INVALID_CHUNK_ID;  // Currently loaded chunk
     size_t playback_chunk_loaded_size_ = 0;                // Size of loaded chunk
+    size_t last_preload_check_chunk_ = INVALID_CHUNK_ID;  // Last chunk we checked for preload
     
     // Global stream state
     std::string uri_;
@@ -94,15 +106,21 @@ private:
     // Synchronization
     SemaphoreHandle_t mutex_ = nullptr;
     bool pause_download_ = false;  // Flag to pause/resume recording
-    
+
     // Seek Table (built incrementally)
     Mp3SeekTable seek_table_;
+
+    // Temporal tracking
+    uint32_t cumulative_time_ms_ = 0;  // Tempo cumulativo di tutti i chunk processati
     
     // RECORDING SIDE (private helpers)
     bool flush_recording_chunk();                    // Flush recording_buffer_ to SD as chunk
     bool write_chunk_to_sd(ChunkInfo& chunk);       // Write chunk data to SD file
     bool validate_chunk(ChunkInfo& chunk);          // Validate chunk integrity
     void promote_chunk_to_ready(ChunkInfo chunk);   // Move chunk from PENDING to READY
+    bool calculate_chunk_duration(const ChunkInfo& chunk,
+                                   uint32_t& out_frames,
+                                   uint32_t& out_duration_ms);  // Calcola durata chunk
 
     // PLAYBACK SIDE (private helpers)
     size_t find_chunk_for_offset(size_t offset);    // Find chunk ID containing offset

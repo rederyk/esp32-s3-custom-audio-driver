@@ -552,12 +552,36 @@ void AudioPlayer::audio_task() {
                 output_.stop();
                 uint32_t after_i2s_clear_ms = millis();
 
-                bool seek_success = stream_->seek(target_frame);
+                bool seek_success = false;
+
+                // Try temporal seek for TimeshiftManager (HTTP_STREAM type)
+                IDataSource* ds_nc = const_cast<IDataSource*>(stream_->data_source());
+                if (ds_nc && ds_nc->type() == SourceType::HTTP_STREAM) {
+                    // Assume HTTP_STREAM is TimeshiftManager (safe cast)
+                    TimeshiftManager* ts = static_cast<TimeshiftManager*>(ds_nc);
+                    uint32_t target_ms = seek_seconds_ * 1000;
+                    size_t byte_offset = ts->seek_to_time(target_ms);
+
+                    if (byte_offset != SIZE_MAX) {
+                        // Perform byte-level seek
+                        seek_success = ds_nc->seek(byte_offset);
+                        if (seek_success) {
+                            current_played_frames_ = target_frame;
+                            LOG_INFO("Temporal seek to %u ms succeeded (byte offset: %u)",
+                                     target_ms, (unsigned)byte_offset);
+                        }
+                    }
+                } else {
+                    // Use standard frame-based seek for other sources
+                    seek_success = stream_->seek(target_frame);
+                    if (seek_success) {
+                        current_played_frames_ = target_frame;
+                    }
+                }
+
                 uint32_t after_decoder_seek_ms = millis();
 
                 if (seek_success) {
-                    current_played_frames_ = target_frame;
-
                     uint32_t seek_end_ms = millis();
                     uint32_t total_time = seek_end_ms - seek_start_ms;
                     uint32_t decoder_time = after_decoder_seek_ms - after_i2s_clear_ms;

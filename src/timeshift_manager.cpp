@@ -39,6 +39,28 @@ bool TimeshiftManager::open(const char* uri) {
     pending_chunks_.clear();
     ready_chunks_.clear();
     pause_download_ = false;
+    cumulative_time_ms_ = 0;  // Reset temporal tracking
+
+    // Create timeshift directory if it doesn't exist
+    if (!SD_MMC.exists("/timeshift")) {
+        SD_MMC.mkdir("/timeshift");
+        LOG_INFO("Created /timeshift directory");
+    }
+
+    // Clean up old timeshift files from previous sessions
+    File tsDir = SD_MMC.open("/timeshift");
+    if (tsDir && tsDir.isDirectory()) {
+        File file = tsDir.openNextFile();
+        while (file) {
+            String fname = String("/timeshift/") + file.name();
+            file.close();
+            SD_MMC.remove(fname.c_str());
+            LOG_DEBUG("Cleaned up: %s", fname.c_str());
+            file = tsDir.openNextFile();
+        }
+        tsDir.close();
+        LOG_INFO("Timeshift directory cleaned");
+    }
 
     recording_buffer_ = (uint8_t*)malloc(BUFFER_SIZE);
     if (!recording_buffer_) {
@@ -47,7 +69,7 @@ bool TimeshiftManager::open(const char* uri) {
         return false;
     }
 
-    playback_buffer_ = (uint8_t*)malloc(BUFFER_SIZE);
+    playback_buffer_ = (uint8_t*)malloc(PLAYBACK_BUFFER_SIZE);
     if (!playback_buffer_) {
         LOG_ERROR("Failed to allocate playback buffer");
         free(recording_buffer_);
@@ -56,7 +78,8 @@ bool TimeshiftManager::open(const char* uri) {
         return false;
     }
 
-    LOG_INFO("Timeshift buffers allocated: 2x%uKB", BUFFER_SIZE / 1024);
+    LOG_INFO("Timeshift buffers allocated: rec=%uKB, play=%uKB",
+             BUFFER_SIZE / 1024, PLAYBACK_BUFFER_SIZE / 1024);
     return true;
 }
 
@@ -336,7 +359,7 @@ bool TimeshiftManager::flush_recording_chunk() {
     chunk.start_offset = current_recording_offset_;
     chunk.length = bytes_in_current_chunk_;
     chunk.end_offset = current_recording_offset_ + bytes_in_current_chunk_;
-    chunk.filename = "/ts_pending_" + std::to_string(chunk.id) + ".bin";
+    chunk.filename = "/timeshift/pending_" + std::to_string(chunk.id) + ".bin";
     chunk.state = ChunkState::PENDING;
     chunk.crc32 = 0; // TODO: calculate CRC if needed
 
@@ -431,20 +454,145 @@ bool TimeshiftManager::validate_chunk(ChunkInfo& chunk) {
     return true;
 }
 
+bool TimeshiftManager::calculate_chunk_duration(const ChunkInfo& chunk,
+                                                 uint32_t& out_frames,
+                                                 uint32_t& out_duration_ms)
+{
+    File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
+    if (!file) {
+        LOG_ERROR("Cannot open chunk for duration calculation: %s", chunk.filename.c_str());
+        return false;
+    }
+
+    uint8_t header[4];
+    uint32_t total_samples = 0;
+    uint32_t sample_rate = 44100;  // Default, will be updated from first frame
+
+    // Scan all MP3 frames in the chunk
+    while (file.available()) {
+        if (file.read(header, 4) != 4) break;
+
+        // Check sync word (0xFFE or 0xFFF at start)
+        if ((header[0] != 0xFF) || ((header[1] & 0xE0) != 0xE0)) {
+            continue;  // Not a frame header, advance by 1 byte and retry
+        }
+
+        // Parse MP3 frame header
+        uint8_t b1 = header[1];
+        uint8_t b2 = header[2];
+
+        int version_id = (b1 >> 3) & 0x03;      // MPEG version
+        int layer_idx = (b1 >> 1) & 0x03;       // Layer
+        int bitrate_idx = (b2 >> 4) & 0x0F;     // Bitrate index
+        int sr_idx = (b2 >> 2) & 0x03;          // Sample rate index
+        int padding = (b2 >> 1) & 0x01;         // Padding bit
+
+        // Validate header fields
+        if (layer_idx == 0 || bitrate_idx == 0x0F || sr_idx == 0x03) {
+            continue;  // Invalid header, skip
+        }
+
+        // Bitrate tables (kbps)
+        static const uint16_t bitrate_table[2][16] = {
+            {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0},  // MPEG1
+            {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0}       // MPEG2/2.5
+        };
+
+        // Sample rate tables
+        static const uint32_t sr_table[3][3] = {
+            {44100, 48000, 32000},  // MPEG1
+            {22050, 24000, 16000},  // MPEG2
+            {11025, 12000, 8000}    // MPEG2.5
+        };
+
+        int version_row = (version_id == 0x03) ? 0 : 1;  // MPEG1 vs MPEG2/2.5
+        uint32_t bitrate_kbps = bitrate_table[version_row][bitrate_idx];
+
+        int sr_row = (version_id == 0x03) ? 0 : (version_id == 0x02) ? 1 : 2;
+        sample_rate = sr_table[sr_row][sr_idx];
+
+        if (bitrate_kbps == 0 || sample_rate == 0) {
+            continue;  // Invalid values, skip
+        }
+
+        // Calculate frame size: FrameSize = 144 * BitRate / SampleRate + Padding
+        int frame_size = (144 * bitrate_kbps * 1000) / sample_rate + padding;
+
+        if (frame_size <= 0 || frame_size > 4096) {
+            continue;  // Unreasonable frame size, skip
+        }
+
+        // Each MP3 frame contains 1152 samples per channel (Layer 3)
+        uint32_t samples_per_frame = 1152;
+        if (layer_idx == 3) samples_per_frame = 384;      // Layer 1
+        else if (layer_idx == 2) samples_per_frame = 1152; // Layer 2
+        else samples_per_frame = ((version_id == 0x03) ? 1152 : 576); // Layer 3
+
+        total_samples += samples_per_frame;
+
+        // Skip to next frame
+        size_t current_pos = file.position();
+        if (current_pos + frame_size - 4 <= file.size()) {
+            file.seek(current_pos + frame_size - 4);
+        } else {
+            break;  // Would go beyond file end
+        }
+    }
+
+    file.close();
+
+    if (total_samples == 0) {
+        LOG_WARN("Chunk %u: no valid MP3 frames found", chunk.id);
+        return false;
+    }
+
+    // Calculate duration in milliseconds
+    out_frames = total_samples;
+    out_duration_ms = (total_samples * 1000) / sample_rate;
+
+    LOG_DEBUG("Chunk %u: %u samples, %u ms @ %u Hz",
+              chunk.id, out_frames, out_duration_ms, sample_rate);
+
+    return true;
+}
+
 void TimeshiftManager::promote_chunk_to_ready(ChunkInfo chunk) {
     // Rename file from pending to ready
-    std::string ready_filename = "/ts_ready_" + std::to_string(chunk.id) + ".bin";
+    std::string ready_filename = "/timeshift/ready_" + std::to_string(chunk.id) + ".bin";
+
+    // Remove destination file if it exists (from previous session)
+    if (SD_MMC.exists(ready_filename.c_str())) {
+        SD_MMC.remove(ready_filename.c_str());
+        LOG_DEBUG("Removed existing ready file: %s", ready_filename.c_str());
+    }
 
     if (SD_MMC.rename(chunk.filename.c_str(), ready_filename.c_str())) {
         chunk.filename = ready_filename;
         chunk.state = ChunkState::READY;
 
+        // Calculate chunk duration
+        uint32_t total_frames = 0;
+        uint32_t duration_ms = 0;
+
+        if (calculate_chunk_duration(chunk, total_frames, duration_ms)) {
+            chunk.total_frames = total_frames;
+            chunk.duration_ms = duration_ms;
+            chunk.start_time_ms = cumulative_time_ms_;
+
+            cumulative_time_ms_ += duration_ms;  // Update cumulative time
+
+            LOG_INFO("Chunk %u promoted to READY (%u KB, offset %u-%u, %u ms, %u frames)",
+                     chunk.id, chunk.length / 1024,
+                     (unsigned)chunk.start_offset, (unsigned)chunk.end_offset,
+                     duration_ms, total_frames);
+        } else {
+            LOG_WARN("Chunk %u promoted to READY without duration info (%u KB, offset %u-%u)",
+                     chunk.id, chunk.length / 1024,
+                     (unsigned)chunk.start_offset, (unsigned)chunk.end_offset);
+        }
+
         // Add to ready_chunks_ (already ordered by ID)
         ready_chunks_.push_back(chunk);
-
-        LOG_INFO("Chunk %u promoted to READY (%u KB, offset %u-%u)",
-                 chunk.id, chunk.length / 1024,
-                 (unsigned)chunk.start_offset, (unsigned)chunk.end_offset);
     } else {
         LOG_ERROR("Failed to rename chunk %u from pending to ready", chunk.id);
         SD_MMC.remove(chunk.filename.c_str());
@@ -511,7 +659,17 @@ bool TimeshiftManager::load_chunk_to_playback(size_t chunk_id) {
     current_playback_chunk_id_ = chunk_id;
     playback_chunk_loaded_size_ = chunk.length;
 
-    LOG_DEBUG("Loaded chunk %u to playback buffer (%u KB)", chunk.id, chunk.length / 1024);
+    // Log with temporal info for better user understanding
+    uint32_t start_min = chunk.start_time_ms / 60000;
+    uint32_t start_sec = (chunk.start_time_ms / 1000) % 60;
+    uint32_t end_ms = chunk.start_time_ms + chunk.duration_ms;
+    uint32_t end_min = end_ms / 60000;
+    uint32_t end_sec = (end_ms / 1000) % 60;
+
+    LOG_INFO("→ Loaded chunk %u (%u KB) [%02u:%02u - %02u:%02u]",
+             chunk.id, chunk.length / 1024,
+             start_min, start_sec, end_min, end_sec);
+
     return true;
 }
 
@@ -529,6 +687,7 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
             LOG_ERROR("Failed to load chunk %u for playback", chunk_id);
             return 0;
         }
+        last_preload_check_chunk_ = INVALID_CHUNK_ID; // Reset preload tracking
     }
 
     // Calculate offset relative to chunk
@@ -537,10 +696,108 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
     size_t available = chunk.length - chunk_offset;
     size_t to_read = std::min(size, available);
 
+    // PRE-LOAD OPTIMIZATION: Check if we should preload next chunk
+    // Do this AFTER memcpy to avoid blocking current read
+    if (chunk_id != last_preload_check_chunk_) {
+        float progress = (float)chunk_offset / (float)chunk.length;
+
+        // When we reach 75% of current chunk, preload next chunk into secondary buffer
+        if (progress >= 0.75f && chunk_id + 1 < ready_chunks_.size()) {
+            // Note: Currently we only have ONE playback buffer, so we can't truly preload
+            // without blocking. We'll just reduce the check frequency to avoid logging spam.
+            // A proper fix would need a double-buffer system.
+            last_preload_check_chunk_ = chunk_id;
+
+            LOG_DEBUG("Approaching end of chunk %u (%.0f%%), next chunk %u will load soon",
+                     chunk.id, progress * 100.0f, ready_chunks_[chunk_id + 1].id);
+        }
+    }
+
     // Copy from playback_buffer_
     memcpy(buffer, playback_buffer_ + chunk_offset, to_read);
 
     return to_read;
+}
+
+// ========== TEMPORAL SEEK METHODS ==========
+
+size_t TimeshiftManager::seek_to_time(uint32_t target_ms) {
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+
+    if (ready_chunks_.empty()) {
+        xSemaphoreGive(mutex_);
+        LOG_WARN("Seek to time failed: no ready chunks available");
+        return SIZE_MAX;  // Invalid offset
+    }
+
+    // Search for the chunk containing the target timestamp
+    for (size_t i = 0; i < ready_chunks_.size(); i++) {
+        const ChunkInfo& chunk = ready_chunks_[i];
+        uint32_t chunk_end_ms = chunk.start_time_ms + chunk.duration_ms;
+
+        if (target_ms >= chunk.start_time_ms && target_ms < chunk_end_ms) {
+            // Found the chunk! Calculate relative offset within chunk
+            uint32_t offset_ms = target_ms - chunk.start_time_ms;
+            float progress = (float)offset_ms / (float)chunk.duration_ms;
+
+            // Estimate byte offset (linear interpolation)
+            size_t byte_offset_in_chunk = (size_t)(chunk.length * progress);
+            size_t global_offset = chunk.start_offset + byte_offset_in_chunk;
+
+            xSemaphoreGive(mutex_);
+
+            LOG_INFO("Seek to %u ms → chunk %u, byte offset %u (progress %.2f%%)",
+                     target_ms, chunk.id, (unsigned)global_offset, progress * 100.0f);
+
+            return global_offset;
+        }
+    }
+
+    // If target is beyond available time, seek to last available position
+    const ChunkInfo& last_chunk = ready_chunks_.back();
+    size_t last_offset = last_chunk.end_offset - 1;
+
+    xSemaphoreGive(mutex_);
+
+    LOG_WARN("Seek to %u ms beyond available time (%u ms), seeking to end",
+             target_ms, last_chunk.start_time_ms + last_chunk.duration_ms);
+
+    return last_offset;
+}
+
+uint32_t TimeshiftManager::total_duration_ms() const {
+    if (ready_chunks_.empty()) return 0;
+
+    // Sum all chunk durations
+    uint32_t total = 0;
+    for (const auto& chunk : ready_chunks_) {
+        total += chunk.duration_ms;
+    }
+
+    return total;
+}
+
+uint32_t TimeshiftManager::current_position_ms() const {
+    if (ready_chunks_.empty()) return 0;
+
+    // Find the chunk containing current_read_offset_
+    for (const auto& chunk : ready_chunks_) {
+        if (current_read_offset_ >= chunk.start_offset &&
+            current_read_offset_ < chunk.end_offset) {
+
+            // Calculate relative offset within chunk
+            size_t offset_in_chunk = current_read_offset_ - chunk.start_offset;
+            float progress = (float)offset_in_chunk / (float)chunk.length;
+
+            // Calculate time within chunk
+            uint32_t time_in_chunk = (uint32_t)(chunk.duration_ms * progress);
+
+            return chunk.start_time_ms + time_in_chunk;
+        }
+    }
+
+    // If not found in any chunk, return 0
+    return 0;
 }
 
 // ========== PAUSE/RESUME METHODS ==========
