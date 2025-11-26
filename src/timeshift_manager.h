@@ -26,7 +26,7 @@ public:
     bool open(const char* uri) override;
     void close() override;
     bool is_open() const override;
-    bool is_seekable() const override { return true; } // Always seekable via buffer
+    bool is_seekable() const override { return !is_running_; } // Only seekable when download is complete
     SourceType type() const override { return SourceType::HTTP_STREAM; } // Acts as HTTP conceptually
     const char* uri() const override;
     const Mp3SeekTable* get_seek_table() const override { return &seek_table_; }
@@ -41,7 +41,7 @@ public:
     float buffer_duration_seconds() const;
 
 private:
-    static const size_t HOT_BUFFER_SIZE = 64 * 1024;    // 64KB RAM buffer
+    static const size_t HOT_BUFFER_SIZE = 128 * 1024;   // 128KB RAM buffer
     static const size_t CHUNK_SIZE = 512 * 1024;        // 512KB SD chunks
     
     struct ChunkInfo {
