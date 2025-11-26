@@ -1,115 +1,68 @@
 # Roadmap di Sviluppo: Funzionalità Timeshift per Streaming HTTP
 
-## Obiettivo Finale:
-Integrare una funzionalità di timeshift robusta che permetta all'utente di mettere in pausa, riavvolgere e riprendere la riproduzione di uno stream audio HTTP live, con una capacità di buffer di almeno 30-60 minuti.
+## Stato Attuale
+- **Modularizzazione Completata:** L'architettura `AudioPlayer` è stata rifattorizzata in `AudioOutput` (hardware) e `AudioStream` (decodifica).
+- **Integrazione Pronta:** `AudioStream` accetta un `std::unique_ptr<IDataSource>`, il che rende l'integrazione del futuro `TimeshiftManager` (che implementerà `IDataSource`) naturale e trasparente.
+
+## Obiettivo Finale
+Integrare una funzionalità di timeshift robusta che permetta all'utente di mettere in pausa, riavvolgere e riprendere la riproduzione di uno stream audio HTTP live, con una capacità di buffer di almeno 30-60 minuti su scheda SD.
 
 ---
 
-## Fase 0: Preparazione e Fondamenta (Durata Stimata: 1-2 giorni)
+## Fase 1: Potenziamento di `Mp3SeekTable` (Durata Stimata: 2-3 giorni)
 
-**Obiettivo:** Preparare l'ambiente di sviluppo, integrare le dipendenze e validare i componenti di base.
+**Obiettivo:** Rendere la tabella di seek capace di gestire stream di lunga durata con utilizzo di RAM contenuto.
 
-*   **Task 1: Setup del Branch di Sviluppo**
-    *   Creare un nuovo branch Git dedicato alla feature (es. `feature/timeshift`) per isolare lo sviluppo.
+*   **Task 1.1: Strategia di Campionamento**
+    *   Modificare `Mp3SeekTable` per non memorizzare ogni singolo frame.
+    *   Implementare un campionamento (es. 1 entry ogni X secondi o ogni Y frame).
+    *   Questo è essenziale per mappare 1 ora di audio senza esaurire la RAM del ESP32.
 
-*   **Task 2: Integrazione Librerie**
-    *   Integrare la libreria `dr_mp3.h` nel progetto. Questa libreria è essenziale per un parsing efficiente e affidabile dei frame MP3.
-    *   Verificare che tutte le dipendenze necessarie per `TimeshiftManager` (FreeRTOS, HTTPClient, WiFi) siano correttamente configurate.
-
-*   **Task 3: Validazione I/O di Base**
-    *   Creare un piccolo test per confermare le performance di lettura/scrittura della scheda SD, assicurandosi che siano adeguate per la registrazione in tempo reale di uno stream a 128-320 kbps.
+*   **Task 1.2: Validazione `build` incrementale**
+    *   Assicurarsi che la tabella possa essere costruita incrementalmente man mano che arrivano nuovi dati dal network (necessario per il Timeshift live).
 
 ---
 
-## Fase 1: Adattamento dei Componenti Esistenti (Durata Stimata: 2-3 giorni)
+## Fase 2: Core Logic - `TimeshiftManager` (Durata Stimata: 5-7 giorni)
 
-**Obiettivo:** Modificare la classe `Mp3SeekTable` per renderla capace di operare su file di grandi dimensioni senza consumare eccessiva RAM.
+**Obiettivo:** Implementare la classe `TimeshiftManager` che agirà come un `IDataSource` intelligente.
 
-*   **Task 1: Implementazione del Nuovo Metodo `build`**
-    *   Finalizzare e testare l'implementazione del metodo `bool build(IDataSource* source, ...)` in `mp3_seek_table.cpp`. L'obiettivo è validarlo e assicurarsi che gestisca correttamente i casi limite (file vuoto, file corrotto, ecc.).
+*   **Task 2.1: Definizione Interfaccia e Strutture Dati**
+    *   `TimeshiftManager` eredita da `IDataSource`.
+    *   Componenti interni:
+        *   `HotBuffer`: Buffer circolare in PSRAM per accesso veloce e cache di scrittura.
+        *   `ChunkManager`: Gestisce la persistenza su SD (file rotanti pre-allocati per evitare frammentazione).
+        *   `DownloaderTask`: Task separato che scarica da HTTP e riempie il buffer.
 
-*   **Task 2: Test Unitari per `Mp3SeekTable`**
-    *   **Punto di Attenzione:** Per evitare un consumo eccessivo di RAM, considerare un'implementazione della tabella di seek a campionamento (es. un punto di ingresso ogni 2-10 secondi) invece di memorizzare ogni frame. Questo offre un buon compromesso tra precisione del seek e uso della memoria.
+*   **Task 2.2: Implementazione Download & Storage**
+    *   Creare il task di download che scrive nel `HotBuffer`.
+    *   Implementare il flush da `HotBuffer` a `ChunkManager` (SD) quando necessario.
+    *   Gestire la concorrenza (mutex) tra scrittore (Downloader) e lettore (AudioPlayer).
 
-*   **Task 3: Test Unitari per `Mp3SeekTable`**
-    *   Scrivere un test specifico che:
-        1.  Crea un file MP3 di test sulla scheda SD.
-        2.  Crea un `DataSource` per quel file.
-        3.  Chiama il nuovo metodo `build(dataSource, ...)` su un'istanza di `Mp3SeekTable`.
-        4.  Verifica che la tabella di seek venga costruita correttamente.
-
----
-
-## Fase 2: Sviluppo del Core Logic (`TimeshiftManager`) (Durata Stimata: 5-7 giorni)
-
-**Obiettivo:** Implementare e stabilizzare il `TimeshiftManager`, il cuore della funzionalità, basandosi sull'architettura definita nei file `timeshift_manager.h` e `.cpp`.
-
-*   **Task 1: Revisione e Finalizzazione dell'Architettura**
-    *   Analizzare l'architettura esistente basata su `HotBuffer` (PSRAM), `ChunkManager` (SD) e `ProgressiveSeekTable`. Il lavoro consiste nel testarla, debuggarla e rifinirla.
-
-*   **Task 1.1: Analisi dei Rischi Architetturali e Mitigazioni**
-    *   **Rischio 1: Race Condition e Deadlock.** L'accesso concorrente al buffer e ai chunk da parte del task di prefetch, del lettore audio e del task di pulizia è critico.
-        *   **Mitigazione:** Implementare una strategia di sincronizzazione robusta, ad esempio utilizzando un singolo mutex per proteggere tutte le strutture dati condivise (buffer, metadati dei chunk, offset). Gestire gli stati dei chunk in modo atomico per evitare conflitti tra lettura e cancellazione.
-
-    *   **Rischio 2: Frammentazione della Scheda SD.** La creazione e cancellazione continua di file di chunk può degradare le performance di I/O nel tempo.
-        *   **Mitigazione:** Implementare il `ChunkManager` utilizzando un set di file pre-allocati gestiti come un buffer circolare (ring buffer). Questo elimina la frammentazione del filesystem.
-
-    *   **Rischio 3: Latenza di Archiviazione (PSRAM -> SD).** La scrittura su SD è lenta e potrebbe bloccare l'accesso al `HotBuffer`, causando un underrun del player.
-        *   **Mitigazione:** Considerare un meccanismo di "double buffering" per l'archiviazione. I dati da archiviare vengono copiati in un buffer temporaneo, permettendo al task di scrittura su SD di operare senza bloccare il `HotBuffer` principale.
-
-*   **Task 2: Implementazione e Test del Task di Prefetch (`prefetch_loop`)**
-    *   Focalizzarsi sul task che scarica i dati dalla rete.
-    *   Verificare che gestisca correttamente le disconnessioni e le riconnessioni.
-    *   Assicurarsi che scriva i dati in modo concorrente e sicuro nel `HotBuffer` e nel `ChunkManager`.
-    *   Implementare la logica di archiviazione: quando i dati nel `HotBuffer` superano una soglia (`archive_threshold`), devono essere scritti in un chunk su SD.
-
-*   **Task 3: Implementazione dell'Interfaccia `IDataSource`**
-    *   Implementare i metodi `read()` e `seek()` del `TimeshiftManager`.
-    *   `read()`: Deve essere *thread-safe* e leggere i dati in modo trasparente dal `HotBuffer` o, se necessario, dai chunk su SD.
-    *   `seek()`: Deve essere *thread-safe* e permettere di posizionare il `playback_offset_` in qualsiasi punto valido del buffer totale.
-
-*   **Task 4: Gestione del Ciclo di Vita dei Dati**
-    *   Implementare la logica di `cleanup_old_data()`. Il sistema deve cancellare periodicamente i chunk più vecchi sulla SD per rispettare la finestra di timeshift definita.
-    *   **Punto di Attenzione:** Questa operazione deve essere sincronizzata per evitare di cancellare un chunk mentre è in uso dal lettore.
+*   **Task 2.3: Implementazione Metodi `read` e `seek`**
+    *   `read(buffer, size)`: Deve capire se leggere dalla PSRAM (dati recenti) o dalla SD (dati vecchi) in base all'offset di riproduzione.
+    *   `seek(offset)`: Deve permettere di saltare istantaneamente a qualsiasi punto del buffer disponibile.
 
 ---
 
-## Fase 3: Integrazione e UI (Durata Stimata: 3-4 giorni)
+## Fase 3: Integrazione nel Sistema (Durata Stimata: 2 giorni)
 
-**Obiettivo:** Integrare il `TimeshiftManager` nel player audio principale e collegarlo ai controlli dell'interfaccia utente.
+**Obiettivo:** Collegare il tutto.
 
-*   **Task 1: Sostituzione della Sorgente Dati**
-    *   Modificare il codice del player audio per istanziare e utilizzare `TimeshiftManager` come sua `IDataSource` primaria.
+*   **Task 3.1: Integrazione in `main.cpp` / `AudioPlayer`**
+    *   Quando si seleziona una sorgente HTTP, invece di creare direttametne un `HTTPStreamSource`, istanziare un `TimeshiftManager` configurato con l'URL.
+    *   Passare il `TimeshiftManager` a `AudioPlayer` tramite `select_source` (o adattando l'auto-detection).
 
-*   **Task 2: Implementazione dei Controlli Utente**
-    *   Collegare i comandi dell'interfaccia utente (es. pulsanti, comandi web) alle funzioni del `TimeshiftManager`:
-        *   **Pausa/Play:** Chiama `set_mode(Mode::PAUSED)` e `set_mode(Mode::TIMESHIFT)`.
-        *   **Rewind/Forward:** Chiama `seek_relative_seconds()`.
-        *   **Torna al Live:** Chiama `seek_to_live()`.
-
-*   **Task 3: Visualizzazione dello Stato**
-    *   Utilizzare la funzione `get_stats()` per visualizzare informazioni utili sull'interfaccia utente (display, pagina web), come il ritardo dal live e la durata del buffer.
+*   **Task 3.2: Comandi Utente**
+    *   Mappare comandi seriali/UI per sfruttare il timeshift (es. pausa live, seek back 30s, "torna al live").
 
 ---
 
-## Fase 4: Test e Ottimizzazione (Durata Stimata: 4-5 giorni)
+## Fase 4: Test e Ottimizzazione (Durata Stimata: 3-5 giorni)
 
-**Obiettivo:** Eseguire test intensivi sul campo per identificare bug, colli di bottiglia e ottimizzare le performance e la stabilità.
+*   **Task 4.1: Stress Test SD**
+    *   Verificare che la scrittura e lettura simultanea su SD (con SPI a freq alta) non causi glitch audio.
+    *   Ottimizzare dimensione dei chunk e buffer.
 
-*   **Task 1: Test di Lunga Durata**
-    *   Lasciare il dispositivo in esecuzione per 24-48 ore per verificare la presenza di memory leak o crash.
-
-*   **Task 2: Stress Test**
-    *   Eseguire ripetutamente e rapidamente comandi di pausa, play, seek e ritorno al live per scovare race condition.
-    *   Testare con connessioni WiFi instabili per verificare la robustezza del buffer.
-    *   **Scenari di Test Aggiuntivi:**
-        *   **Test "Seek-to-Live":** Eseguire seek all'indietro seguiti immediatamente da un ritorno al live per testare la transizione tra lettura da SD e da PSRAM.
-        *   **Test di Riempimento Buffer:** Lasciare il sistema in pausa fino al riempimento completo del buffer per verificare la stabilità e la corretta attivazione della pulizia.
-        *   **Test con Bitrate Variabile (VBR):** Se possibile, usare uno stream VBR per validare la robustezza della logica di seek e parsing.
-
-*   **Task 3: Ottimizzazione delle Performance**
-    *   Profilare l'uso della CPU e della memoria.
-    *   Ottimizzare i parametri di configurazione (`prefetch_chunk_size`, `archive_threshold`, ecc.) per trovare il miglior equilibrio tra reattività e consumo di risorse.
-
-*   **Task 4: Merge Finale**
-    *   Una volta che la feature è stabile e validata, eseguire il merge del branch `feature/timeshift` nel branch principale.
+*   **Task 4.2: Long Run Test**
+    *   Testare riempimento del buffer circolare (es. dopo 60 minuti, i dati vecchi vengono sovrascritti correttamente?).
