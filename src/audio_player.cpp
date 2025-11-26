@@ -1,19 +1,10 @@
 #include "audio_player.h"
 
-#include "driver/i2s.h"
 #include "esp_err.h"
 #include <esp_heap_caps.h>
 #include <cstring>
 
 namespace {
-// --- Pinout (invariato)
-constexpr int kI2sBck = 5;
-constexpr int kI2sDout = 8;
-constexpr int kI2sWs = 7;
-constexpr int kApEnable = 1;
-constexpr int kI2cScl = 15;
-constexpr int kI2cSda = 16;
-constexpr uint32_t kI2cSpeed = 400000;
 
 #ifdef AUDIO_RING_USE_DRAM
 constexpr bool kPreferDramRing = true;
@@ -83,7 +74,6 @@ AudioConfig default_audio_config() {
 
 AudioPlayer::AudioPlayer(const AudioConfig &cfg)
     : cfg_(cfg),
-      i2s_write_timeout_ms_(cfg.i2s_write_timeout_ms),
       current_sample_rate_(cfg.default_sample_rate),
       saved_volume_percent_(cfg.default_volume_percent),
       user_volume_percent_(cfg.default_volume_percent),
@@ -142,7 +132,10 @@ void AudioPlayer::schedule_recovery(FailureReason reason, const char *detail) {
         last_failure_reason_ = reason;
         player_state_ = PlayerState::ERROR;
         LOG_WARN("Scheduling auto recovery (%s). Attempt %u/%u", detail, recovery_attempts_, cfg_.max_recovery_attempts);
-        notify_error(data_source_ ? data_source_->uri() : "n/a", detail);
+        const char* uri = "n/a";
+        if (stream_ && stream_->data_source()) uri = stream_->data_source()->uri();
+        else if (current_source_to_arm_) uri = current_source_to_arm_->uri();
+        notify_error(uri, detail);
     }
     stop_requested_ = true;
 }
@@ -173,18 +166,6 @@ void AudioPlayer::wait_for_task_shutdown(uint32_t timeout_ms) {
     }
 }
 
-void AudioPlayer::cleanup_ring_buffer_if_idle() {
-    if (audio_task_handle_ == NULL) {
-        if (pcm_ring_buffer_) {
-            vRingbufferDelete(pcm_ring_buffer_);
-            pcm_ring_buffer_ = NULL;
-        }
-        if (pcm_ring_storage_) {
-            heap_caps_free(pcm_ring_storage_);
-            pcm_ring_storage_ = NULL;
-        }
-    }
-}
 
 
 void AudioPlayer::reset_memory_stats() {
@@ -247,15 +228,15 @@ bool AudioPlayer::select_source(const char* uri, SourceType hint) {
     // Crea DataSource appropriata
     switch (type) {
         case SourceType::LITTLEFS:
-            data_source_.reset(new LittleFSSource());
+            current_source_to_arm_.reset(new LittleFSSource());
             break;
 
         case SourceType::SD_CARD:
-            data_source_.reset(new SDCardSource());
+            current_source_to_arm_.reset(new SDCardSource());
             break;
 
         case SourceType::HTTP_STREAM:
-            data_source_.reset(new HTTPStreamSource());
+            current_source_to_arm_.reset(new HTTPStreamSource());
             break;
 
         default:
@@ -266,36 +247,36 @@ bool AudioPlayer::select_source(const char* uri, SourceType hint) {
     current_metadata_ = Metadata();
 
     LOG_INFO("Source selected: %s (type: %d)", uri, (int)type);
-    return data_source_->open(uri);
+    return current_source_to_arm_->open(uri);
 }
 
 bool AudioPlayer::arm_source() {
-    if (!data_source_) {
+    if (!current_source_to_arm_) {
         LOG_ERROR("No data source selected");
         return false;
     }
 
     // Se la sorgente non è già aperta, prova ad aprirla.
     // Questo rende 'arm_source' idempotente.
-    if (!data_source_->is_open()) {
-        if (!data_source_->open(data_source_->uri())) {
-            LOG_ERROR("Failed to open: %s", data_source_->uri());
+    if (!current_source_to_arm_->is_open()) {
+        if (!current_source_to_arm_->open(current_source_to_arm_->uri())) {
+            LOG_ERROR("Failed to open: %s", current_source_to_arm_->uri());
             return false;
         }
     }
 
     LOG_INFO("Source armed: %s, size=%u bytes, seekable=%s",
-             data_source_->uri(),
-             (unsigned)data_source_->size(),
-             data_source_->is_seekable() ? "yes" : "no");
+             current_source_to_arm_->uri(),
+             (unsigned)current_source_to_arm_->size(),
+             current_source_to_arm_->is_seekable() ? "yes" : "no");
 
-    if (data_source_->is_seekable()) {
-        if (id3_parser_.parse(data_source_.get(), current_metadata_)) {
+    if (current_source_to_arm_->is_seekable()) {
+        if (id3_parser_.parse(current_source_to_arm_.get(), current_metadata_)) {
             LOG_INFO("Metadata: title=\"%s\" artist=\"%s\" album=\"%s\"", current_metadata_.title.c_str(), current_metadata_.artist.c_str(), current_metadata_.album.c_str());
         } else {
             LOG_INFO("Metadata ID3 not found or not parseable");
         }
-        notify_metadata(current_metadata_, data_source_->uri());
+        notify_metadata(current_metadata_, current_source_to_arm_->uri());
     }
 
     return true;
@@ -306,19 +287,19 @@ void AudioPlayer::set_volume(int vol_pct) {
     if (vol_pct > 100) vol_pct = 100;
     user_volume_percent_ = vol_pct;
     saved_volume_percent_ = vol_pct;
-    codec_.set_volume(vol_pct);
+    output_.set_volume(vol_pct);
     current_volume_percent_ = vol_pct;
 }
 
 void AudioPlayer::toggle_pause() {
     if (player_state_ == PlayerState::PAUSED) {
-        codec_.set_volume(user_volume_percent_);
+        output_.set_volume(user_volume_percent_);
         pause_flag_ = false;
         player_state_ = PlayerState::PLAYING;
         LOG_INFO("Playback resumed");
     } else if (player_state_ == PlayerState::PLAYING) {
         pause_flag_ = true;
-        codec_.set_volume(0);
+        output_.set_volume(0);
         player_state_ = PlayerState::PAUSED;
         LOG_INFO("Playback paused");
     }
@@ -329,20 +310,13 @@ void AudioPlayer::request_seek(int seconds) {
     LOG_INFO("Seek to %d seconds requested", seconds);
 }
 
-size_t AudioPlayer::ring_buffer_used() const {
-    if (!pcm_ring_buffer_) {
-        return 0;
-    }
-    size_t free_bytes = xRingbufferGetCurFreeSize(pcm_ring_buffer_);
-    return pcm_ring_size_ - free_bytes;
-}
 
 void AudioPlayer::start() {
     if (player_state_ != PlayerState::STOPPED && player_state_ != PlayerState::ERROR && player_state_ != PlayerState::ENDED) {
         LOG_INFO("Already active");
         return;
     }
-    if (!data_source_ || !data_source_->is_open()) {
+    if (!current_source_to_arm_ || !current_source_to_arm_->is_open()) {
         LOG_WARN("No source armed. Use 'l' before 'p'");
         return;
     }
@@ -350,11 +324,20 @@ void AudioPlayer::start() {
     LOG_INFO("Config profile: %s", kConfigProfile);
     reset_memory_stats();
 
+    stream_.reset(new AudioStream());
+    if (!stream_->begin(std::move(current_source_to_arm_))) {
+        LOG_ERROR("Failed to begin stream");
+        player_state_ = PlayerState::ERROR;
+        stream_.reset();
+        return;
+    }
+
     stop_requested_ = false;
     pause_flag_ = false;
     seek_seconds_ = -1;
     current_played_frames_ = 0;
-    total_pcm_frames_ = 0;
+    total_pcm_frames_ = stream_->total_frames();
+    current_sample_rate_ = stream_->sample_rate();
 
     if (!playback_events_) {
         playback_events_ = xEventGroupCreate();
@@ -363,7 +346,8 @@ void AudioPlayer::start() {
         xEventGroupClearBits(playback_events_, AUDIO_TASK_DONE_BIT);
     }
 
-    LOG_INFO("Starting playback: %s", data_source_->uri());
+    const char* uri = stream_->data_source()->uri();
+    LOG_INFO("Starting playback: %s", uri);
 
     // Crea SOLO audio task (no file task!)
     BaseType_t created = create_task_with_affinity(
@@ -386,7 +370,7 @@ void AudioPlayer::start() {
     player_state_ = PlayerState::PLAYING;
 
     LOG_INFO("Playback started");
-    notify_start(data_source_->uri());
+    notify_start(uri);
 }
 
 void AudioPlayer::stop() {
@@ -395,13 +379,16 @@ void AudioPlayer::stop() {
         LOG_INFO("Not playing.");
         return;
     }
-    String stopped_path = data_source_ ? data_source_->uri() : "";
+    String stopped_path = (stream_ && stream_->data_source()) ? stream_->data_source()->uri() : "";
     stop_requested_ = true;
     pause_flag_ = false;
     wait_for_task_shutdown(2500);
-    cleanup_ring_buffer_if_idle();
     playing_ = false;
     player_state_ = PlayerState::STOPPED;
+    
+    // Clean up stream
+    stream_.reset();
+
     size_t heap_end = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     LOG_INFO("Playback stopped. Heap delta: start %u -> min %u -> end %u (diff %d)",
              (unsigned)mem_stats_.heap_free_start,
@@ -424,7 +411,6 @@ void AudioPlayer::handle_recovery_if_needed() {
 void AudioPlayer::tick_housekeeping() {
     update_memory_min();
     handle_recovery_if_needed();
-    cleanup_ring_buffer_if_idle();
 }
 
 void AudioPlayer::print_status() const {
@@ -444,12 +430,12 @@ void AudioPlayer::print_status() const {
     LOG_INFO("State: %s", state_str);
     LOG_INFO("Volume: %d%% (saved: %d%%)", current_volume_percent_, saved_volume_percent_);
     LOG_INFO("Sample Rate: %u Hz", current_sample_rate_);
-    LOG_INFO("PCM ring buffer -> %u/%u bytes used", (unsigned)ring_used, (unsigned)pcm_ring_size_);
-    if (data_source_) {
+    const IDataSource* src = data_source();
+    if (src) {
         LOG_INFO("Source: %s | open: %s | size: %u bytes",
-                 data_source_->uri(),
-                 data_source_->is_open() ? "yes" : "no",
-                 (unsigned)data_source_->size());
+                 src->uri(),
+                 src->is_open() ? "yes" : "no",
+                 (unsigned)src->size());
     } else {
         LOG_INFO("Source: not selected");
     }
@@ -493,91 +479,44 @@ void AudioPlayer::audio_task() {
     const uint32_t frames_per_chunk = 2048;
     uint32_t channels = 0;
     uint32_t sample_rate = 0;
+    int16_t* pcm_buffer = nullptr;
+    size_t pcm_buffer_size_frames = 2048;
 
-    if (!data_source_ || !data_source_->is_open()) {
-        LOG_ERROR("DataSource not available");
+    // Check is done below with stream check
+
+    // Stream is already initialized in start()
+    if (!stream_) {
+        LOG_ERROR("Stream not initialized");
         goto cleanup;
     }
 
-    // ===== INIT DECODER =====
-    if (!decoder_.init(data_source_.get(), frames_per_chunk)) {
-        LOG_ERROR("Failed to init decoder");
-        schedule_recovery(FailureReason::DECODER_INIT, "decoder init failed");
+    channels = stream_->channels();
+    sample_rate = stream_->sample_rate();
+    // total_pcm_frames_ is updated in start()
+
+    // ===== INIT AUDIO OUTPUT (Codec & I2S) =====
+    if (!output_.begin(cfg_, sample_rate, channels)) {
+        LOG_ERROR("Audio output init failed");
+        schedule_recovery(FailureReason::DECODER_INIT, "output init failed");
         goto cleanup;
     }
-
-    channels = decoder_.channels();
-    sample_rate = decoder_.sample_rate();
-
-    if (channels == 0 || sample_rate == 0) {
-        LOG_ERROR("Invalid audio format");
-        schedule_recovery(FailureReason::DECODER_INIT, "invalid format");
-        goto cleanup;
-    }
-
-    LOG_INFO("Decoder initialized: %u Hz, %u channels", sample_rate, channels);
-
-    total_pcm_frames_ = decoder_.total_frames();
-    current_sample_rate_ = sample_rate;
-
-    // Stima durata se non disponibile
-    if (total_pcm_frames_ == 0 && data_source_->size() > 0) {
-        // La stima del bitrate è stata rimossa per evitare dipendenze dal filesystem.
-        // La durata sarà nota solo se il file MP3 ha un header Xing/VBRI,
-        // che dr_mp3 legge automaticamente.
-    }
-
-    // ===== ALLOCA RING BUFFER PCM =====
-    // Molto più piccolo del ring MP3: 32KB = ~180ms @ 44.1kHz stereo
-    pcm_ring_size_ = 32 * 1024;
-    pcm_ring_storage_ = static_cast<uint8_t*>(
-        heap_caps_malloc(pcm_ring_size_, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
-    );
-
-    if (!pcm_ring_storage_) {
-        LOG_ERROR("Failed to allocate PCM ring buffer");
-        goto cleanup;
-    }
-
-    pcm_ring_buffer_ = xRingbufferCreateStatic(
-        pcm_ring_size_,
-        RINGBUF_TYPE_BYTEBUF,
-        pcm_ring_storage_,
-        &pcm_ring_struct_
-    );
-
-    if (!pcm_ring_buffer_) {
-        LOG_ERROR("Failed to create PCM ring buffer");
-        goto cleanup;
-    }
-
-    LOG_INFO("PCM ring buffer: %u bytes (%.1f ms @ %u Hz)",
-             (unsigned)pcm_ring_size_,
-             (pcm_ring_size_ * 1000.0f) / (sample_rate * channels * sizeof(int16_t)),
-             sample_rate);
-
-    // ===== INIT CODEC & I2S =====
-    if (!codec_.init(sample_rate, kApEnable, kI2cSda, kI2cScl, kI2cSpeed, cfg_.default_volume_percent)) {
-        LOG_ERROR("Codec init failed");
-        schedule_recovery(FailureReason::DECODER_INIT, "codec init failed");
-        goto cleanup;
-    }
-
-    i2s_driver_.init(sample_rate, cfg_, kBytesPerSample, channels, kI2sBck, kI2sWs, kI2sDout);
-    codec_.set_volume(user_volume_percent_);
+    output_.set_volume(user_volume_percent_);
     i2s_ready = true;
 
+    // ===== ALLOCATE TEMP PCM BUFFER =====
+    // Using a heap buffer for PCM data
+    pcm_buffer = (int16_t*)heap_caps_malloc(pcm_buffer_size_frames * channels * sizeof(int16_t), MALLOC_CAP_8BIT);
+    if (!pcm_buffer) {
+        LOG_ERROR("Failed to allocate PCM buffer");
+        goto cleanup;
+    }
+
     // ===== MAIN PLAYBACK LOOP =====
-    {
-        auto& buffers = decoder_.buffers();
-        int16_t* pcm_buffer = buffers.pcm;
-        const size_t max_frames = buffers.pcm_capacity_frames;
+    LOG_INFO("Starting playback loop...");
 
-        LOG_INFO("Starting playback loop...");
-
-        while (!stop_requested_) {
-            // PAUSE handling
-            while (pause_flag_ && !stop_requested_) {
+    while (!stop_requested_) {
+        // PAUSE handling
+        while (pause_flag_ && !stop_requested_) {
                 vTaskDelay(pdMS_TO_TICKS(20));
                 update_memory_min();
             }
@@ -600,21 +539,14 @@ void AudioPlayer::audio_task() {
                          current_played_frames_, target_frame, seek_distance, seek_seconds_);
 
                 // Pulisci buffer DMA I2S per evitare suoni ripetuti durante seek
-                i2s_zero_dma_buffer(I2S_NUM_0);
+                output_.stop();
                 uint32_t after_i2s_clear_ms = millis();
 
-                bool seek_success = decoder_.seek_to_frame(target_frame);
+                bool seek_success = stream_->seek(target_frame);
                 uint32_t after_decoder_seek_ms = millis();
 
                 if (seek_success) {
                     current_played_frames_ = target_frame;
-
-                    // Svuota ring buffer PCM
-                    void* item;
-                    size_t size;
-                    while ((item = xRingbufferReceive(pcm_ring_buffer_, &size, 0)) != NULL) {
-                        vRingbufferReturnItem(pcm_ring_buffer_, item);
-                    }
 
                     uint32_t seek_end_ms = millis();
                     uint32_t total_time = seek_end_ms - seek_start_ms;
@@ -628,7 +560,9 @@ void AudioPlayer::audio_task() {
                     uint32_t brute_start_ms = millis();
                     // Fallback a brute force per stream non-seekable
                     while (current_played_frames_ < target_frame && !stop_requested_) {
-                        drmp3_uint64 discard = decoder_.read_frames(pcm_buffer, 1024 / channels);
+                         // Read small chunks to discard
+                        size_t frames_to_discard = 1024 / channels; // arbitrary small chunk
+                        size_t discard = stream_->read(pcm_buffer, frames_to_discard);
                         if (discard == 0) break;
                         current_played_frames_ += discard;
                     }
@@ -642,7 +576,7 @@ void AudioPlayer::audio_task() {
             update_memory_min();
 
             // DECODE: DataSource → PCM
-            drmp3_uint64 frames_decoded = decoder_.read_frames(pcm_buffer, max_frames);
+            size_t frames_decoded = stream_->read(pcm_buffer, pcm_buffer_size_frames);
 
             if (frames_decoded == 0) {
                 if (stop_requested_) {
@@ -657,69 +591,28 @@ void AudioPlayer::audio_task() {
             current_played_frames_ += frames_decoded;
 
             if (!pause_flag_) {
-                // Write PCM direttamente a I2S (semplificato, senza ring intermediario)
-                size_t pcm_bytes = frames_decoded * channels * sizeof(int16_t);
-                const uint8_t* write_ptr = reinterpret_cast<const uint8_t*>(pcm_buffer);
-                size_t remaining = pcm_bytes;
-
-                while (remaining > 0 && !stop_requested_) {
-                    size_t chunk = remaining;
-                    if (chunk > i2s_driver_.chunk_bytes()) {
-                        chunk = i2s_driver_.chunk_bytes();
-                    }
-
-                    size_t written = 0;
-                    esp_err_t result = i2s_write(I2S_NUM_0,
-                                                write_ptr,
-                                                chunk,
-                                                &written,
-                                                pdMS_TO_TICKS(cfg_.i2s_write_timeout_ms));
-
-                    if (result != ESP_OK) {
-                        LOG_ERROR("I2S write error: %s", esp_err_to_name(result));
-                        schedule_recovery(FailureReason::I2S_WRITE, "i2s write failed");
-                        player_state_ = PlayerState::ERROR;
-                        break;
-                    }
-
-                    if (written == 0) {
-                        LOG_ERROR("I2S write returned 0 bytes");
-                        schedule_recovery(FailureReason::I2S_WRITE, "i2s wrote zero bytes");
-                        player_state_ = PlayerState::ERROR;
-                        break;
-                    }
-
-                    remaining -= written;
-                    write_ptr += written;
+                size_t frames_written = output_.write(pcm_buffer, frames_decoded, channels);
+                if (frames_written < frames_decoded) {
+                     // Handle partial write or error if needed, but AudioOutput logs errors.
+                     // For now, we continue or could count dropped frames.
                 }
             }
-        }
+        } // end while (!stop_requested_)
+
+    if (pcm_buffer) {
+        heap_caps_free(pcm_buffer);
+        pcm_buffer = NULL;
     }
 
 cleanup:
-    // Cleanup
-    decoder_.shutdown();
-
-    if (pcm_ring_buffer_) {
-        vRingbufferDelete(pcm_ring_buffer_);
-        pcm_ring_buffer_ = NULL;
-    }
-
-    if (pcm_ring_storage_) {
-        heap_caps_free(pcm_ring_storage_);
-        pcm_ring_storage_ = NULL;
-    }
-
+    // Stream shutdown is handled by AudioPlayer::stop when resetting stream_
+    // But we can end output here.
     if (i2s_ready) {
-        i2s_driver_.uninstall();
-    }
-
-    if (data_source_) {
-        data_source_->close();
+        output_.end();
     }
 
     PlayerState final_state = player_state_;
-    String path_copy = data_source_ ? data_source_->uri() : "";
+    String path_copy = (stream_ && stream_->data_source()) ? stream_->data_source()->uri() : "";
     playing_ = false;
     signal_task_done(AUDIO_TASK_DONE_BIT);
     audio_task_handle_ = NULL;

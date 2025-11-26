@@ -310,16 +310,10 @@ void loop()
     if (millis() - last_log > 5000)
     {
         last_log = millis();
-        if (player.ring_buffer_size() > 0)
-        {
-            size_t ring_used = player.ring_buffer_used();
-            size_t ring_free = player.ring_buffer_size() - ring_used;
-            LOG_INFO("Uptime: %lu s, Heap Libero: %u bytes, Audio ring: %u used / %u free",
-                     millis() / 1000,
-                     esp_get_free_heap_size(),
-                     (unsigned)ring_used,
-                     (unsigned)ring_free);
-        }
+        LOG_INFO("Uptime: %lu s, Heap Libero: %u bytes",
+                 millis() / 1000,
+                 esp_get_free_heap_size());
+        
         if (player.state() == PlayerState::PLAYING)
         {
             uint32_t current_sec = player.played_frames() / player.current_sample_rate();
