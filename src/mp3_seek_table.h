@@ -10,10 +10,16 @@ public:
     Mp3SeekTable() = default;
     ~Mp3SeekTable();
 
-    // Costruisce la seek table scansionando il file
-    // frames_per_entry: quanti frame tra ogni entry (default 4800 = ~100ms @ 48kHz)
-    // Ritorna: true se successo, false se errore
+    // Costruisce la seek table scansionando il file (One-shot)
     bool build(const uint8_t* mp3_data, size_t mp3_size, uint32_t sample_rate, uint32_t frames_per_entry = 4800);
+
+    // --- Incremental Build API ---
+    // Inizializza il processo di costruzione incrementale
+    void begin(uint32_t sample_rate, uint32_t frames_per_entry = 4800);
+
+    // Processa un chunk di dati MP3. Assumiamo che i chunk siano contigui.
+    // Ritorna true se ok, false se errore critico (allocazione memoria)
+    bool append_chunk(const uint8_t* data, size_t size);
 
     // Trova il seek point più vicino al target frame
     // Ritorna: true se trovato, false se table vuota
@@ -37,5 +43,19 @@ private:
     size_t entry_capacity_ = 0;        // Capacità allocata
     uint32_t frames_per_entry_ = 0;    // Frame tra ogni entry
 
+    // Stato build incrementale
+    uint32_t sample_rate_ = 44100;
+    uint64_t current_pcm_frame_ = 0;
+    uint64_t last_entry_frame_ = 0;
+    uint64_t total_processed_bytes_ = 0;
+    
+    // Gestione frame a cavallo di chunk
+    size_t bytes_to_skip_ = 0;         // Byte del frame corrente che continuano nel prossimo chunk
+    
+    // Residuo per header sync (max 4 byte per parsare l'header se spezzato)
+    uint8_t residue_buf_[4];
+    size_t residue_len_ = 0;
+
     bool ensure_capacity(size_t new_capacity);
+    bool parse_header(const uint8_t* header, uint32_t* frame_size, uint32_t* samples_per_frame);
 };

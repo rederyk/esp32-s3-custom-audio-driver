@@ -153,14 +153,24 @@ bool Mp3Decoder::seek_to_frame(drmp3_uint64 frame_index) {
     }
 
     uint32_t seek_start = millis();
-    stream_size_ = source_->size();
+    // Always refresh stream_size_ as it might change for live streams (Timeshift)
+    stream_size_ = source_->size(); // Update cached size
 
     // Usa seek table: re-inizializza dr_mp3 facendo credere che l'offset sia l'inizio del file
-    if (seek_table_.is_ready()) {
+    
+    // Check if source provides a seek table (e.g. TimeshiftManager), otherwise use internal one
+    const Mp3SeekTable* table_ptr = source_->get_seek_table();
+    bool use_table = (table_ptr && table_ptr->is_ready());
+    if (!use_table) {
+        table_ptr = &seek_table_;
+        use_table = seek_table_.is_ready();
+    }
+
+    if (use_table) {
         uint64_t byte_offset = 0;
         uint64_t nearest_frame = 0;
 
-        if (seek_table_.find_seek_point(frame_index, &byte_offset, &nearest_frame) && nearest_frame <= frame_index) {
+        if (table_ptr->find_seek_point(frame_index, &byte_offset, &nearest_frame) && nearest_frame <= frame_index) {
             stream_base_offset_ = static_cast<size_t>(byte_offset);
 
             if (!reinit_decoder()) {
@@ -169,6 +179,9 @@ bool Mp3Decoder::seek_to_frame(drmp3_uint64 frame_index) {
             }
 
             uint64_t frames_to_skip = frame_index - nearest_frame;
+            
+            // Optimization: if skippint is huge (> 5 sec), maybe just use byte seek inaccuracy?
+            // But precision is good.
 
             if (frames_to_skip > 0) {
                 int16_t temp_buf[2048];

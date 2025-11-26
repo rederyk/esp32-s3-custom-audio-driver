@@ -48,6 +48,7 @@ public:
 
     void set_callbacks(const PlayerCallbacks &cb);
     bool select_source(const char* uri, SourceType hint = SourceType::LITTLEFS);
+bool select_source(std::unique_ptr<IDataSource> source);
     bool arm_source();
     void start();
     void stop();

@@ -5,6 +5,8 @@
 #include "logger.h"
 #include "drivers/sd_card_driver.h"
 #include <esp_heap_caps.h>
+#include <memory>
+#include "timeshift_manager.h"
 
 // WiFi credentials - CONFIGURA QUI LE TUE CREDENZIALI
 static const char *kWiFiSSID = "FASTWEB-2";
@@ -16,6 +18,17 @@ static const char *kSampleFilePath = "/audioontag.mp3";
 static const char *kRadioStreamURL = "http://stream.radioparadise.com/mp3-128";
 
 static AudioPlayer player;
+
+void select_timeshift_source() {
+    auto* ts = new TimeshiftManager();
+    if (ts->open(kRadioStreamURL) && ts->start()) {
+        player.select_source(std::unique_ptr<IDataSource>(ts));
+        LOG_INFO("Timeshift source selected and started.");
+    } else {
+        LOG_ERROR("Failed to start timeshift manager.");
+        delete ts;
+    }
+}
 
 static void list_littlefs_files(const char *path)
 {
@@ -157,7 +170,7 @@ static void handle_command_string(String cmd)
             break;
         case 'r':
         case 'R':
-            select_source_path(kRadioStreamURL);
+            select_timeshift_source();
             break;
         case 'i':
         case 'I':

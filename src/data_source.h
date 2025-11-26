@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+class Mp3SeekTable;
+
 enum class SourceType {
     LITTLEFS,
     SD_CARD,
@@ -28,4 +30,7 @@ public:
     virtual bool is_seekable() const = 0;
     virtual SourceType type() const = 0;
     virtual const char* uri() const = 0;
+    
+    // Optional: Provide a build-in seek table (e.g. for Timeshift)
+    virtual const Mp3SeekTable* get_seek_table() const { return nullptr; }
 };

@@ -1,4 +1,5 @@
 #include "audio_player.h"
+#include "timeshift_manager.h"
 
 #include "esp_err.h"
 #include <esp_heap_caps.h>
@@ -236,7 +237,7 @@ bool AudioPlayer::select_source(const char* uri, SourceType hint) {
             break;
 
         case SourceType::HTTP_STREAM:
-            current_source_to_arm_.reset(new HTTPStreamSource());
+            current_source_to_arm_.reset(new TimeshiftManager());
             break;
 
         default:
@@ -248,6 +249,15 @@ bool AudioPlayer::select_source(const char* uri, SourceType hint) {
 
     LOG_INFO("Source selected: %s (type: %d)", uri, (int)type);
     return current_source_to_arm_->open(uri);
+}
+
+bool AudioPlayer::select_source(std::unique_ptr<IDataSource> source) {
+    if (!source) {
+        return false;
+    }
+    current_source_to_arm_ = std::move(source);
+    current_metadata_ = Metadata();
+    return true;
 }
 
 bool AudioPlayer::arm_source() {
