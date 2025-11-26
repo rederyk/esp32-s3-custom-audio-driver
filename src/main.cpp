@@ -19,15 +19,62 @@ static const char *kRadioStreamURL = "http://stream.radioparadise.com/mp3-128";
 
 static AudioPlayer player;
 
-void select_timeshift_source() {
-    auto* ts = new TimeshiftManager();
-    if (ts->open(kRadioStreamURL) && ts->start()) {
-        player.select_source(std::unique_ptr<IDataSource>(ts));
-        LOG_INFO("Timeshift source selected and started.");
-    } else {
-        LOG_ERROR("Failed to start timeshift manager.");
-        delete ts;
+void start_timeshift_radio() {
+    // Stop any current playback first
+    if (player.is_playing() || player.state() == PlayerState::PLAYING || player.state() == PlayerState::PAUSED) {
+        LOG_INFO("Stopping current playback before starting timeshift...");
+        player.stop();
+        delay(500); // Give time to cleanup
     }
+
+    // Create and configure timeshift manager
+    auto* ts = new TimeshiftManager();
+    if (!ts->open(kRadioStreamURL)) {
+        LOG_ERROR("Failed to open timeshift stream URL");
+        delete ts;
+        return;
+    }
+
+    // Start download task
+    if (!ts->start()) {
+        LOG_ERROR("Failed to start timeshift download task");
+        delete ts;
+        return;
+    }
+
+    LOG_INFO("Timeshift download started, waiting for first chunk...");
+
+    // Wait for at least one READY chunk before starting playback (max 10 seconds)
+    const uint32_t MAX_WAIT_MS = 10000;
+    uint32_t start_wait = millis();
+    while (ts->buffered_bytes() == 0) {
+        if (millis() - start_wait > MAX_WAIT_MS) {
+            LOG_ERROR("Timeout waiting for first chunk to be ready");
+            delete ts;
+            return;
+        }
+        delay(100);
+
+        // Log progress every second
+        if ((millis() - start_wait) % 1000 == 0) {
+            LOG_INFO("Waiting for chunks... (%u KB downloaded)",
+                     (unsigned)(ts->total_downloaded_bytes() / 1024));
+        }
+    }
+
+    LOG_INFO("First chunk ready! Starting playback...");
+
+    // Transfer ownership to player
+    player.select_source(std::unique_ptr<IDataSource>(ts));
+
+    // Arm and start playback
+    if (!player.arm_source()) {
+        LOG_ERROR("Failed to arm timeshift source");
+        return;
+    }
+
+    player.start();
+    LOG_INFO("Timeshift radio playback started successfully!");
 }
 
 static void list_littlefs_files(const char *path)
@@ -107,21 +154,26 @@ static void handle_command_string(String cmd)
         {
         case 'h':
         case 'H':
-            LOG_INFO("Commands:");
-            LOG_INFO("h - Help");
-            LOG_INFO("t - Seleziona test file %s", kTestFilePath);
-            LOG_INFO("s - Seleziona sample file %s", kSampleFilePath);
-            LOG_INFO("r - Seleziona radio HTTP stream (Radio Paradise 128k)");
-            LOG_INFO("l - Carica/verifica file selezionato (no play)");
-            LOG_INFO("p - Play/Pause toggle");
-            LOG_INFO("q - Stop playback");
-            LOG_INFO("d <path> - Lista i file (es. 'd /' per LittleFS, 'd /sd/' per SD card)");
-            LOG_INFO("m - Memory stats (start/min/current)");
-            LOG_INFO("f<path> - Seleziona file custom (es. f/my.mp3 o f/sd/song.mp3)");
-            LOG_INFO("i - Player status");
-            LOG_INFO("x - Stato della scheda SD");
-            LOG_INFO("v## - Set volume to ##% (e.g. v75)");
-            LOG_INFO("s## - Seek to ## seconds (e.g. s123)");
+            LOG_INFO("=== COMANDI DISPONIBILI ===");
+            LOG_INFO("PLAYBACK:");
+            LOG_INFO("  r - Avvia radio streaming con timeshift (tutto in uno!)");
+            LOG_INFO("  t - Riproduci test file (%s)", kTestFilePath);
+            LOG_INFO("  s - Riproduci sample file (%s)", kSampleFilePath);
+            LOG_INFO("  p - Play/Pause toggle");
+            LOG_INFO("  q - Stop playback");
+            LOG_INFO("");
+            LOG_INFO("CONTROLLO:");
+            LOG_INFO("  v## - Volume (es. v75 = 75%)");
+            LOG_INFO("  i - Stato player");
+            LOG_INFO("");
+            LOG_INFO("FILE SYSTEM:");
+            LOG_INFO("  d [path] - Lista file (es. 'd /' o 'd /sd/')");
+            LOG_INFO("  f<path> - Seleziona file custom (es. f/song.mp3)");
+            LOG_INFO("  x - Stato SD card");
+            LOG_INFO("");
+            LOG_INFO("DEBUG:");
+            LOG_INFO("  m - Memory stats");
+            LOG_INFO("  h - Mostra questo help");
             break;
         case 'l':
         case 'L':
@@ -162,15 +214,27 @@ static void handle_command_string(String cmd)
             break;
         case 't':
         case 'T':
+            if (player.is_playing() || player.state() == PlayerState::PLAYING || player.state() == PlayerState::PAUSED) {
+                player.stop();
+                delay(300);
+            }
             select_source_path(kTestFilePath);
+            player.arm_source();
+            player.start();
             break;
         case 's':
         case 'S':
+            if (player.is_playing() || player.state() == PlayerState::PLAYING || player.state() == PlayerState::PAUSED) {
+                player.stop();
+                delay(300);
+            }
             select_source_path(kSampleFilePath);
+            player.arm_source();
+            player.start();
             break;
         case 'r':
         case 'R':
-            select_timeshift_source();
+            start_timeshift_radio();
             break;
         case 'i':
         case 'I':

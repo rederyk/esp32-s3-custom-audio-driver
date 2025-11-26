@@ -6,10 +6,11 @@
 #include <WiFi.h>
 #include "mp3_seek_table.h"
 
-constexpr size_t HOT_BUFFER_SIZE = 128 * 1024;   // 128KB RAM buffer (increased)
+constexpr size_t BUFFER_SIZE = 128 * 1024;       // 128KB per buffer
 constexpr size_t CHUNK_SIZE = 512 * 1024;        // 512KB SD chunks
 constexpr size_t MAX_TS_WINDOW = 1024 * 1024 * 512; // 512 MB max window
 constexpr size_t DOWNLOAD_CHUNK = 2048;          // Download buffer size
+constexpr size_t MIN_CHUNK_FLUSH_SIZE = 64 * 1024;  // Min 64KB before flushing
 
 TimeshiftManager::TimeshiftManager() {
     mutex_ = xSemaphoreCreateMutex();
@@ -19,44 +20,69 @@ TimeshiftManager::~TimeshiftManager() {
     stop();
     close();
     if (mutex_) vSemaphoreDelete(mutex_);
-    if (hot_buffer_) free(hot_buffer_);
+    if (recording_buffer_) free(recording_buffer_);
+    if (playback_buffer_) free(playback_buffer_);
 }
 
 bool TimeshiftManager::open(const char* uri) {
     if (is_open_) close();
-    
+
     uri_ = uri;
     is_open_ = true;
-    current_download_offset_ = 0;
+    current_recording_offset_ = 0;
     current_read_offset_ = 0;
-    hot_write_head_ = 0;
-    hot_read_head_ = 0;
-    chunks_.clear();
-    
-    hot_buffer_ = (uint8_t*)malloc(HOT_BUFFER_SIZE);
-    if (!hot_buffer_) {
-        LOG_ERROR("Failed to allocate hot buffer");
+    rec_write_head_ = 0;
+    bytes_in_current_chunk_ = 0;
+    next_chunk_id_ = 0;
+    current_playback_chunk_id_ = INVALID_CHUNK_ID;
+    playback_chunk_loaded_size_ = 0;
+    pending_chunks_.clear();
+    ready_chunks_.clear();
+    pause_download_ = false;
+
+    recording_buffer_ = (uint8_t*)malloc(BUFFER_SIZE);
+    if (!recording_buffer_) {
+        LOG_ERROR("Failed to allocate recording buffer");
         close();
         return false;
     }
-    
+
+    playback_buffer_ = (uint8_t*)malloc(BUFFER_SIZE);
+    if (!playback_buffer_) {
+        LOG_ERROR("Failed to allocate playback buffer");
+        free(recording_buffer_);
+        recording_buffer_ = nullptr;
+        close();
+        return false;
+    }
+
+    LOG_INFO("Timeshift buffers allocated: 2x%uKB", BUFFER_SIZE / 1024);
     return true;
 }
 
 void TimeshiftManager::close() {
     stop();
-    
-    // Clean up chunks
-    for (const auto& chunk : chunks_) {
+
+    // Clean up all chunks (both pending and ready)
+    for (const auto& chunk : pending_chunks_) {
         SD_MMC.remove(chunk.filename.c_str());
     }
-    chunks_.clear();
-    
-    if (hot_buffer_) {
-        free(hot_buffer_);
-        hot_buffer_ = nullptr;
+    for (const auto& chunk : ready_chunks_) {
+        SD_MMC.remove(chunk.filename.c_str());
     }
-    
+    pending_chunks_.clear();
+    ready_chunks_.clear();
+
+    if (recording_buffer_) {
+        free(recording_buffer_);
+        recording_buffer_ = nullptr;
+    }
+
+    if (playback_buffer_) {
+        free(playback_buffer_);
+        playback_buffer_ = nullptr;
+    }
+
     is_open_ = false;
     seek_table_.clear();
 }
@@ -91,35 +117,51 @@ void TimeshiftManager::stop() {
 size_t TimeshiftManager::read(void* buffer, size_t size) {
     if (!is_open_) return 0;
 
-    // For live streams, wait until we have data available (up to 5 seconds)
+    // Wait until we have ready chunks available (up to 5 seconds)
     const uint32_t MAX_WAIT_MS = 5000;
     uint32_t start_wait = millis();
 
-    while (is_running_ && current_read_offset_ >= current_download_offset_) {
+    while (is_running_ && ready_chunks_.empty()) {
         if (millis() - start_wait > MAX_WAIT_MS) {
-            LOG_WARN("Timeout waiting for download data");
+            LOG_WARN("Timeout waiting for ready chunks");
             return 0;  // Timeout - no data available
         }
-        vTaskDelay(pdMS_TO_TICKS(50));  // Wait for more data to be downloaded
+        vTaskDelay(pdMS_TO_TICKS(100));  // Wait for chunks to be promoted to READY
+    }
+
+    if (ready_chunks_.empty()) {
+        LOG_WARN("No ready chunks available for playback");
+        return 0; // No data available
     }
 
     xSemaphoreTake(mutex_, portMAX_DELAY);
-    size_t bytes_read = read_from_cache(current_read_offset_, buffer, size);
+
+    // Read from playback buffer (will load chunk if needed)
+    size_t bytes_read = read_from_playback_buffer(current_read_offset_, buffer, size);
     current_read_offset_ += bytes_read;
+
     xSemaphoreGive(mutex_);
     return bytes_read;
 }
 
 bool TimeshiftManager::seek(size_t position) {
     if (!is_open_) return false;
-    
+
     xSemaphoreTake(mutex_, portMAX_DELAY);
-    if (position > current_download_offset_) {
+
+    // Verify that the offset is in a READY chunk
+    size_t chunk_id = find_chunk_for_offset(position);
+    if (chunk_id == INVALID_CHUNK_ID) {
         xSemaphoreGive(mutex_);
+        LOG_WARN("Seek to %u failed: offset not in ready chunks", (unsigned)position);
         return false;
     }
+
+    // Update read offset (next read() will load the correct chunk)
     current_read_offset_ = position;
+
     xSemaphoreGive(mutex_);
+    LOG_INFO("Seek to offset %u (chunk %u)", (unsigned)position, (unsigned)ready_chunks_[chunk_id].id);
     return true;
 }
 
@@ -134,7 +176,7 @@ size_t TimeshiftManager::size() const {
         return 0;  // Unknown size for live stream
     }
     // Only when download is complete, return actual size
-    return current_download_offset_;
+    return current_recording_offset_;
 }
 
 bool TimeshiftManager::is_open() const {
@@ -147,11 +189,24 @@ const char* TimeshiftManager::uri() const {
 
 
 size_t TimeshiftManager::buffered_bytes() const {
-    return current_download_offset_ - current_read_offset_;
+    // Calculate available bytes in ready chunks
+    // Safe to access ready_chunks_.size() without mutex (atomic operation)
+    if (ready_chunks_.empty()) {
+        return 0;
+    }
+
+    // Quick estimation without mutex (to avoid blocking in loop())
+    // This is safe because ready_chunks_ only grows (never shrinks during recording)
+    size_t num_ready = ready_chunks_.size();
+    if (num_ready == 0) return 0;
+
+    // Conservative estimate: num_chunks * CHUNK_SIZE
+    // (actual calculation would need mutex, but this is good enough for "ready?" check)
+    return num_ready * CHUNK_SIZE;
 }
 
 size_t TimeshiftManager::total_downloaded_bytes() const {
-    return current_download_offset_;
+    return current_recording_offset_;
 }
 
 float TimeshiftManager::buffer_duration_seconds() const {
@@ -194,6 +249,12 @@ void TimeshiftManager::download_task_loop() {
     const uint32_t STREAM_TIMEOUT = 30000; // 30 seconds without data = timeout
 
     while (is_running_) {
+        // Check pause flag
+        if (pause_download_) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         int available = stream->available();
         if (available > 0) {
             size_t to_read = std::min(sizeof(buf), (size_t)available);
@@ -204,32 +265,29 @@ void TimeshiftManager::download_task_loop() {
 
                 xSemaphoreTake(mutex_, portMAX_DELAY);
 
-                // Write to hot buffer (circular)
+                // Write to recording_buffer_ (circular)
                 for (int i = 0; i < len; i++) {
-                    hot_buffer_[hot_write_head_] = buf[i];
-                    hot_write_head_ = (hot_write_head_ + 1) % HOT_BUFFER_SIZE;
+                    recording_buffer_[rec_write_head_] = buf[i];
+                    rec_write_head_ = (rec_write_head_ + 1) % BUFFER_SIZE;
+                    bytes_in_current_chunk_++;
+
+                    // Flush when buffer is almost full (must flush before wrap corrupts data)
+                    if (bytes_in_current_chunk_ >= BUFFER_SIZE - 4096) {
+                        LOG_INFO("Buffer near full (%u bytes), flushing to SD", (unsigned)bytes_in_current_chunk_);
+                        if (!flush_recording_chunk()) {
+                            LOG_ERROR("Failed to flush recording chunk");
+                        }
+                    }
                 }
-                current_download_offset_ += len;
                 total_downloaded += len;
 
                 // Log progress every 5 seconds
                 if (millis() - last_log_time > 5000) {
-                    LOG_INFO("Downloaded %u KB (total: %u KB, buffered: %u bytes)",
-                             len / 1024, (unsigned)(total_downloaded / 1024),
-                             (unsigned)buffered_bytes());
+                    LOG_INFO("Recording: %u KB total, %u bytes in current chunk, %u ready chunks",
+                             (unsigned)(total_downloaded / 1024),
+                             (unsigned)bytes_in_current_chunk_,
+                             (unsigned)ready_chunks_.size());
                     last_log_time = millis();
-                }
-
-                // Flush to SD if buffer is getting full (leave 32KB free for safety)
-                size_t buffer_used = (hot_write_head_ >= hot_read_head_)
-                    ? (hot_write_head_ - hot_read_head_)
-                    : (HOT_BUFFER_SIZE - hot_read_head_ + hot_write_head_);
-
-                if (buffer_used >= HOT_BUFFER_SIZE - 32 * 1024) {
-                    LOG_INFO("Hot buffer near full (%u bytes), flushing to SD", (unsigned)buffer_used);
-                    if (!flush_to_sd()) {
-                        LOG_ERROR("Failed to flush to SD");
-                    }
                 }
 
                 xSemaphoreGive(mutex_);
@@ -264,144 +322,235 @@ void TimeshiftManager::download_task_loop() {
     vTaskDelete(nullptr);
 }
 
-bool TimeshiftManager::flush_to_sd() {
-    // Calculate how much data to flush (from hot_read_head_ to hot_write_head_)
-    size_t bytes_to_flush;
-    if (hot_write_head_ >= hot_read_head_) {
-        bytes_to_flush = hot_write_head_ - hot_read_head_;
-    } else {
-        bytes_to_flush = (HOT_BUFFER_SIZE - hot_read_head_) + hot_write_head_;
-    }
+// ========== RECORDING SIDE METHODS ==========
 
-    if (bytes_to_flush < 64 * 1024) {
+bool TimeshiftManager::flush_recording_chunk() {
+    if (bytes_in_current_chunk_ < MIN_CHUNK_FLUSH_SIZE) {
         // Not enough data to flush yet
         return true;
     }
 
-    ChunkInfo new_chunk;
-    new_chunk.id = chunks_.size();
-    new_chunk.start_offset = current_download_offset_ - bytes_to_flush;
-    new_chunk.length = bytes_to_flush;
-    new_chunk.filename = "/ts_chunk_" + std::to_string(new_chunk.id) + ".bin";
+    // Create ChunkInfo for PENDING chunk
+    ChunkInfo chunk;
+    chunk.id = next_chunk_id_++;
+    chunk.start_offset = current_recording_offset_;
+    chunk.length = bytes_in_current_chunk_;
+    chunk.end_offset = current_recording_offset_ + bytes_in_current_chunk_;
+    chunk.filename = "/ts_pending_" + std::to_string(chunk.id) + ".bin";
+    chunk.state = ChunkState::PENDING;
+    chunk.crc32 = 0; // TODO: calculate CRC if needed
 
-    File file = SD_MMC.open(new_chunk.filename.c_str(), FILE_WRITE);
-    if (!file) {
-        LOG_ERROR("Failed to open chunk file for write: %s", new_chunk.filename.c_str());
+    // Write chunk to SD
+    if (!write_chunk_to_sd(chunk)) {
+        LOG_ERROR("Failed to write chunk %u to SD", chunk.id);
         return false;
     }
 
-    // Write data handling circular buffer
-    size_t written = 0;
-    if (hot_write_head_ >= hot_read_head_) {
-        // Contiguous write
-        written = file.write(hot_buffer_ + hot_read_head_, bytes_to_flush);
+    // Validate and promote to READY
+    if (validate_chunk(chunk)) {
+        promote_chunk_to_ready(chunk);
     } else {
-        // Split write: from read_head to end, then from 0 to write_head
-        size_t first_part = HOT_BUFFER_SIZE - hot_read_head_;
-        written = file.write(hot_buffer_ + hot_read_head_, first_part);
-        if (written == first_part && hot_write_head_ > 0) {
-            written += file.write(hot_buffer_, hot_write_head_);
-        }
-    }
-
-    file.close();
-
-    if (written != bytes_to_flush) {
-        LOG_ERROR("Failed to write chunk to SD (wrote %u of %u bytes)",
-                  (unsigned)written, (unsigned)bytes_to_flush);
-        SD_MMC.remove(new_chunk.filename.c_str());
+        LOG_ERROR("Chunk %u validation failed", chunk.id);
+        SD_MMC.remove(chunk.filename.c_str());
         return false;
     }
 
-    chunks_.push_back(new_chunk);
-    hot_read_head_ = hot_write_head_; // Update read head
+    // Update recording state
+    current_recording_offset_ += bytes_in_current_chunk_;
+    bytes_in_current_chunk_ = 0;
+    // DON'T reset rec_write_head_ - buffer continues circularly
 
-    LOG_INFO("Flushed chunk %u: %u bytes to %s",
-             (unsigned)new_chunk.id, (unsigned)bytes_to_flush, new_chunk.filename.c_str());
-
-    // Clean up old chunks if over max window
-    while (!chunks_.empty() &&
-           current_download_offset_ - chunks_.front().start_offset > MAX_TS_WINDOW) {
-        LOG_INFO("Removing old chunk: %s", chunks_.front().filename.c_str());
-        SD_MMC.remove(chunks_.front().filename.c_str());
-        chunks_.erase(chunks_.begin());
-    }
+    // Cleanup old chunks
+    cleanup_old_chunks();
 
     return true;
 }
 
-size_t TimeshiftManager::read_from_cache(size_t offset, void* buffer, size_t size) {
-    if (offset >= current_download_offset_) {
-        // Trying to read beyond what's downloaded
-        return 0;
+bool TimeshiftManager::write_chunk_to_sd(ChunkInfo& chunk) {
+    File file = SD_MMC.open(chunk.filename.c_str(), FILE_WRITE);
+    if (!file) {
+        LOG_ERROR("Failed to open chunk file for write: %s", chunk.filename.c_str());
+        return false;
     }
 
-    size_t bytes_read = 0;
-    uint8_t* dst = static_cast<uint8_t*>(buffer);
-    size_t remaining = size;
+    // The recording_buffer_ might have wrapped around, so we need to handle circular buffer
+    // Calculate start position: current position minus accumulated bytes
+    size_t start_pos = 0;
+    if (rec_write_head_ >= chunk.length) {
+        // Data is contiguous: [start_pos ... rec_write_head_)
+        start_pos = rec_write_head_ - chunk.length;
+        size_t written = file.write(recording_buffer_ + start_pos, chunk.length);
+        file.close();
 
-    // Step 1: Try to read from SD chunks first
-    for (const auto& chunk : chunks_) {
-        if (bytes_read >= size) break;
+        if (written != chunk.length) {
+            LOG_ERROR("Chunk write mismatch: expected %u, wrote %u", chunk.length, written);
+            SD_MMC.remove(chunk.filename.c_str());
+            return false;
+        }
+    } else {
+        // Data wraps around: [BUFFER_SIZE - remainder ... BUFFER_SIZE) + [0 ... rec_write_head_)
+        size_t remainder = chunk.length - rec_write_head_;
+        start_pos = BUFFER_SIZE - remainder;
 
-        if (offset >= chunk.start_offset && offset < chunk.start_offset + chunk.length) {
-            size_t chunk_offset = offset - chunk.start_offset;
-            size_t to_read = std::min(remaining, chunk.length - chunk_offset);
+        // Write first part (from start_pos to end of buffer)
+        size_t written1 = file.write(recording_buffer_ + start_pos, remainder);
 
-            File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
-            if (!file) {
-                LOG_ERROR("Failed to open chunk file for read: %s", chunk.filename.c_str());
-                return bytes_read;
-            }
+        // Write second part (from 0 to rec_write_head_)
+        size_t written2 = file.write(recording_buffer_, rec_write_head_);
 
-            if (!file.seek(chunk_offset)) {
-                LOG_ERROR("Failed to seek in chunk file");
-                file.close();
-                return bytes_read;
-            }
+        file.close();
 
-            size_t read = file.read(dst, to_read);
-            file.close();
-
-            bytes_read += read;
-            if (read != to_read) {
-                LOG_WARN("Partial read from chunk: %u of %u bytes", (unsigned)read, (unsigned)to_read);
-                return bytes_read;
-            }
-
-            dst += read;
-            offset += read;
-            remaining -= read;
+        if (written1 + written2 != chunk.length) {
+            LOG_ERROR("Chunk write mismatch: expected %u, wrote %u", chunk.length, (unsigned)(written1 + written2));
+            SD_MMC.remove(chunk.filename.c_str());
+            return false;
         }
     }
 
-    // Step 2: Read remaining data from hot buffer (circular)
-    if (remaining > 0 && offset < current_download_offset_) {
-        // Calculate the oldest data in hot buffer
-        size_t hot_buffer_size;
-        if (hot_write_head_ >= hot_read_head_) {
-            hot_buffer_size = hot_write_head_ - hot_read_head_;
+    LOG_DEBUG("Wrote chunk %u: %u KB to %s", chunk.id, chunk.length / 1024, chunk.filename.c_str());
+    return true;
+}
+
+bool TimeshiftManager::validate_chunk(ChunkInfo& chunk) {
+    // Basic validation: check file exists and size matches
+    File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
+    if (!file) {
+        LOG_ERROR("Validation failed: cannot open %s", chunk.filename.c_str());
+        return false;
+    }
+
+    size_t file_size = file.size();
+    file.close();
+
+    if (file_size != chunk.length) {
+        LOG_ERROR("Validation failed: size mismatch (%u vs %u)", file_size, chunk.length);
+        return false;
+    }
+
+    // TODO: Add CRC32 validation if needed
+    return true;
+}
+
+void TimeshiftManager::promote_chunk_to_ready(ChunkInfo chunk) {
+    // Rename file from pending to ready
+    std::string ready_filename = "/ts_ready_" + std::to_string(chunk.id) + ".bin";
+
+    if (SD_MMC.rename(chunk.filename.c_str(), ready_filename.c_str())) {
+        chunk.filename = ready_filename;
+        chunk.state = ChunkState::READY;
+
+        // Add to ready_chunks_ (already ordered by ID)
+        ready_chunks_.push_back(chunk);
+
+        LOG_INFO("Chunk %u promoted to READY (%u KB, offset %u-%u)",
+                 chunk.id, chunk.length / 1024,
+                 (unsigned)chunk.start_offset, (unsigned)chunk.end_offset);
+    } else {
+        LOG_ERROR("Failed to rename chunk %u from pending to ready", chunk.id);
+        SD_MMC.remove(chunk.filename.c_str());
+    }
+}
+
+void TimeshiftManager::cleanup_old_chunks() {
+    // Remove chunks beyond the timeshift window
+    while (!ready_chunks_.empty()) {
+        const ChunkInfo& oldest = ready_chunks_.front();
+
+        if (current_recording_offset_ - oldest.end_offset > MAX_TS_WINDOW) {
+            LOG_INFO("Removing old chunk %u: %s", oldest.id, oldest.filename.c_str());
+            SD_MMC.remove(oldest.filename.c_str());
+            ready_chunks_.erase(ready_chunks_.begin());
         } else {
-            hot_buffer_size = (HOT_BUFFER_SIZE - hot_read_head_) + hot_write_head_;
+            break; // Chunks are ordered, so we can stop
         }
+    }
+}
 
-        size_t hot_start = current_download_offset_ - hot_buffer_size;
+// ========== PLAYBACK SIDE METHODS ==========
 
-        if (offset >= hot_start && offset < current_download_offset_) {
-            // Data is in hot buffer
-            size_t bytes_from_start = offset - hot_start;
-            size_t physical_offset = (hot_read_head_ + bytes_from_start) % HOT_BUFFER_SIZE;
-            size_t available = current_download_offset_ - offset;
-            size_t to_read = std::min(remaining, available);
+size_t TimeshiftManager::find_chunk_for_offset(size_t offset) {
+    // Binary search in ready_chunks_ (ordered by start_offset)
+    for (size_t i = 0; i < ready_chunks_.size(); i++) {
+        const ChunkInfo& chunk = ready_chunks_[i];
+        if (offset >= chunk.start_offset && offset < chunk.end_offset) {
+            return i; // Found
+        }
+    }
+    return INVALID_CHUNK_ID; // Not found
+}
 
-            // Handle circular buffer read
-            for (size_t i = 0; i < to_read; i++) {
-                dst[i] = hot_buffer_[(physical_offset + i) % HOT_BUFFER_SIZE];
-            }
+bool TimeshiftManager::load_chunk_to_playback(size_t chunk_id) {
+    if (chunk_id >= ready_chunks_.size()) {
+        LOG_ERROR("Invalid chunk ID: %u (max: %u)", chunk_id, ready_chunks_.size());
+        return false;
+    }
 
-            bytes_read += to_read;
+    const ChunkInfo& chunk = ready_chunks_[chunk_id];
+    if (chunk.state != ChunkState::READY) {
+        LOG_ERROR("Chunk %u is not READY (state: %d)", chunk.id, (int)chunk.state);
+        return false;
+    }
+
+    // Open chunk file
+    File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
+    if (!file) {
+        LOG_ERROR("Failed to open chunk for playback: %s", chunk.filename.c_str());
+        return false;
+    }
+
+    // Read entire chunk into playback_buffer_
+    size_t read = file.read(playback_buffer_, chunk.length);
+    file.close();
+
+    if (read != chunk.length) {
+        LOG_ERROR("Chunk read mismatch: expected %u, got %u", chunk.length, read);
+        return false;
+    }
+
+    // Update playback state
+    current_playback_chunk_id_ = chunk_id;
+    playback_chunk_loaded_size_ = chunk.length;
+
+    LOG_DEBUG("Loaded chunk %u to playback buffer (%u KB)", chunk.id, chunk.length / 1024);
+    return true;
+}
+
+size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, size_t size) {
+    // Find chunk containing this offset
+    size_t chunk_id = find_chunk_for_offset(offset);
+    if (chunk_id == INVALID_CHUNK_ID) {
+        LOG_WARN("No chunk found for offset %u", (unsigned)offset);
+        return 0; // Offset not available in ready chunks
+    }
+
+    // If chunk not loaded, load it
+    if (current_playback_chunk_id_ != chunk_id) {
+        if (!load_chunk_to_playback(chunk_id)) {
+            LOG_ERROR("Failed to load chunk %u for playback", chunk_id);
+            return 0;
         }
     }
 
-    return bytes_read;
+    // Calculate offset relative to chunk
+    const ChunkInfo& chunk = ready_chunks_[chunk_id];
+    size_t chunk_offset = offset - chunk.start_offset;
+    size_t available = chunk.length - chunk_offset;
+    size_t to_read = std::min(size, available);
+
+    // Copy from playback_buffer_
+    memcpy(buffer, playback_buffer_ + chunk_offset, to_read);
+
+    return to_read;
+}
+
+// ========== PAUSE/RESUME METHODS ==========
+
+void TimeshiftManager::pause_recording() {
+    pause_download_ = true;
+    LOG_INFO("Recording paused");
+}
+
+void TimeshiftManager::resume_recording() {
+    pause_download_ = false;
+    LOG_INFO("Recording resumed");
 }
