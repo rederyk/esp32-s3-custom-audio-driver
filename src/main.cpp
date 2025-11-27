@@ -376,14 +376,11 @@ static void handle_command_string(String cmd)
             int target_sec = cmd.substring(1).toInt();
             uint32_t total_sec = player.total_duration_sec();
 
-            // Limita il seek al tempo disponibile con margine di sicurezza
-            // Sottrai 10 secondi per evitare di seekare alla fine dell'ultimo chunk
+            // Limita il seek al tempo disponibile
+            // TimeshiftManager gestirà automaticamente la posizione sicura
             if (total_sec > 0 && target_sec > (int)total_sec) {
                 LOG_WARN("Cannot seek to %d sec, max available is %u sec", target_sec, total_sec);
-                // Seek a un chunk sicuro, non alla fine
-                const int SAFETY_MARGIN_SEC = 10;
-                target_sec = (total_sec > SAFETY_MARGIN_SEC) ? (total_sec - SAFETY_MARGIN_SEC) : 0;
-                LOG_INFO("Adjusted seek to %d sec (safe position in earlier chunk)", target_sec);
+                target_sec = total_sec;
             }
 
             if (target_sec < 0) {

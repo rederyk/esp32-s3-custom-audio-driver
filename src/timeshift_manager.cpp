@@ -1116,7 +1116,7 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
 
         // Attendi il margine configurato per permettere al preloader di caricare i chunk successivi
         if (auto_pause_callback_ && is_auto_paused_) {
-            // Se il margine è 0, riprendi immediatamente senza attese
+            // Se ENTRAMBI i margini sono 0, riprendi immediatamente senza attese
             if (auto_pause_delay_ms_ == 0 && auto_pause_min_chunks_ == 0) {
                 LOG_INFO("Chunk loaded, resuming immediately (no buffer margin configured)");
                 is_auto_paused_ = false;
@@ -1180,7 +1180,46 @@ size_t TimeshiftManager::seek_to_time(uint32_t target_ms) {
         return SIZE_MAX;  // Invalid offset
     }
 
-    // Search for the chunk containing the target timestamp
+    const ChunkInfo& first_chunk = ready_chunks_.front();
+    const ChunkInfo& last_chunk = ready_chunks_.back();
+    uint32_t total_duration_ms = 0;
+    for (const auto& c : ready_chunks_) {
+        total_duration_ms += c.duration_ms;
+    }
+
+    // STRATEGIA SICURA: Calcolo dinamico del margine di sicurezza
+    // Basato sulla dimensione dei chunk e sul parametro auto_pause_min_chunks_
+    // Formula: durata_chunk = (CHUNK_SIZE * 8000) / (bitrate_kbps * 1024)
+    // Con bitrate a 128kbps: ~8 secondi per chunk da 128KB
+    constexpr float bitrate_kbps = 128.0f;
+    uint32_t avg_chunk_duration_ms = (uint32_t)((CHUNK_SIZE * 8000.0f) / (bitrate_kbps * 1024.0f));
+    uint32_t SAFETY_MARGIN_MS = avg_chunk_duration_ms * auto_pause_min_chunks_;
+
+    uint32_t safe_max_ms = (total_duration_ms > SAFETY_MARGIN_MS)
+                           ? (total_duration_ms - SAFETY_MARGIN_MS)
+                           : 0;
+
+    // Se il target è oltre il margine di sicurezza, clampalo
+    bool clamped_for_safety = false;
+    if (target_ms > safe_max_ms) {
+        LOG_WARN("Seek to %u ms is too close to end (%u ms total), clamping to safe position at %u ms (margin: %u ms = %u chunks)",
+                 target_ms, total_duration_ms, safe_max_ms, SAFETY_MARGIN_MS, (unsigned)auto_pause_min_chunks_);
+        target_ms = safe_max_ms;
+        clamped_for_safety = true;
+    }
+
+    // If target is BEFORE available time, seek to BEGINNING
+    if (target_ms < first_chunk.start_time_ms) {
+        size_t first_offset = first_chunk.start_offset;
+        xSemaphoreGive(mutex_);
+
+        LOG_WARN("Seek to %u ms before available time (starts at %u ms), seeking to beginning",
+                 target_ms, first_chunk.start_time_ms);
+
+        return first_offset;
+    }
+
+    // Search for the chunk containing the (possibly clamped) target timestamp
     for (size_t i = 0; i < ready_chunks_.size(); i++) {
         const ChunkInfo& chunk = ready_chunks_[i];
         uint32_t chunk_end_ms = chunk.start_time_ms + chunk.duration_ms;
@@ -1196,35 +1235,20 @@ size_t TimeshiftManager::seek_to_time(uint32_t target_ms) {
 
             xSemaphoreGive(mutex_);
 
-            LOG_INFO("Seek to %u ms → chunk %u, byte offset %u (progress %.2f%%)",
-                     target_ms, chunk.id, (unsigned)global_offset, progress * 100.0f);
+            LOG_INFO("Seek to %u ms → chunk %u, byte offset %u (progress %.2f%%)%s",
+                     target_ms, chunk.id, (unsigned)global_offset, progress * 100.0f,
+                     clamped_for_safety ? " [SAFE POSITION - buffering margin]" : "");
 
             return global_offset;
         }
     }
 
-    // Target not in any chunk - check if before or after available time
-    const ChunkInfo& first_chunk = ready_chunks_.front();
-    const ChunkInfo& last_chunk = ready_chunks_.back();
-
-    // If target is BEFORE available time, seek to BEGINNING
-    if (target_ms < first_chunk.start_time_ms) {
-        size_t first_offset = first_chunk.start_offset;
-        xSemaphoreGive(mutex_);
-
-        LOG_WARN("Seek to %u ms before available time (starts at %u ms), seeking to beginning",
-                 target_ms, first_chunk.start_time_ms);
-
-        return first_offset;
-    }
-
-    // If target is AFTER available time, seek to BEGINNING of last chunk
-    // (not end, to avoid immediate "End of stream")
+    // Target not found - shouldn't happen after clamping, but handle gracefully
+    // Seek to beginning of last chunk as fallback
     size_t safe_offset = last_chunk.start_offset;
     xSemaphoreGive(mutex_);
 
-    LOG_WARN("Seek to %u ms beyond available time (ends at %u ms), seeking to beginning of last chunk",
-             target_ms, last_chunk.start_time_ms + last_chunk.duration_ms);
+    LOG_WARN("Seek target not found after clamping, seeking to beginning of last chunk");
 
     return safe_offset;
 }
