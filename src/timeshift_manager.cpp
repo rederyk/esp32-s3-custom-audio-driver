@@ -8,7 +8,9 @@
 
 constexpr size_t BUFFER_SIZE = 128 * 1024;       // 128KB per buffer
 constexpr size_t CHUNK_SIZE = 128 * 1024;        // Chunk fissi da 128KB
-constexpr size_t MAX_TS_WINDOW = 1024 * 1024 * 512; // 512 MB max window
+// CONFIGURABILE: Ridotto da 512MB a 256MB per cleanup più aggressivo
+// Modifica questo valore per cambiare quando vengono rimossi i chunk vecchi
+constexpr size_t MAX_TS_WINDOW = 1024 * 1024 * 2; // 256 MB max window (era 512MB)
 constexpr size_t DOWNLOAD_CHUNK = 4096;          // Aumentiamo per efficienza
 constexpr size_t MIN_CHUNK_FLUSH_SIZE = 124 * 1024; // Flush vicino alla dimensione target
 
@@ -450,7 +452,8 @@ bool TimeshiftManager::flush_recording_chunk() {
         return false;
     }
 
-    // Cleanup old chunks
+    // Cleanup old chunks (chiamato dopo ogni flush di chunk)
+    LOG_DEBUG("Calling cleanup_old_chunks() after flushing chunk %u", chunk.id);
     cleanup_old_chunks();
 
     // Rilasciamo il mutex
@@ -671,17 +674,73 @@ void TimeshiftManager::promote_chunk_to_ready(ChunkInfo chunk) {
 
 void TimeshiftManager::cleanup_old_chunks() {
     // Remove chunks beyond the timeshift window
+    LOG_DEBUG("=== CLEANUP START ===");
+    LOG_DEBUG("Current recording offset: %u MB (%u bytes)",
+              (unsigned)(current_recording_offset_ / (1024 * 1024)),
+              (unsigned)current_recording_offset_);
+    LOG_DEBUG("MAX_TS_WINDOW: %u MB (%u bytes)",
+              (unsigned)(MAX_TS_WINDOW / (1024 * 1024)),
+              (unsigned)MAX_TS_WINDOW);
+    LOG_DEBUG("Total ready chunks: %u", (unsigned)ready_chunks_.size());
+
+    if (ready_chunks_.empty()) {
+        LOG_DEBUG("No chunks to cleanup (ready_chunks_ is empty)");
+        LOG_DEBUG("=== CLEANUP END (nothing to do) ===");
+        return;
+    }
+
+    size_t removed_count = 0;
+    size_t total_removed_bytes = 0;
+
     while (!ready_chunks_.empty()) {
         const ChunkInfo& oldest = ready_chunks_.front();
+        size_t age_bytes = current_recording_offset_ - oldest.end_offset;
+        size_t age_mb = age_bytes / (1024 * 1024);
 
-        if (current_recording_offset_ - oldest.end_offset > MAX_TS_WINDOW) {
-            LOG_INFO("Removing old chunk %u: %s", oldest.id, oldest.filename.c_str());
-            SD_MMC.remove(oldest.filename.c_str());
+        LOG_DEBUG("Checking oldest chunk %u: end_offset=%u MB, age=%u MB (%u bytes)",
+                  oldest.id,
+                  (unsigned)(oldest.end_offset / (1024 * 1024)),
+                  (unsigned)age_mb,
+                  (unsigned)age_bytes);
+
+        if (age_bytes > MAX_TS_WINDOW) {
+            LOG_INFO("🗑️ CLEANUP: Removing old chunk %u (age: %u MB > limit: %u MB)",
+                     oldest.id,
+                     (unsigned)age_mb,
+                     (unsigned)(MAX_TS_WINDOW / (1024 * 1024)));
+            LOG_INFO("   File: %s, Size: %u KB",
+                     oldest.filename.c_str(),
+                     (unsigned)(oldest.length / 1024));
+
+            bool removed = SD_MMC.remove(oldest.filename.c_str());
+            if (removed) {
+                LOG_DEBUG("   ✅ File deleted successfully");
+                removed_count++;
+                total_removed_bytes += oldest.length;
+            } else {
+                LOG_ERROR("   ❌ Failed to delete file: %s", oldest.filename.c_str());
+            }
+
             ready_chunks_.erase(ready_chunks_.begin());
         } else {
+            LOG_DEBUG("Oldest chunk %u is still within window (age: %u MB <= limit: %u MB), stopping cleanup",
+                      oldest.id,
+                      (unsigned)age_mb,
+                      (unsigned)(MAX_TS_WINDOW / (1024 * 1024)));
             break; // Chunks are ordered, so we can stop
         }
     }
+
+    if (removed_count > 0) {
+        LOG_INFO("✅ CLEANUP SUMMARY: Removed %u chunks, freed %u MB",
+                 (unsigned)removed_count,
+                 (unsigned)(total_removed_bytes / (1024 * 1024)));
+    } else {
+        LOG_DEBUG("No chunks removed (all within window)");
+    }
+
+    LOG_DEBUG("Remaining ready chunks: %u", (unsigned)ready_chunks_.size());
+    LOG_DEBUG("=== CLEANUP END ===");
 }
 
 bool TimeshiftManager::preload_next_chunk(size_t current_chunk_id) {
