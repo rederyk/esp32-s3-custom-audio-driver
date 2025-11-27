@@ -18,6 +18,7 @@ static const char *kSampleFilePath = "/audioontag.mp3";
 static const char *kRadioStreamURL = "http://stream.radioparadise.com/mp3-128";
 
 static AudioPlayer player;
+static StorageMode preferred_storage_mode = StorageMode::SD_CARD;  // Default: SD card mode
 
 void start_timeshift_radio() {
     // Stop any current playback first
@@ -29,6 +30,12 @@ void start_timeshift_radio() {
 
     // Create and configure timeshift manager
     auto* ts = new TimeshiftManager();
+
+    // Set preferred storage mode BEFORE opening
+    ts->setStorageMode(preferred_storage_mode);
+    LOG_INFO("Starting timeshift in %s mode",
+             preferred_storage_mode == StorageMode::PSRAM_ONLY ? "PSRAM" : "SD");
+
     if (!ts->open(kRadioStreamURL)) {
         LOG_ERROR("Failed to open timeshift stream URL");
         delete ts;
@@ -75,6 +82,13 @@ void start_timeshift_radio() {
 
     player.start();
     LOG_INFO("Timeshift radio playback started successfully!");
+}
+
+void set_preferred_storage_mode(StorageMode mode) {
+    preferred_storage_mode = mode;
+    LOG_INFO("Preferred timeshift storage mode set to: %s",
+             mode == StorageMode::PSRAM_ONLY ? "PSRAM_ONLY (fast, ~2min buffer)" : "SD_CARD (slower, unlimited)");
+    LOG_INFO("This will be used next time you start radio with 'r' command");
 }
 
 static void list_littlefs_files(const char *path)
@@ -164,12 +178,18 @@ static void handle_command_string(String cmd)
             LOG_INFO("");
             LOG_INFO("CONTROLLO:");
             LOG_INFO("  v## - Volume (es. v75 = 75%)");
+            LOG_INFO("  s## - Seek indietro di ## secondi (es. s5 = -5 sec)");
             LOG_INFO("  i - Stato player");
             LOG_INFO("");
             LOG_INFO("FILE SYSTEM:");
             LOG_INFO("  d [path] - Lista file (es. 'd /' o 'd /sd/')");
             LOG_INFO("  f<path> - Seleziona file custom (es. f/song.mp3)");
             LOG_INFO("  x - Stato SD card");
+            LOG_INFO("");
+            LOG_INFO("TIMESHIFT STORAGE (set BEFORE starting radio):");
+            LOG_INFO("  W - shoW preferred storage mode");
+            LOG_INFO("  Z - set psRam mode preference (fast, ~2min buffer)");
+            LOG_INFO("  C - set sd Card mode preference (slower, unlimited buffer)");
             LOG_INFO("");
             LOG_INFO("DEBUG:");
             LOG_INFO("  m - Memory stats");
@@ -263,6 +283,28 @@ static void handle_command_string(String cmd)
             }
         }
             break;
+        case 'w':
+        case 'W':
+            // Show preferred timeshift storage mode
+            LOG_INFO("Preferred timeshift storage mode: %s",
+                     preferred_storage_mode == StorageMode::PSRAM_ONLY ? "PSRAM_ONLY" : "SD_CARD");
+            if (preferred_storage_mode == StorageMode::PSRAM_ONLY) {
+                LOG_INFO("  - Fast access, ~2min buffer, 2MB PSRAM used");
+            } else {
+                LOG_INFO("  - Slower access, unlimited buffer, uses SD card");
+            }
+            LOG_INFO("Use 'Z' for PSRAM or 'C' for SD, then start radio with 'r'");
+            break;
+        case 'z':
+        case 'Z':
+            // Set PSRAM mode preference
+            set_preferred_storage_mode(StorageMode::PSRAM_ONLY);
+            break;
+        case 'c':
+        case 'C':
+            // Set SD card mode preference
+            set_preferred_storage_mode(StorageMode::SD_CARD);
+            break;
         default:
             LOG_WARN("Unknown command: %s. Type 'h' for help.", cmd.c_str());
             break;
@@ -275,10 +317,18 @@ static void handle_command_string(String cmd)
             int vol = cmd.substring(1).toInt();
             player.set_volume(vol);
         }
-        else if (first_char == 's')
+        else if (first_char == 's' || first_char == 'S')
         {
             int seconds = cmd.substring(1).toInt();
-            player.request_seek(seconds);
+            // SEEK RELATIVO: "s 5" = vai indietro di 5 secondi
+            // Calcola la posizione corrente e sottrai i secondi
+            int current_sec = player.played_frames() / player.current_sample_rate();
+            int target_sec = current_sec - seconds;
+            if (target_sec < 0) {
+                target_sec = 0; // Non andare prima dell'inizio
+            }
+            LOG_INFO("Relative seek: -%d sec (from %d to %d sec)", seconds, current_sec, target_sec);
+            player.request_seek(target_sec);
         }
         else if (first_char == 'd' || first_char == 'D')
         {

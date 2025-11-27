@@ -4,6 +4,7 @@
 #include <SD_MMC.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <esp_heap_caps.h>  // For PSRAM allocation
 #include "mp3_seek_table.h"
 
 constexpr size_t BUFFER_SIZE = 128 * 1024;       // 128KB per buffer
@@ -24,6 +25,7 @@ TimeshiftManager::~TimeshiftManager() {
     if (mutex_) vSemaphoreDelete(mutex_);
     if (recording_buffer_) free(recording_buffer_);
     if (playback_buffer_) free(playback_buffer_);
+    free_psram_pool();
 }
 
 bool TimeshiftManager::open(const char* uri) {
@@ -43,25 +45,38 @@ bool TimeshiftManager::open(const char* uri) {
     pause_download_ = false;
     cumulative_time_ms_ = 0;  // Reset temporal tracking
 
-    // Create timeshift directory if it doesn't exist
-    if (!SD_MMC.exists("/timeshift")) {
-        SD_MMC.mkdir("/timeshift");
-        LOG_INFO("Created /timeshift directory");
-    }
-
-    // Clean up old timeshift files from previous sessions
-    File tsDir = SD_MMC.open("/timeshift");
-    if (tsDir && tsDir.isDirectory()) {
-        File file = tsDir.openNextFile();
-        while (file) {
-            String fname = String("/timeshift/") + file.name();
-            file.close();
-            SD_MMC.remove(fname.c_str());
-            LOG_DEBUG("Cleaned up: %s", fname.c_str());
-            file = tsDir.openNextFile();
+    // Initialize storage backend based on current mode
+    if (storage_mode_ == StorageMode::SD_CARD) {
+        // Create timeshift directory if it doesn't exist
+        if (!SD_MMC.exists("/timeshift")) {
+            SD_MMC.mkdir("/timeshift");
+            LOG_INFO("Created /timeshift directory");
         }
-        tsDir.close();
-        LOG_INFO("Timeshift directory cleaned");
+
+        // Clean up old timeshift files from previous sessions
+        File tsDir = SD_MMC.open("/timeshift");
+        if (tsDir && tsDir.isDirectory()) {
+            File file = tsDir.openNextFile();
+            while (file) {
+                String fname = String("/timeshift/") + file.name();
+                file.close();
+                SD_MMC.remove(fname.c_str());
+                LOG_DEBUG("Cleaned up: %s", fname.c_str());
+                file = tsDir.openNextFile();
+            }
+            tsDir.close();
+            LOG_INFO("Timeshift directory cleaned");
+        }
+        LOG_INFO("Timeshift mode: SD_CARD");
+    } else {
+        // PSRAM mode: allocate chunk pool
+        if (!init_psram_pool()) {
+            LOG_ERROR("Failed to initialize PSRAM pool");
+            close();
+            return false;
+        }
+        LOG_INFO("Timeshift mode: PSRAM_ONLY (%u chunks, %u KB total)",
+                 MAX_PSRAM_CHUNKS, psram_pool_size_ / 1024);
     }
 
     recording_buffer_ = (uint8_t*)malloc(BUFFER_SIZE);
@@ -88,13 +103,18 @@ bool TimeshiftManager::open(const char* uri) {
 void TimeshiftManager::close() {
     stop();
 
-    // Clean up all chunks (both pending and ready)
-    for (const auto& chunk : pending_chunks_) {
-        SD_MMC.remove(chunk.filename.c_str());
+    // Clean up all chunks based on storage mode
+    if (storage_mode_ == StorageMode::SD_CARD) {
+        for (const auto& chunk : pending_chunks_) {
+            SD_MMC.remove(chunk.filename.c_str());
+        }
+        for (const auto& chunk : ready_chunks_) {
+            SD_MMC.remove(chunk.filename.c_str());
+        }
+    } else {
+        // PSRAM mode: pool will be freed, no per-chunk cleanup needed
     }
-    for (const auto& chunk : ready_chunks_) {
-        SD_MMC.remove(chunk.filename.c_str());
-    }
+
     pending_chunks_.clear();
     ready_chunks_.clear();
 
@@ -107,6 +127,9 @@ void TimeshiftManager::close() {
         free(playback_buffer_);
         playback_buffer_ = nullptr;
     }
+
+    // Free PSRAM pool if allocated
+    free_psram_pool();
 
     is_open_ = false;
     seek_table_.clear();
@@ -424,13 +447,22 @@ bool TimeshiftManager::flush_recording_chunk() {
     chunk.start_offset = current_recording_offset_;
     chunk.length = bytes_in_current_chunk_;
     chunk.end_offset = current_recording_offset_ + bytes_in_current_chunk_;
-    chunk.filename = "/timeshift/pending_" + std::to_string(chunk.id) + ".bin";
     chunk.state = ChunkState::PENDING;
     chunk.crc32 = 0; // TODO: calculate CRC if needed
+    chunk.psram_ptr = nullptr;
 
-    // *** MODIFICA CHIAVE: La scrittura su SD avviene SENZA tenere il mutex ***
-    if (!write_chunk_to_sd(chunk)) {
-        LOG_ERROR("Failed to write chunk %u to SD", chunk.id);
+    // Write to storage based on mode (without holding mutex)
+    bool write_success = false;
+    if (storage_mode_ == StorageMode::SD_CARD) {
+        chunk.filename = "/timeshift/pending_" + std::to_string(chunk.id) + ".bin";
+        write_success = write_chunk_to_sd(chunk);
+    } else {
+        chunk.filename = "";  // Not used in PSRAM mode
+        write_success = write_chunk_to_psram(chunk);
+    }
+
+    if (!write_success) {
+        LOG_ERROR("Failed to write chunk %u to storage", chunk.id);
         return false;
     }
 
@@ -507,20 +539,60 @@ bool TimeshiftManager::write_chunk_to_sd(ChunkInfo& chunk) {
     return true;
 }
 
-bool TimeshiftManager::validate_chunk(ChunkInfo& chunk) {
-    // Basic validation: check file exists and size matches
-    File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
-    if (!file) {
-        LOG_ERROR("Validation failed: cannot open %s", chunk.filename.c_str());
+bool TimeshiftManager::write_chunk_to_psram(ChunkInfo& chunk) {
+    // Allocate PSRAM chunk from pool (circular)
+    chunk.psram_ptr = allocate_psram_chunk();
+    if (!chunk.psram_ptr) {
+        LOG_ERROR("Failed to allocate PSRAM chunk");
         return false;
     }
 
-    size_t file_size = file.size();
-    file.close();
+    // Copy data from circular recording buffer to PSRAM chunk
+    size_t start_pos = 0;
+    if (rec_write_head_ >= chunk.length) {
+        // Data is contiguous: [start_pos ... rec_write_head_)
+        start_pos = rec_write_head_ - chunk.length;
+        memcpy(chunk.psram_ptr, recording_buffer_ + start_pos, chunk.length);
+    } else {
+        // Data wraps around: [BUFFER_SIZE - remainder ... BUFFER_SIZE) + [0 ... rec_write_head_)
+        size_t remainder = chunk.length - rec_write_head_;
+        start_pos = BUFFER_SIZE - remainder;
 
-    if (file_size != chunk.length) {
-        LOG_ERROR("Validation failed: size mismatch (%u vs %u)", file_size, chunk.length);
-        return false;
+        // Copy first part (from start_pos to end of buffer)
+        memcpy(chunk.psram_ptr, recording_buffer_ + start_pos, remainder);
+
+        // Copy second part (from 0 to rec_write_head_)
+        memcpy(chunk.psram_ptr + remainder, recording_buffer_, rec_write_head_);
+    }
+
+    LOG_DEBUG("Wrote chunk %u: %u KB to PSRAM (pool index %u)",
+              chunk.id, chunk.length / 1024, (unsigned)(chunk.id % MAX_PSRAM_CHUNKS));
+    return true;
+}
+
+bool TimeshiftManager::validate_chunk(ChunkInfo& chunk) {
+    if (storage_mode_ == StorageMode::SD_CARD) {
+        // SD mode: check file exists and size matches
+        File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
+        if (!file) {
+            LOG_ERROR("Validation failed: cannot open %s", chunk.filename.c_str());
+            return false;
+        }
+
+        size_t file_size = file.size();
+        file.close();
+
+        if (file_size != chunk.length) {
+            LOG_ERROR("Validation failed: size mismatch (%u vs %u)", file_size, chunk.length);
+            return false;
+        }
+    } else {
+        // PSRAM mode: check pointer is valid
+        if (!chunk.psram_ptr) {
+            LOG_ERROR("Validation failed: null PSRAM pointer for chunk %u", chunk.id);
+            return false;
+        }
+        // Size is always correct in PSRAM mode (direct copy)
     }
 
     // TODO: Add CRC32 validation if needed
@@ -531,19 +603,51 @@ bool TimeshiftManager::calculate_chunk_duration(const ChunkInfo& chunk,
                                                  uint32_t& out_frames,
                                                  uint32_t& out_duration_ms)
 {
-    File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
-    if (!file) {
-        LOG_ERROR("Cannot open chunk for duration calculation: %s", chunk.filename.c_str());
-        return false;
-    }
-
     uint8_t header[4];
     uint32_t total_samples = 0;
     uint32_t sample_rate = 44100;  // Default, will be updated from first frame
+    size_t data_pos = 0;  // Current position in chunk data
+
+    // Helper lambda to read data from either SD or PSRAM
+    auto read_bytes = [&](uint8_t* buffer, size_t len) -> size_t {
+        if (storage_mode_ == StorageMode::PSRAM_ONLY) {
+            if (data_pos + len > chunk.length) {
+                len = chunk.length - data_pos;
+            }
+            if (len == 0) return 0;
+            memcpy(buffer, chunk.psram_ptr + data_pos, len);
+            data_pos += len;
+            return len;
+        }
+        return 0; // Will be handled by file read in SD mode
+    };
+
+    File file;
+    if (storage_mode_ == StorageMode::SD_CARD) {
+        file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
+        if (!file) {
+            LOG_ERROR("Cannot open chunk for duration calculation: %s", chunk.filename.c_str());
+            return false;
+        }
+    } else {
+        // PSRAM mode: use psram_ptr
+        if (!chunk.psram_ptr) {
+            LOG_ERROR("Cannot calculate duration: null PSRAM pointer");
+            return false;
+        }
+    }
 
     // Scan all MP3 frames in the chunk
-    while (file.available()) {
-        if (file.read(header, 4) != 4) break;
+    while (true) {
+        size_t bytes_read;
+        if (storage_mode_ == StorageMode::SD_CARD) {
+            if (!file.available()) break;
+            bytes_read = file.read(header, 4);
+        } else {
+            bytes_read = read_bytes(header, 4);
+        }
+
+        if (bytes_read != 4) break;
 
         // Check sync word (0xFFE or 0xFFF at start)
         if ((header[0] != 0xFF) || ((header[1] & 0xE0) != 0xE0)) {
@@ -604,15 +708,26 @@ bool TimeshiftManager::calculate_chunk_duration(const ChunkInfo& chunk,
         total_samples += samples_per_frame;
 
         // Skip to next frame
-        size_t current_pos = file.position();
-        if (current_pos + frame_size - 4 <= file.size()) {
-            file.seek(current_pos + frame_size - 4);
+        if (storage_mode_ == StorageMode::SD_CARD) {
+            size_t current_pos = file.position();
+            if (current_pos + frame_size - 4 <= file.size()) {
+                file.seek(current_pos + frame_size - 4);
+            } else {
+                break;  // Would go beyond file end
+            }
         } else {
-            break;  // Would go beyond file end
+            // PSRAM mode: advance data_pos
+            size_t skip_bytes = frame_size - 4;
+            if (data_pos + skip_bytes > chunk.length) {
+                break;  // Would go beyond chunk end
+            }
+            data_pos += skip_bytes;
         }
     }
 
-    file.close();
+    if (storage_mode_ == StorageMode::SD_CARD && file) {
+        file.close();
+    }
 
     if (total_samples == 0) {
         LOG_WARN("Chunk %u: no valid MP3 frames found", chunk.id);
@@ -630,46 +745,50 @@ bool TimeshiftManager::calculate_chunk_duration(const ChunkInfo& chunk,
 }
 
 void TimeshiftManager::promote_chunk_to_ready(ChunkInfo chunk) {
-    // Rename file from pending to ready
-    std::string ready_filename = "/timeshift/ready_" + std::to_string(chunk.id) + ".bin";
+    if (storage_mode_ == StorageMode::SD_CARD) {
+        // Rename file from pending to ready
+        std::string ready_filename = "/timeshift/ready_" + std::to_string(chunk.id) + ".bin";
 
-    // Remove destination file if it exists (from previous session)
-    if (SD_MMC.exists(ready_filename.c_str())) {
-        SD_MMC.remove(ready_filename.c_str());
-        LOG_DEBUG("Removed existing ready file: %s", ready_filename.c_str());
-    }
-
-    if (SD_MMC.rename(chunk.filename.c_str(), ready_filename.c_str())) {
-        chunk.filename = ready_filename;
-        chunk.state = ChunkState::READY;
-
-        // Calculate chunk duration
-        uint32_t total_frames = 0;
-        uint32_t duration_ms = 0;
-
-        if (calculate_chunk_duration(chunk, total_frames, duration_ms)) {
-            chunk.total_frames = total_frames;
-            chunk.duration_ms = duration_ms;
-            chunk.start_time_ms = cumulative_time_ms_;
-
-            cumulative_time_ms_ += duration_ms;  // Update cumulative time
-
-            LOG_INFO("Chunk %u promoted to READY (%u KB, offset %u-%u, %u ms, %u frames)",
-                     chunk.id, chunk.length / 1024,
-                     (unsigned)chunk.start_offset, (unsigned)chunk.end_offset,
-                     duration_ms, total_frames);
-        } else {
-            LOG_WARN("Chunk %u promoted to READY without duration info (%u KB, offset %u-%u)",
-                     chunk.id, chunk.length / 1024,
-                     (unsigned)chunk.start_offset, (unsigned)chunk.end_offset);
+        // Remove destination file if it exists (from previous session)
+        if (SD_MMC.exists(ready_filename.c_str())) {
+            SD_MMC.remove(ready_filename.c_str());
+            LOG_DEBUG("Removed existing ready file: %s", ready_filename.c_str());
         }
 
-        // Add to ready_chunks_ (already ordered by ID)
-        ready_chunks_.push_back(chunk);
-    } else {
-        LOG_ERROR("Failed to rename chunk %u from pending to ready", chunk.id);
-        SD_MMC.remove(chunk.filename.c_str());
+        if (!SD_MMC.rename(chunk.filename.c_str(), ready_filename.c_str())) {
+            LOG_ERROR("Failed to rename chunk %u from pending to ready", chunk.id);
+            SD_MMC.remove(chunk.filename.c_str());
+            return;
+        }
+        chunk.filename = ready_filename;
     }
+
+    // Mark as READY (for both SD and PSRAM modes)
+    chunk.state = ChunkState::READY;
+
+    // Calculate chunk duration
+    uint32_t total_frames = 0;
+    uint32_t duration_ms = 0;
+
+    if (calculate_chunk_duration(chunk, total_frames, duration_ms)) {
+        chunk.total_frames = total_frames;
+        chunk.duration_ms = duration_ms;
+        chunk.start_time_ms = cumulative_time_ms_;
+
+        cumulative_time_ms_ += duration_ms;  // Update cumulative time
+
+        LOG_INFO("Chunk %u promoted to READY (%u KB, offset %u-%u, %u ms, %u frames)",
+                 chunk.id, chunk.length / 1024,
+                 (unsigned)chunk.start_offset, (unsigned)chunk.end_offset,
+                 duration_ms, total_frames);
+    } else {
+        LOG_WARN("Chunk %u promoted to READY without duration info (%u KB, offset %u-%u)",
+                 chunk.id, chunk.length / 1024,
+                 (unsigned)chunk.start_offset, (unsigned)chunk.end_offset);
+    }
+
+    // Add to ready_chunks_ (already ordered by ID)
+    ready_chunks_.push_back(chunk);
 }
 
 void TimeshiftManager::cleanup_old_chunks() {
@@ -704,21 +823,30 @@ void TimeshiftManager::cleanup_old_chunks() {
                   (unsigned)age_bytes);
 
         if (age_bytes > MAX_TS_WINDOW) {
-            LOG_INFO("🗑️ CLEANUP: Removing old chunk %u (age: %u MB > limit: %u MB)",
+            LOG_INFO("CLEANUP: Removing old chunk %u (age: %u MB > limit: %u MB)",
                      oldest.id,
                      (unsigned)age_mb,
                      (unsigned)(MAX_TS_WINDOW / (1024 * 1024)));
-            LOG_INFO("   File: %s, Size: %u KB",
-                     oldest.filename.c_str(),
-                     (unsigned)(oldest.length / 1024));
 
-            bool removed = SD_MMC.remove(oldest.filename.c_str());
-            if (removed) {
-                LOG_DEBUG("   ✅ File deleted successfully");
+            if (storage_mode_ == StorageMode::SD_CARD) {
+                LOG_INFO("   File: %s, Size: %u KB",
+                         oldest.filename.c_str(),
+                         (unsigned)(oldest.length / 1024));
+
+                bool removed = SD_MMC.remove(oldest.filename.c_str());
+                if (removed) {
+                    LOG_DEBUG("   File deleted successfully");
+                    removed_count++;
+                    total_removed_bytes += oldest.length;
+                } else {
+                    LOG_ERROR("   Failed to delete file: %s", oldest.filename.c_str());
+                }
+            } else {
+                // PSRAM mode: chunk slot will be reused automatically
+                LOG_DEBUG("   PSRAM chunk slot %u freed (will be reused)",
+                          (unsigned)(oldest.id % MAX_PSRAM_CHUNKS));
                 removed_count++;
                 total_removed_bytes += oldest.length;
-            } else {
-                LOG_ERROR("   ❌ Failed to delete file: %s", oldest.filename.c_str());
             }
 
             ready_chunks_.erase(ready_chunks_.begin());
@@ -732,7 +860,7 @@ void TimeshiftManager::cleanup_old_chunks() {
     }
 
     if (removed_count > 0) {
-        LOG_INFO("✅ CLEANUP SUMMARY: Removed %u chunks, freed %u MB",
+        LOG_INFO("CLEANUP SUMMARY: Removed %u chunks, freed %u MB",
                  (unsigned)removed_count,
                  (unsigned)(total_removed_bytes / (1024 * 1024)));
     } else {
@@ -745,7 +873,7 @@ void TimeshiftManager::cleanup_old_chunks() {
 
 bool TimeshiftManager::preload_next_chunk(size_t current_chunk_id) {
     size_t next_chunk_id = current_chunk_id + 1;
-    
+
     // Il preloader task non attende, controlla solo se il chunk è disponibile
     if (next_chunk_id >= ready_chunks_.size()) {
         return false; // Non è ancora pronto, riproverà al prossimo ciclo
@@ -759,19 +887,28 @@ bool TimeshiftManager::preload_next_chunk(size_t current_chunk_id) {
 
     // Il buffer di playback è 256KB. Il chunk corrente è a [0-128KB].
     // Pre-carichiamo il successivo a [128KB-256KB].
-    File file = SD_MMC.open(next_chunk.filename.c_str(), FILE_READ);
-    if (!file) {
-        LOG_ERROR("Preload failed: cannot open %s", next_chunk.filename.c_str());
-        return false;
-    }
+    if (storage_mode_ == StorageMode::SD_CARD) {
+        File file = SD_MMC.open(next_chunk.filename.c_str(), FILE_READ);
+        if (!file) {
+            LOG_ERROR("Preload failed: cannot open %s", next_chunk.filename.c_str());
+            return false;
+        }
 
-    // Carica nella seconda metà del buffer
-    size_t read = file.read(playback_buffer_ + CHUNK_SIZE, next_chunk.length);
-    file.close();
+        // Carica nella seconda metà del buffer
+        size_t read = file.read(playback_buffer_ + CHUNK_SIZE, next_chunk.length);
+        file.close();
 
-    if (read != next_chunk.length) {
-        LOG_ERROR("Preload read mismatch: expected %u, got %u", next_chunk.length, read);
-        return false;
+        if (read != next_chunk.length) {
+            LOG_ERROR("Preload read mismatch: expected %u, got %u", next_chunk.length, read);
+            return false;
+        }
+    } else {
+        // PSRAM mode: direct copy from PSRAM pool
+        if (!next_chunk.psram_ptr) {
+            LOG_ERROR("Preload failed: null PSRAM pointer for chunk %u", next_chunk.id);
+            return false;
+        }
+        memcpy(playback_buffer_ + CHUNK_SIZE, next_chunk.psram_ptr, next_chunk.length);
     }
 
     LOG_DEBUG("Preloaded chunk %u (%u KB) at buffer offset %u",
@@ -831,20 +968,30 @@ bool TimeshiftManager::load_chunk_to_playback(size_t chunk_id) {
         return false;
     }
 
-    // Open chunk file
-    File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
-    if (!file) {
-        LOG_ERROR("Failed to open chunk for playback: %s", chunk.filename.c_str());
-        return false;
-    }
+    // Load chunk data based on storage mode
+    if (storage_mode_ == StorageMode::SD_CARD) {
+        // Open chunk file
+        File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
+        if (!file) {
+            LOG_ERROR("Failed to open chunk for playback: %s", chunk.filename.c_str());
+            return false;
+        }
 
-    // Read entire chunk into playback_buffer_
-    size_t read = file.read(playback_buffer_, chunk.length);
-    file.close();
+        // Read entire chunk into playback_buffer_
+        size_t read = file.read(playback_buffer_, chunk.length);
+        file.close();
 
-    if (read != chunk.length) {
-        LOG_ERROR("Chunk read mismatch: expected %u, got %u", chunk.length, read);
-        return false;
+        if (read != chunk.length) {
+            LOG_ERROR("Chunk read mismatch: expected %u, got %u", chunk.length, read);
+            return false;
+        }
+    } else {
+        // PSRAM mode: direct copy from PSRAM pool
+        if (!chunk.psram_ptr) {
+            LOG_ERROR("Failed to load chunk %u: null PSRAM pointer", chunk.id);
+            return false;
+        }
+        memcpy(playback_buffer_, chunk.psram_ptr, chunk.length);
     }
 
     // Update playback state
@@ -998,4 +1145,67 @@ void TimeshiftManager::pause_recording() {
 void TimeshiftManager::resume_recording() {
     pause_download_ = false;
     LOG_INFO("Recording resumed");
+}
+
+// ========== STORAGE BACKEND HELPERS ==========
+
+bool TimeshiftManager::init_psram_pool() {
+    if (psram_chunk_pool_) {
+        LOG_WARN("PSRAM pool already allocated");
+        return true;
+    }
+
+    // Allocate pool for MAX_PSRAM_CHUNKS chunks
+    psram_pool_size_ = MAX_PSRAM_CHUNKS * CHUNK_SIZE;
+
+    // Try to allocate in PSRAM first (heap_caps_malloc with MALLOC_CAP_SPIRAM)
+    psram_chunk_pool_ = (uint8_t*)heap_caps_malloc(psram_pool_size_, MALLOC_CAP_SPIRAM);
+
+    if (!psram_chunk_pool_) {
+        LOG_ERROR("Failed to allocate %u KB in PSRAM", psram_pool_size_ / 1024);
+        psram_pool_size_ = 0;
+        return false;
+    }
+
+    LOG_INFO("PSRAM pool allocated: %u KB (%u chunks x %u KB)",
+             psram_pool_size_ / 1024, MAX_PSRAM_CHUNKS, CHUNK_SIZE / 1024);
+
+    return true;
+}
+
+void TimeshiftManager::free_psram_pool() {
+    if (psram_chunk_pool_) {
+        heap_caps_free(psram_chunk_pool_);
+        psram_chunk_pool_ = nullptr;
+        psram_pool_size_ = 0;
+        LOG_DEBUG("PSRAM pool freed");
+    }
+}
+
+uint8_t* TimeshiftManager::allocate_psram_chunk() {
+    if (!psram_chunk_pool_) {
+        LOG_ERROR("PSRAM pool not initialized");
+        return nullptr;
+    }
+
+    // Calculate circular index based on next_chunk_id_
+    size_t pool_index = next_chunk_id_ % MAX_PSRAM_CHUNKS;
+    uint8_t* chunk_ptr = psram_chunk_pool_ + (pool_index * CHUNK_SIZE);
+
+    LOG_DEBUG("Allocated PSRAM chunk at pool index %u (chunk ID %u)",
+              (unsigned)pool_index, next_chunk_id_);
+
+    return chunk_ptr;
+}
+
+void TimeshiftManager::free_chunk_storage(ChunkInfo& chunk) {
+    if (storage_mode_ == StorageMode::SD_CARD) {
+        if (!chunk.filename.empty()) {
+            SD_MMC.remove(chunk.filename.c_str());
+            LOG_DEBUG("Removed SD file: %s", chunk.filename.c_str());
+        }
+    } else {
+        // PSRAM mode: nothing to free (pool is reused circularly)
+        LOG_DEBUG("PSRAM chunk %u freed (slot reusable)", chunk.id);
+    }
 }

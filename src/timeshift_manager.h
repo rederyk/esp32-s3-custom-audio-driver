@@ -12,7 +12,13 @@
 // Forward declarations
 class HTTPClient;
 
-// TimeshiftManager: IDataSource intelligente che gestisce buffer circolare e cache su SD
+// Storage backend selection
+enum class StorageMode {
+    SD_CARD,    // Save chunks to SD card (lower memory usage, slower)
+    PSRAM_ONLY  // Keep all chunks in PSRAM (faster, higher memory usage)
+};
+
+// TimeshiftManager: IDataSource intelligente che gestisce buffer circolare e cache su SD/PSRAM
 class TimeshiftManager : public IDataSource {
 public:
     TimeshiftManager();
@@ -37,6 +43,10 @@ public:
     void pause_recording();
     void resume_recording();
     bool is_recording_paused() const { return pause_download_; }
+
+    // Storage mode control (can be changed when stream is closed)
+    void setStorageMode(StorageMode mode) { storage_mode_ = mode; }
+    StorageMode getStorageMode() const { return storage_mode_; }
     
     // Status info
     size_t buffered_bytes() const;
@@ -53,9 +63,10 @@ private:
     static const size_t PLAYBACK_BUFFER_SIZE = 256 * 1024;  // Raddoppiato a 256KB per contenere chunk corrente + successivo
     static const size_t CHUNK_SIZE = 128 * 1024;        // Manteniamo i chunk da 128KB
     static const size_t INVALID_CHUNK_ID = SIZE_MAX;
+    static const size_t MAX_PSRAM_CHUNKS = 16;          // Max 16 chunks in PSRAM = 2MB
 
     enum class ChunkState {
-        PENDING,    // In scrittura su SD
+        PENDING,    // In scrittura su SD/PSRAM
         READY,      // Completo e disponibile per playback
         INVALID     // Errore di scrittura/validazione
     };
@@ -65,7 +76,8 @@ private:
         size_t start_offset;     // Offset globale di inizio
         size_t end_offset;       // Offset globale di fine
         size_t length;           // Lunghezza effettiva
-        std::string filename;
+        std::string filename;    // Used only in SD_CARD mode
+        uint8_t* psram_ptr;      // Used only in PSRAM_ONLY mode
         ChunkState state;
         uint32_t crc32;          // Per validazione (opzionale)
 
@@ -92,7 +104,8 @@ private:
     std::string uri_;
     bool is_open_ = false;
     bool is_running_ = false;
-    
+    StorageMode storage_mode_ = StorageMode::SD_CARD;  // Default to SD card mode
+
     // Download task
     TaskHandle_t download_task_handle_ = nullptr;
     static void download_task_trampoline(void* arg);
@@ -102,12 +115,16 @@ private:
     TaskHandle_t preloader_task_handle_ = nullptr;
     static void preloader_task_trampoline(void* arg);
     void preloader_task_loop();
-    
+
     // CHUNK MANAGEMENT
     std::vector<ChunkInfo> pending_chunks_;  // Chunks being written (PENDING state)
     std::vector<ChunkInfo> ready_chunks_;    // Chunks complete and ready for playback (READY state)
     size_t current_read_offset_ = 0;         // Current read position (logical offset)
-    
+
+    // PSRAM-only mode: circular chunk pool
+    uint8_t* psram_chunk_pool_ = nullptr;    // Pre-allocated pool for PSRAM mode
+    size_t psram_pool_size_ = 0;             // Total size of PSRAM pool
+
     // Synchronization
     SemaphoreHandle_t mutex_ = nullptr;
     bool pause_download_ = false;  // Flag to pause/resume recording
@@ -119,8 +136,9 @@ private:
     uint32_t cumulative_time_ms_ = 0;  // Tempo cumulativo di tutti i chunk processati
     
     // RECORDING SIDE (private helpers)
-    bool flush_recording_chunk();                    // Flush recording_buffer_ to SD as chunk
+    bool flush_recording_chunk();                    // Flush recording_buffer_ to storage
     bool write_chunk_to_sd(ChunkInfo& chunk);       // Write chunk data to SD file
+    bool write_chunk_to_psram(ChunkInfo& chunk);    // Write chunk data to PSRAM pool
     bool validate_chunk(ChunkInfo& chunk);          // Validate chunk integrity
     void promote_chunk_to_ready(ChunkInfo chunk);   // Move chunk from PENDING to READY
     bool calculate_chunk_duration(const ChunkInfo& chunk,
@@ -135,6 +153,12 @@ private:
 
     // CLEANUP
     void cleanup_old_chunks();                      // Remove old chunks beyond window
+
+    // STORAGE BACKEND HELPERS
+    bool init_psram_pool();                         // Initialize PSRAM chunk pool
+    void free_psram_pool();                         // Free PSRAM chunk pool
+    uint8_t* allocate_psram_chunk();                // Get next available PSRAM chunk slot
+    void free_chunk_storage(ChunkInfo& chunk);      // Free chunk storage (SD or PSRAM)
     
     // HTTP Handling (basic placeholder logic initially)
     // We might need a real HTTP client member here or in the task
