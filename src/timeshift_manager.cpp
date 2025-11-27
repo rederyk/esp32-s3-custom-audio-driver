@@ -900,6 +900,21 @@ void TimeshiftManager::cleanup_old_chunks() {
             last_preload_check_chunk_ -= chunks_removed_count;
         }
         LOG_DEBUG("Adjusted playback chunk ID by -%u due to cleanup", (unsigned)chunks_removed_count);
+
+        // FIX: Aggiusta anche current_read_offset_ se punta a chunk rimossi
+        // Se current_read_offset_ è fuori dal range dei chunk disponibili, spostalo all'inizio del primo chunk
+        if (!ready_chunks_.empty()) {
+            const ChunkInfo& first_chunk = ready_chunks_.front();
+            const ChunkInfo& last_chunk = ready_chunks_.back();
+
+            // Se l'offset corrente è prima del primo chunk disponibile o dopo l'ultimo
+            if (current_read_offset_ < first_chunk.start_offset || current_read_offset_ >= last_chunk.end_offset) {
+                size_t old_offset = current_read_offset_;
+                current_read_offset_ = first_chunk.start_offset;
+                LOG_INFO("CLEANUP: Adjusted read offset from %u to %u (first available chunk)",
+                         (unsigned)old_offset, (unsigned)current_read_offset_);
+            }
+        }
     }
 
     if (removed_count > 0) {
