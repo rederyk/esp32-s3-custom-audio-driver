@@ -1203,16 +1203,30 @@ size_t TimeshiftManager::seek_to_time(uint32_t target_ms) {
         }
     }
 
-    // If target is beyond available time, seek to last available position
+    // Target not in any chunk - check if before or after available time
+    const ChunkInfo& first_chunk = ready_chunks_.front();
     const ChunkInfo& last_chunk = ready_chunks_.back();
-    size_t last_offset = last_chunk.end_offset - 1;
 
+    // If target is BEFORE available time, seek to BEGINNING
+    if (target_ms < first_chunk.start_time_ms) {
+        size_t first_offset = first_chunk.start_offset;
+        xSemaphoreGive(mutex_);
+
+        LOG_WARN("Seek to %u ms before available time (starts at %u ms), seeking to beginning",
+                 target_ms, first_chunk.start_time_ms);
+
+        return first_offset;
+    }
+
+    // If target is AFTER available time, seek to BEGINNING of last chunk
+    // (not end, to avoid immediate "End of stream")
+    size_t safe_offset = last_chunk.start_offset;
     xSemaphoreGive(mutex_);
 
-    LOG_WARN("Seek to %u ms beyond available time (%u ms), seeking to end",
+    LOG_WARN("Seek to %u ms beyond available time (ends at %u ms), seeking to beginning of last chunk",
              target_ms, last_chunk.start_time_ms + last_chunk.duration_ms);
 
-    return last_offset;
+    return safe_offset;
 }
 
 uint32_t TimeshiftManager::total_duration_ms() const {
