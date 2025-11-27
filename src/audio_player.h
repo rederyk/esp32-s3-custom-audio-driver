@@ -38,6 +38,7 @@ struct PlayerCallbacks {
     void (*on_end)(const char *path) = nullptr;
     void (*on_error)(const char *path, const char *detail) = nullptr;
     void (*on_metadata)(const Metadata &meta, const char *path) = nullptr;
+    void (*on_progress)(uint32_t pos_ms, uint32_t dur_ms) = nullptr;  // Progress update callback
 };
 
 AudioConfig default_audio_config();
@@ -109,6 +110,8 @@ bool select_source(std::unique_ptr<IDataSource> source);
     inline uint32_t current_position_sec() const { return current_position_ms() / 1000; }
     inline uint32_t total_duration_sec() const { return total_duration_ms() / 1000; }
     const char* current_uri() const;
+    uint32_t current_bitrate() const;  // Current bitrate in kbps
+    AudioFormat current_format() const;  // Current audio format
 
 private:
     // Task
@@ -134,6 +137,7 @@ private:
     void notify_end(const char *path);
     void notify_error(const char *path, const char *detail);
     void notify_metadata(const Metadata &meta, const char *path);
+    void notify_progress(uint32_t pos_ms, uint32_t dur_ms);
 
     // Task body
     void audio_task();

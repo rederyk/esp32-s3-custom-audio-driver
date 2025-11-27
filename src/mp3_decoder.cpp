@@ -241,6 +241,35 @@ drmp3_uint64 Mp3Decoder::total_frames() const {
     return drmp3_get_pcm_frame_count(mp3_);
 }
 
+uint32_t Mp3Decoder::bitrate() const {
+    if (!mp3_ || !initialized_ || !source_) {
+        return 0;
+    }
+
+    // Calculate average bitrate: (file_size_bytes * 8) / duration_seconds / 1000
+    uint64_t total = total_frames();
+    uint32_t sr = sample_rate();
+
+    if (total == 0 || sr == 0) {
+        return 0;
+    }
+
+    size_t file_size = source_->size();
+    if (file_size == 0) {
+        return 0;
+    }
+
+    // Duration in seconds = total_frames / sample_rate
+    // Bitrate (kbps) = (file_size * 8) / duration / 1000
+    uint64_t duration_ms = (total * 1000) / sr;
+    if (duration_ms == 0) {
+        return 0;
+    }
+
+    uint64_t bitrate_bps = (file_size * 8 * 1000) / duration_ms;
+    return static_cast<uint32_t>(bitrate_bps / 1000);  // Convert to kbps
+}
+
 // ========== CALLBACKS dr_mp3 ==========
 
 size_t Mp3Decoder::on_read_cb(void *user, void *buffer, size_t bytesToRead) {

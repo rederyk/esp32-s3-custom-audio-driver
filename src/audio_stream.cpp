@@ -135,3 +135,7 @@ uint64_t AudioStream::total_frames() const {
 AudioFormat AudioStream::format() const {
     return decoder_ ? decoder_->format() : AudioFormat::UNKNOWN;
 }
+
+uint32_t AudioStream::bitrate() const {
+    return decoder_ ? decoder_->bitrate() : 0;
+}

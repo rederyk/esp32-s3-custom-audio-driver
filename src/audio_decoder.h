@@ -46,6 +46,9 @@ public:
     virtual bool initialized() const = 0;
     virtual AudioFormat format() const = 0;
 
+    // Bitrate in kbps (opzionale, ritorna 0 se non calcolabile)
+    virtual uint32_t bitrate() const { return 0; }
+
     // Seek table support (opzionale, ritorna false se non supportato)
     virtual bool has_seek_table() const { return false; }
 };

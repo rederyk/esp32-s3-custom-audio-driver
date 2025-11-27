@@ -45,6 +45,10 @@ public:
         return AudioFormat::MP3;
     }
 
+    uint32_t bitrate() const override {
+        return decoder_.bitrate();
+    }
+
     bool has_seek_table() const override {
         return decoder_.has_seek_table();
     }

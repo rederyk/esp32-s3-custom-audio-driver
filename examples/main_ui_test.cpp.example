@@ -1,0 +1,481 @@
+/**
+ * @file main_ui_test.cpp
+ * @brief Comprehensive UI Music Player Test - Tests all callbacks and UI methods
+ *
+ * This example demonstrates ALL features needed for a music player UI:
+ * - Progress bar with position/duration
+ * - Playback controls (play, pause, stop, seek)
+ * - Volume control
+ * - Metadata display (title, artist, album, etc.)
+ * - Bitrate and format display
+ * - Multi-format support (MP3, WAV, AAC, FLAC)
+ * - All callbacks (start, stop, end, error, metadata, progress)
+ */
+
+#include <Arduino.h>
+#include <LittleFS.h>
+#include "audio_player.h"
+#include "logger.h"
+
+// ========== UI STATE (Simulated) ==========
+struct UIState {
+    String current_title = "No track";
+    String current_artist = "";
+    String current_album = "";
+    uint32_t position_ms = 0;
+    uint32_t duration_ms = 0;
+    uint32_t bitrate = 0;
+    String format = "UNKNOWN";
+    PlayerState state = PlayerState::STOPPED;
+    int volume = 75;
+    bool is_playing = false;
+
+    void print_progress_bar() {
+        if (duration_ms == 0) return;
+
+        float progress = (float)position_ms / duration_ms;
+        int bar_width = 40;
+        int filled = (int)(progress * bar_width);
+
+        Serial.print("\r[");
+        for (int i = 0; i < bar_width; i++) {
+            if (i < filled) Serial.print("=");
+            else if (i == filled) Serial.print(">");
+            else Serial.print(" ");
+        }
+        Serial.print("] ");
+
+        // Time display: MM:SS / MM:SS
+        uint32_t pos_sec = position_ms / 1000;
+        uint32_t dur_sec = duration_ms / 1000;
+        Serial.printf("%02d:%02d / %02d:%02d ",
+                     pos_sec / 60, pos_sec % 60,
+                     dur_sec / 60, dur_sec % 60);
+
+        // Bitrate and format
+        Serial.printf("| %d kbps | %s ", bitrate, format.c_str());
+
+        // State indicator
+        if (state == PlayerState::PLAYING) Serial.print("[PLAY]");
+        else if (state == PlayerState::PAUSED) Serial.print("[PAUSE]");
+        else Serial.print("[STOP]");
+    }
+
+    void print_now_playing() {
+        Serial.println("\n==================================================");
+        Serial.printf("NOW PLAYING: %s\n", current_title.c_str());
+        if (current_artist.length() > 0) {
+            Serial.printf("Artist: %s\n", current_artist.c_str());
+        }
+        if (current_album.length() > 0) {
+            Serial.printf("Album: %s\n", current_album.c_str());
+        }
+        Serial.println("==================================================");
+    }
+};
+
+UIState ui;
+AudioPlayer player;
+
+// ========== CALLBACKS ==========
+
+void on_start_callback(const char* path) {
+    Serial.printf("\n[CALLBACK] START: %s\n", path);
+    ui.is_playing = true;
+    ui.state = PlayerState::PLAYING;
+}
+
+void on_stop_callback(const char* path, PlayerState state) {
+    Serial.printf("\n[CALLBACK] STOP: %s (state: %d)\n", path, (int)state);
+    ui.is_playing = false;
+    ui.state = PlayerState::STOPPED;
+}
+
+void on_end_callback(const char* path) {
+    Serial.printf("\n[CALLBACK] END: %s\n", path);
+    ui.is_playing = false;
+    ui.state = PlayerState::ENDED;
+}
+
+void on_error_callback(const char* path, const char* detail) {
+    Serial.printf("\n[CALLBACK] ERROR: %s - %s\n", path, detail);
+    ui.state = PlayerState::ERROR;
+}
+
+void on_metadata_callback(const Metadata& meta, const char* path) {
+    Serial.printf("\n[CALLBACK] METADATA: %s\n", path);
+
+    ui.current_title = meta.title.length() ? meta.title : "Unknown";
+    ui.current_artist = meta.artist.length() ? meta.artist : "";
+    ui.current_album = meta.album.length() ? meta.album : "";
+
+    ui.print_now_playing();
+}
+
+void on_progress_callback(uint32_t pos_ms, uint32_t dur_ms) {
+    // Update UI state
+    ui.position_ms = pos_ms;
+    ui.duration_ms = dur_ms;
+    ui.bitrate = player.current_bitrate();
+    ui.format = audio_format_to_string(player.current_format());
+    ui.state = player.state();
+
+    // Print progress bar
+    ui.print_progress_bar();
+}
+
+// ========== TEST SEQUENCES ==========
+
+struct TestTrack {
+    const char* path;
+    const char* name;
+    AudioFormat expected_format;
+};
+
+TestTrack test_tracks[] = {
+    {"/sample-rich.mp3", "MP3 Test (320kbps)", AudioFormat::MP3},
+    {"/sample_440hz.wav", "WAV Test (1411 kbps PCM)", AudioFormat::WAV},
+    {"/sample_440hz.aac", "AAC Test (~128 kbps)", AudioFormat::AAC},
+    {"/sample_440hz.flac", "FLAC Test (Lossless)", AudioFormat::FLAC},
+};
+
+void test_playback_controls() {
+    Serial.println("\n\n========== TEST 1: PLAYBACK CONTROLS ==========");
+
+    const char* test_file = "/sample-rich.mp3";
+
+    // Load and arm
+    Serial.printf("Loading: %s\n", test_file);
+    if (!player.select_source(test_file)) {
+        Serial.println("Failed to select source!");
+        return;
+    }
+
+    if (!player.arm_source()) {
+        Serial.println("Failed to arm source!");
+        return;
+    }
+
+    // Start playback
+    Serial.println("\n1. Testing START...");
+    player.start();
+    delay(3000);  // Play for 3 seconds
+
+    // Pause
+    Serial.println("\n\n2. Testing PAUSE...");
+    player.toggle_pause();
+    delay(2000);  // Paused for 2 seconds
+
+    // Resume
+    Serial.println("\n\n3. Testing RESUME...");
+    player.toggle_pause();
+    delay(3000);  // Play for 3 seconds
+
+    // Programmatic pause
+    Serial.println("\n\n4. Testing set_pause(true)...");
+    player.set_pause(true);
+    delay(2000);
+
+    Serial.println("\n\n5. Testing set_pause(false)...");
+    player.set_pause(false);
+    delay(3000);
+
+    // Stop
+    Serial.println("\n\n6. Testing STOP...");
+    player.stop();
+    delay(1000);
+}
+
+void test_seek_functionality() {
+    Serial.println("\n\n========== TEST 2: SEEK FUNCTIONALITY ==========");
+
+    const char* test_file = "/sample-rich.mp3";
+
+    Serial.printf("Loading: %s\n", test_file);
+    player.select_source(test_file);
+    player.arm_source();
+    player.start();
+
+    delay(2000);
+
+    // Seek to 5 seconds
+    Serial.println("\n\nSeeking to 5 seconds...");
+    player.request_seek(5);
+    delay(3000);
+
+    // Seek to 10 seconds
+    Serial.println("\n\nSeeking to 10 seconds...");
+    player.request_seek(10);
+    delay(3000);
+
+    // Seek backward to 3 seconds
+    Serial.println("\n\nSeeking backward to 3 seconds...");
+    player.request_seek(3);
+    delay(3000);
+
+    player.stop();
+    delay(1000);
+}
+
+void test_volume_control() {
+    Serial.println("\n\n========== TEST 3: VOLUME CONTROL ==========");
+
+    const char* test_file = "/sample_440hz.wav";
+
+    Serial.printf("Loading: %s\n", test_file);
+    player.select_source(test_file);
+    player.arm_source();
+    player.start();
+
+    // Volume levels
+    int volumes[] = {100, 75, 50, 25, 10, 50, 75};
+
+    for (int vol : volumes) {
+        Serial.printf("\n\nSetting volume to %d%%...\n", vol);
+        player.set_volume(vol);
+        ui.volume = vol;
+        delay(2000);
+    }
+
+    player.stop();
+    delay(1000);
+}
+
+void test_multi_format() {
+    Serial.println("\n\n========== TEST 4: MULTI-FORMAT PLAYBACK ==========");
+
+    for (const auto& track : test_tracks) {
+        Serial.printf("\n\n--- Testing: %s ---\n", track.name);
+        Serial.printf("Expected format: %s\n", audio_format_to_string(track.expected_format));
+
+        if (!player.select_source(track.path)) {
+            Serial.printf("SKIP: %s not found\n", track.path);
+            continue;
+        }
+
+        if (!player.arm_source()) {
+            Serial.printf("SKIP: Failed to arm %s\n", track.path);
+            continue;
+        }
+
+        player.start();
+
+        // Wait to display format info
+        delay(1000);
+
+        // Verify format
+        AudioFormat actual = player.current_format();
+        Serial.printf("Actual format: %s ", audio_format_to_string(actual));
+        if (actual == track.expected_format) {
+            Serial.println("[OK]");
+        } else {
+            Serial.println("[MISMATCH!]");
+        }
+
+        // Display bitrate
+        Serial.printf("Bitrate: %d kbps\n", player.current_bitrate());
+
+        // Play for 5 seconds
+        delay(5000);
+
+        player.stop();
+        delay(1000);
+    }
+}
+
+void test_ui_info_methods() {
+    Serial.println("\n\n========== TEST 5: UI INFO METHODS ==========");
+
+    const char* test_file = "/sample-rich.mp3";
+
+    player.select_source(test_file);
+    player.arm_source();
+    player.start();
+
+    delay(2000);  // Let it play a bit
+
+    // Test all getter methods
+    Serial.println("\n--- Audio Player Info ---");
+    Serial.printf("URI: %s\n", player.current_uri());
+    Serial.printf("Source Type: %d\n", (int)player.source_type());
+    Serial.printf("State: %d\n", (int)player.state());
+    Serial.printf("Is Playing: %s\n", player.is_playing() ? "true" : "false");
+    Serial.printf("Sample Rate: %u Hz\n", player.current_sample_rate());
+    Serial.printf("Current Volume: %d%%\n", player.current_volume());
+    Serial.printf("Saved Volume: %d%%\n", player.saved_volume());
+    Serial.printf("Bitrate: %u kbps\n", player.current_bitrate());
+    Serial.printf("Format: %s\n", audio_format_to_string(player.current_format()));
+
+    Serial.println("\n--- Timing Info ---");
+    Serial.printf("Position (ms): %u\n", player.current_position_ms());
+    Serial.printf("Duration (ms): %u\n", player.total_duration_ms());
+    Serial.printf("Position (sec): %u\n", player.current_position_sec());
+    Serial.printf("Duration (sec): %u\n", player.total_duration_sec());
+    Serial.printf("Played Frames: %llu\n", player.played_frames());
+    Serial.printf("Total Frames: %llu\n", player.total_frames());
+
+    Serial.println("\n--- Metadata ---");
+    const Metadata& meta = player.metadata();
+    Serial.printf("Title: %s\n", meta.title.c_str());
+    Serial.printf("Artist: %s\n", meta.artist.c_str());
+    Serial.printf("Album: %s\n", meta.album.c_str());
+    Serial.printf("Genre: %s\n", meta.genre.c_str());
+    Serial.printf("Year: %s\n", meta.year.c_str());
+    Serial.printf("Track: %s\n", meta.track.c_str());
+    Serial.printf("Comment: %s\n", meta.comment.c_str());
+    Serial.printf("Cover Present: %s\n", meta.cover_present ? "yes" : "no");
+
+    delay(3000);
+
+    player.stop();
+    delay(1000);
+}
+
+void test_error_handling() {
+    Serial.println("\n\n========== TEST 6: ERROR HANDLING ==========");
+
+    // Test 1: Non-existent file
+    Serial.println("\n1. Testing non-existent file...");
+    if (!player.select_source("/nonexistent.mp3")) {
+        Serial.println("Expected error: File not found [OK]");
+    }
+
+    // Test 2: Invalid format
+    Serial.println("\n2. Testing unsupported format...");
+    // Create a dummy invalid file for testing
+    // (skipped in this example)
+
+    delay(1000);
+}
+
+void test_continuous_playback() {
+    Serial.println("\n\n========== TEST 7: CONTINUOUS PLAYBACK ==========");
+    Serial.println("Playing through entire track with live progress...");
+
+    const char* test_file = "/sample_440hz.wav";
+
+    player.select_source(test_file);
+    player.arm_source();
+    player.start();
+
+    // Let it play until end
+    while (player.is_playing() && player.state() != PlayerState::ENDED) {
+        delay(100);
+        player.tick_housekeeping();
+    }
+
+    Serial.println("\n\nTrack ended naturally.");
+    delay(1000);
+}
+
+// ========== INTERACTIVE MENU ==========
+
+void print_menu() {
+    Serial.println("\n\n========================================");
+    Serial.println("    AUDIO PLAYER UI TEST MENU");
+    Serial.println("========================================");
+    Serial.println("1. Test Playback Controls (play/pause/stop)");
+    Serial.println("2. Test Seek Functionality");
+    Serial.println("3. Test Volume Control");
+    Serial.println("4. Test Multi-Format Playback");
+    Serial.println("5. Test UI Info Methods");
+    Serial.println("6. Test Error Handling");
+    Serial.println("7. Test Continuous Playback");
+    Serial.println("8. Run ALL Tests");
+    Serial.println("9. Print Player Status");
+    Serial.println("0. Exit");
+    Serial.println("========================================");
+    Serial.print("Select option: ");
+}
+
+void run_all_tests() {
+    test_playback_controls();
+    test_seek_functionality();
+    test_volume_control();
+    test_multi_format();
+    test_ui_info_methods();
+    test_error_handling();
+    test_continuous_playback();
+
+    Serial.println("\n\n========================================");
+    Serial.println("   ALL TESTS COMPLETED!");
+    Serial.println("========================================");
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+
+    Serial.println("\n\n");
+    Serial.println("========================================");
+    Serial.println("  Audio Player UI Test - Comprehensive");
+    Serial.println("========================================");
+
+    // Initialize LittleFS
+    if (!LittleFS.begin(true)) {
+        Serial.println("ERROR: LittleFS mount failed!");
+        while (1) delay(1000);
+    }
+    Serial.println("LittleFS mounted successfully");
+
+    // Setup player callbacks
+    PlayerCallbacks callbacks;
+    callbacks.on_start = on_start_callback;
+    callbacks.on_stop = on_stop_callback;
+    callbacks.on_end = on_end_callback;
+    callbacks.on_error = on_error_callback;
+    callbacks.on_metadata = on_metadata_callback;
+    callbacks.on_progress = on_progress_callback;
+
+    player.set_callbacks(callbacks);
+
+    Serial.println("\nCallbacks configured:");
+    Serial.println("  - on_start");
+    Serial.println("  - on_stop");
+    Serial.println("  - on_end");
+    Serial.println("  - on_error");
+    Serial.println("  - on_metadata");
+    Serial.println("  - on_progress");
+
+    Serial.println("\nReady!");
+
+    // Auto-run all tests
+    Serial.println("\n>>> AUTO-RUNNING ALL TESTS IN 3 SECONDS <<<");
+    delay(3000);
+    run_all_tests();
+}
+
+void loop() {
+    print_menu();
+
+    // Wait for serial input
+    while (!Serial.available()) {
+        delay(100);
+        player.tick_housekeeping();
+    }
+
+    char choice = Serial.read();
+    while (Serial.available()) Serial.read();  // Clear buffer
+
+    Serial.println(choice);
+
+    switch (choice) {
+        case '1': test_playback_controls(); break;
+        case '2': test_seek_functionality(); break;
+        case '3': test_volume_control(); break;
+        case '4': test_multi_format(); break;
+        case '5': test_ui_info_methods(); break;
+        case '6': test_error_handling(); break;
+        case '7': test_continuous_playback(); break;
+        case '8': run_all_tests(); break;
+        case '9': player.print_status(); break;
+        case '0':
+            Serial.println("Exiting...");
+            player.stop();
+            while(1) delay(1000);
+            break;
+        default:
+            Serial.println("Invalid option!");
+            break;
+    }
+}

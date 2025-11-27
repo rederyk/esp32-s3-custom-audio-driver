@@ -195,3 +195,12 @@ bool WavDecoder::seek_to_frame(uint64_t frame_index) {
     LOG_ERROR("WavDecoder: Seek failed");
     return false;
 }
+
+uint32_t WavDecoder::bitrate() const {
+    if (!initialized_ || sample_rate_ == 0) {
+        return 0;
+    }
+
+    // PCM bitrate = sample_rate * channels * bits_per_sample / 1000 (kbps)
+    return (sample_rate_ * channels_ * bits_per_sample_) / 1000;
+}

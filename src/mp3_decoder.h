@@ -26,6 +26,7 @@ public:
     uint32_t sample_rate() const { return mp3_ ? mp3_->sampleRate : 0; }
     uint32_t channels() const { return mp3_ ? mp3_->channels : 0; }
     drmp3_uint64 total_frames() const;
+    uint32_t bitrate() const;  // Bitrate in kbps
     Buffers &buffers() { return buffers_; }
     bool initialized() const { return initialized_; }
     drmp3* mp3() { return mp3_; }

@@ -211,6 +211,30 @@ void AudioPlayer::notify_metadata(const Metadata &meta, const char *path) {
     }
 }
 
+void AudioPlayer::notify_progress(uint32_t pos_ms, uint32_t dur_ms) {
+    if (callbacks_.on_progress) {
+        callbacks_.on_progress(pos_ms, dur_ms);
+    }
+}
+
+uint32_t AudioPlayer::current_bitrate() const {
+    return stream_ ? stream_->bitrate() : 0;
+}
+
+SourceType AudioPlayer::source_type() const {
+    const IDataSource* ds = data_source();
+    return ds ? ds->type() : SourceType::LITTLEFS;
+}
+
+const char* AudioPlayer::current_uri() const {
+    const IDataSource* ds = data_source();
+    return ds ? ds->uri() : "";
+}
+
+AudioFormat AudioPlayer::current_format() const {
+    return stream_ ? stream_->format() : AudioFormat::UNKNOWN;
+}
+
 bool AudioPlayer::select_source(const char* uri, SourceType hint) {
     // Auto-detect da URI se hint è LITTLEFS (default)
     SourceType type = hint;
@@ -507,6 +531,8 @@ void AudioPlayer::audio_task() {
     uint32_t sample_rate = 0;
     int16_t* pcm_buffer = nullptr;
     size_t pcm_buffer_size_frames = 2048;
+    uint32_t last_progress_update_ms = 0;
+    static constexpr uint32_t kProgressUpdateIntervalMs = 250;  // Update every 250ms
 
     // Check is done below with stream check
 
@@ -643,6 +669,15 @@ void AudioPlayer::audio_task() {
             }
 
             current_played_frames_ += frames_decoded;
+
+            // Progress callback (every 250ms)
+            uint32_t now = millis();
+            if (now - last_progress_update_ms >= kProgressUpdateIntervalMs) {
+                uint32_t pos_ms = current_position_ms();
+                uint32_t dur_ms = total_duration_ms();
+                notify_progress(pos_ms, dur_ms);
+                last_progress_update_ms = now;
+            }
 
             if (!pause_flag_) {
                 size_t frames_written = output_.write(pcm_buffer, frames_decoded, channels);

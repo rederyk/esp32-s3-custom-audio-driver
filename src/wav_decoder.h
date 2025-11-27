@@ -22,6 +22,7 @@ public:
     uint64_t total_frames() const override { return total_frames_; }
     bool initialized() const override { return initialized_; }
     AudioFormat format() const override { return AudioFormat::WAV; }
+    uint32_t bitrate() const override;
     bool has_seek_table() const override { return true; } // WAV supporta seek immediato
 
 private:

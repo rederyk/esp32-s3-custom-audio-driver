@@ -30,6 +30,7 @@ public:
     uint32_t channels() const;
     uint64_t total_frames() const;
     AudioFormat format() const;
+    uint32_t bitrate() const;
 
     // Access underlying data source
     const IDataSource* data_source() const { return source_.get(); }

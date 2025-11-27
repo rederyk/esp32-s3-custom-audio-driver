@@ -1,1 +1,11 @@
 .pio
+
+# AAC and FLAC decoders (not yet implemented)
+src/aac_decoder/
+src/aac_decoder_adapter.cpp
+src/aac_decoder_adapter.h
+src/flac_decoder/
+src/flac_decoder_adapter.cpp
+src/flac_decoder_adapter.h
+data/sample_440hz.aac
+data/sample_440hz.flac
