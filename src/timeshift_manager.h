@@ -33,7 +33,7 @@ public:
     bool open(const char* uri) override;
     void close() override;
     bool is_open() const override;
-    bool is_seekable() const override { return !is_running_; } // Only seekable when download is complete
+    bool is_seekable() const override { return !ready_chunks_.empty(); } // Seekable when chunks are available
     SourceType type() const override { return SourceType::HTTP_STREAM; } // Acts as HTTP conceptually
     const char* uri() const override;
     const Mp3SeekTable* get_seek_table() const override { return &seek_table_; }

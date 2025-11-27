@@ -330,11 +330,29 @@ void AudioPlayer::toggle_pause() {
         output_.set_volume(user_volume_percent_);
         pause_flag_ = false;
         player_state_ = PlayerState::PLAYING;
+
+        // Resume timeshift recording if using TimeshiftManager
+        if (stream_ && stream_->data_source() &&
+            stream_->data_source()->type() == SourceType::HTTP_STREAM) {
+            TimeshiftManager* ts = static_cast<TimeshiftManager*>(
+                const_cast<IDataSource*>(stream_->data_source()));
+            ts->resume_recording();
+        }
+
         LOG_INFO("Playback resumed");
     } else if (player_state_ == PlayerState::PLAYING) {
         pause_flag_ = true;
         output_.set_volume(0);
         player_state_ = PlayerState::PAUSED;
+
+        // Pause timeshift recording if using TimeshiftManager
+        if (stream_ && stream_->data_source() &&
+            stream_->data_source()->type() == SourceType::HTTP_STREAM) {
+            TimeshiftManager* ts = static_cast<TimeshiftManager*>(
+                const_cast<IDataSource*>(stream_->data_source()));
+            ts->pause_recording();
+        }
+
         LOG_INFO("Playback paused");
     }
 }
@@ -345,12 +363,30 @@ void AudioPlayer::set_pause(bool pause) {
         pause_flag_ = true;
         output_.set_volume(0);
         player_state_ = PlayerState::PAUSED;
+
+        // Pause timeshift recording if using TimeshiftManager
+        if (stream_ && stream_->data_source() &&
+            stream_->data_source()->type() == SourceType::HTTP_STREAM) {
+            TimeshiftManager* ts = static_cast<TimeshiftManager*>(
+                const_cast<IDataSource*>(stream_->data_source()));
+            ts->pause_recording();
+        }
+
         LOG_INFO("Playback paused");
     } else if (!pause && player_state_ == PlayerState::PAUSED) {
         // Resume playback
         output_.set_volume(user_volume_percent_);
         pause_flag_ = false;
         player_state_ = PlayerState::PLAYING;
+
+        // Resume timeshift recording if using TimeshiftManager
+        if (stream_ && stream_->data_source() &&
+            stream_->data_source()->type() == SourceType::HTTP_STREAM) {
+            TimeshiftManager* ts = static_cast<TimeshiftManager*>(
+                const_cast<IDataSource*>(stream_->data_source()));
+            ts->resume_recording();
+        }
+
         LOG_INFO("Playback resumed");
     }
 }
@@ -603,18 +639,22 @@ void AudioPlayer::audio_task() {
                     size_t byte_offset = ds_nc->seek_to_time(target_ms);
 
                     if (byte_offset != SIZE_MAX) {
-                        // La sorgente supporta il seek temporale.
-                        // Eseguiamo un seek a livello di byte e re-inizializziamo il decoder.
-                        // NOTA: stream_->seek() fa il seek a livello di frame, qui serve un seek a livello di sorgente.
-                        // Il modo corretto è fare il seek sulla sorgente e poi reinizializzare lo stream.
-                        // Per ora, usiamo il seek a frame che ricalcolerà la posizione.
-                        LOG_INFO("Temporal seek to %u ms requested (target frame ~%llu)", target_ms, target_frame);
-                        seek_success = stream_->seek(target_frame); // Usa il seek a frame come fallback
-                        if (seek_success) {
+                        // La sorgente supporta il seek temporale - usa il byte offset ritornato!
+                        LOG_INFO("Temporal seek to %u ms → byte offset %u", target_ms, (unsigned)byte_offset);
+
+                        // Seek diretto sulla datasource - NON chiamare stream_->seek(0)!
+                        // Il decoder ricomincerà automaticamente a leggere dal nuovo offset
+                        if (ds_nc->seek(byte_offset)) {
+                            // Il decoder è ora posizionato all'inizio del chunk seekato
                             current_played_frames_ = target_frame;
+                            seek_success = true;
+                            LOG_INFO("Temporal seek successful");
+                        } else {
+                            LOG_WARN("Byte offset seek failed, trying frame seek");
+                            seek_success = stream_->seek(target_frame);
                         }
                     } else {
-                        // Seek temporale non supportato, usa seek a frame
+                        // Seek temporale non supportato, usa seek a frame standard
                         seek_success = stream_->seek(target_frame);
                     }
                 } else {

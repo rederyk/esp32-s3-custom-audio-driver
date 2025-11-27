@@ -198,7 +198,9 @@ static void handle_command_string(String cmd)
             LOG_INFO("");
             LOG_INFO("CONTROLLO:");
             LOG_INFO("  v## - Volume (es. v75 = 75%)");
-            LOG_INFO("  s## - Seek indietro di ## secondi (es. s5 = -5 sec)");
+            LOG_INFO("  [ - Seek indietro di 5 secondi");
+            LOG_INFO("  ] - Seek avanti di 5 secondi");
+            LOG_INFO("  s## - Seek assoluto a ## secondi (es. s30 = vai al secondo 30)");
             LOG_INFO("  i - Stato player");
             LOG_INFO("");
             LOG_INFO("FILE SYSTEM:");
@@ -325,6 +327,38 @@ static void handle_command_string(String cmd)
             // Set SD card mode preference
             set_preferred_storage_mode(StorageMode::SD_CARD);
             break;
+        case '[':
+            // Seek indietro di 5 secondi
+            {
+                uint32_t current_sec = player.current_position_sec();
+                uint32_t total_sec = player.total_duration_sec();
+                int target_sec = (int)current_sec - 5;
+
+                if (target_sec < 0) {
+                    target_sec = 0;
+                }
+
+                LOG_INFO("Seek -5 sec (from %u to %d sec)", current_sec, target_sec);
+                player.request_seek(target_sec);
+            }
+            break;
+        case ']':
+            // Seek avanti di 5 secondi
+            {
+                uint32_t current_sec = player.current_position_sec();
+                uint32_t total_sec = player.total_duration_sec();
+                uint32_t target_sec = current_sec + 5;
+
+                // Per timeshift: non superare il tempo disponibile
+                if (total_sec > 0 && target_sec > total_sec) {
+                    target_sec = total_sec;
+                    LOG_WARN("Cannot seek beyond available time (%u sec)", total_sec);
+                }
+
+                LOG_INFO("Seek +5 sec (from %u to %u sec)", current_sec, target_sec);
+                player.request_seek(target_sec);
+            }
+            break;
         default:
             LOG_WARN("Unknown command: %s. Type 'h' for help.", cmd.c_str());
             break;
@@ -339,15 +373,21 @@ static void handle_command_string(String cmd)
         }
         else if (first_char == 's' || first_char == 'S')
         {
-            int seconds = cmd.substring(1).toInt();
-            // SEEK RELATIVO: "s 5" = vai indietro di 5 secondi
-            // Calcola la posizione corrente e sottrai i secondi
-            int current_sec = player.played_frames() / player.current_sample_rate();
-            int target_sec = current_sec - seconds;
-            if (target_sec < 0) {
-                target_sec = 0; // Non andare prima dell'inizio
+            int target_sec = cmd.substring(1).toInt();
+            uint32_t total_sec = player.total_duration_sec();
+
+            // Limita il seek al tempo disponibile
+            if (total_sec > 0 && target_sec > (int)total_sec) {
+                LOG_WARN("Cannot seek to %d sec, max available is %u sec", target_sec, total_sec);
+                target_sec = total_sec;
             }
-            LOG_INFO("Relative seek: -%d sec (from %d to %d sec)", seconds, current_sec, target_sec);
+
+            if (target_sec < 0) {
+                target_sec = 0;
+            }
+
+            uint32_t current_sec = player.current_position_sec();
+            LOG_INFO("Absolute seek to %d sec (current: %u sec)", target_sec, current_sec);
             player.request_seek(target_sec);
         }
         else if (first_char == 'd' || first_char == 'D')
