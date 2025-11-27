@@ -837,6 +837,10 @@ void TimeshiftManager::cleanup_old_chunks() {
     size_t removed_count = 0;
     size_t total_removed_bytes = 0;
 
+    // Causa #1: Tracciamo quanti chunk vengono rimossi per correggere l'indice di playback.
+    // Se non lo facessimo, l'indice punterebbe al chunk sbagliato dopo la pulizia.
+    size_t chunks_removed_count = 0;
+
     while (!ready_chunks_.empty()) {
         const ChunkInfo& oldest = ready_chunks_.front();
         size_t age_bytes = current_recording_offset_ - oldest.end_offset;
@@ -876,6 +880,7 @@ void TimeshiftManager::cleanup_old_chunks() {
             }
 
             ready_chunks_.erase(ready_chunks_.begin());
+            chunks_removed_count++; // Incrementa il contatore dei chunk rimossi
         } else {
             LOG_DEBUG("Oldest chunk %u is still within window (age: %u MB <= limit: %u MB), stopping cleanup",
                       oldest.id,
@@ -883,6 +888,18 @@ void TimeshiftManager::cleanup_old_chunks() {
                       (unsigned)(MAX_TS_WINDOW / (1024 * 1024)));
             break; // Chunks are ordered, so we can stop
         }
+    }
+
+    // Causa #1 (FIX): Se abbiamo rimosso dei chunk, dobbiamo aggiornare l'indice di playback
+    // per evitare che punti a un chunk errato.
+    if (chunks_removed_count > 0) {
+        if (current_playback_chunk_id_ != INVALID_CHUNK_ID && current_playback_chunk_id_ >= chunks_removed_count) {
+            current_playback_chunk_id_ -= chunks_removed_count;
+        }
+        if (last_preload_check_chunk_ != INVALID_CHUNK_ID && last_preload_check_chunk_ >= chunks_removed_count) {
+            last_preload_check_chunk_ -= chunks_removed_count;
+        }
+        LOG_DEBUG("Adjusted playback chunk ID by -%u due to cleanup", (unsigned)chunks_removed_count);
     }
 
     if (removed_count > 0) {
