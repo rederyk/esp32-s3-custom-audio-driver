@@ -45,10 +45,12 @@ bool CodecES8311::init(int sample_rate,
 int CodecES8311::map_user_volume_to_hw(int user_pct) {
     if (user_pct <= 0) return 0;
     if (user_pct >= 100) return 75;
-    int mapped = 65 + ((user_pct - 1) * 10 + 98) / 99;
+    int mapped = 55 + ((user_pct - 1) * 10 + 98) / 99;
     if (mapped > 75) mapped = 75;
     return mapped;
 }
+//map it better with a curve 1to10%=55to65 rest 65to75=10to100
+//in this way volume result udible lianearly
 
 void CodecES8311::set_volume(int vol_pct) {
     if (vol_pct < 0) vol_pct = 0;

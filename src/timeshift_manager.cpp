@@ -7,10 +7,10 @@
 #include "mp3_seek_table.h"
 
 constexpr size_t BUFFER_SIZE = 128 * 1024;       // 128KB per buffer
-constexpr size_t CHUNK_SIZE = 512 * 1024;        // 512KB SD chunks
+constexpr size_t CHUNK_SIZE = 128 * 1024;        // Chunk fissi da 128KB
 constexpr size_t MAX_TS_WINDOW = 1024 * 1024 * 512; // 512 MB max window
-constexpr size_t DOWNLOAD_CHUNK = 2048;          // Download buffer size
-constexpr size_t MIN_CHUNK_FLUSH_SIZE = 64 * 1024;  // Min 64KB before flushing
+constexpr size_t DOWNLOAD_CHUNK = 4096;          // Aumentiamo per efficienza
+constexpr size_t MIN_CHUNK_FLUSH_SIZE = 124 * 1024; // Flush vicino alla dimensione target
 
 TimeshiftManager::TimeshiftManager() {
     mutex_ = xSemaphoreCreateMutex();
@@ -124,6 +124,14 @@ bool TimeshiftManager::start() {
         return false;
     }
     LOG_INFO("TimeshiftManager download task created successfully");
+
+    // Crea il nuovo task di pre-caricamento
+    result = xTaskCreate(preloader_task_trampoline, "ts_preloader", 4096, this, 4, &preloader_task_handle_);
+    if (result != pdPASS) {
+        LOG_ERROR("Failed to create preloader task");
+        stop(); // Cleanup
+        return false;
+    }
     return true;
 }
 
@@ -134,34 +142,46 @@ void TimeshiftManager::stop() {
             vTaskDelete(download_task_handle_);
             download_task_handle_ = nullptr;
         }
+        if (preloader_task_handle_) {
+            vTaskDelete(preloader_task_handle_);
+            preloader_task_handle_ = nullptr;
+        }
     }
 }
 
 size_t TimeshiftManager::read(void* buffer, size_t size) {
     if (!is_open_) return 0;
 
-    // Wait until we have ready chunks available (up to 5 seconds)
-    const uint32_t MAX_WAIT_MS = 5000;
-    uint32_t start_wait = millis();
+    // --- ROBUSTO BUFFERING INIZIALE ---
+    // Causa #5 & #6: Forziamo l'attesa di un buffer sano all'avvio.
+    // Questo si applica solo alla primissima chiamata a read().
+    if (current_read_offset_ == 0) {
+        const size_t MIN_CHUNKS_FOR_START = 2;
+        const uint32_t MAX_WAIT_MS = 15000; // Aumentato a 15s per sicurezza
+        uint32_t start_wait = millis();
 
-    while (is_running_ && ready_chunks_.empty()) {
-        if (millis() - start_wait > MAX_WAIT_MS) {
-            LOG_WARN("Timeout waiting for ready chunks");
-            return 0;  // Timeout - no data available
+        while (is_running_ && ready_chunks_.size() < MIN_CHUNKS_FOR_START) {
+            if (millis() - start_wait > MAX_WAIT_MS) {
+                LOG_ERROR("Timeout waiting for initial buffer (%u chunks)", (unsigned)MIN_CHUNKS_FOR_START);
+                return 0;
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
         }
-        vTaskDelay(pdMS_TO_TICKS(100));  // Wait for chunks to be promoted to READY
     }
 
+    // Se, dopo l'attesa, non ci sono chunk, è un errore grave o la fine dello stream.
     if (ready_chunks_.empty()) {
-        LOG_WARN("No ready chunks available for playback");
-        return 0; // No data available
+        LOG_WARN("No ready chunks available for playback. End of stream?");
+        return 0;
     }
 
     xSemaphoreTake(mutex_, portMAX_DELAY);
 
     // Read from playback buffer (will load chunk if needed)
     size_t bytes_read = read_from_playback_buffer(current_read_offset_, buffer, size);
-    current_read_offset_ += bytes_read;
+    if (bytes_read > 0) {
+        current_read_offset_ += bytes_read;
+    }
 
     xSemaphoreGive(mutex_);
     return bytes_read;
@@ -171,6 +191,9 @@ bool TimeshiftManager::seek(size_t position) {
     if (!is_open_) return false;
 
     xSemaphoreTake(mutex_, portMAX_DELAY);
+
+    // Causa #8: Resettiamo lo stato di pre-caricamento dopo un seek.
+    last_preload_check_chunk_ = INVALID_CHUNK_ID;
 
     // Verify that the offset is in a READY chunk
     size_t chunk_id = find_chunk_for_offset(position);
@@ -243,6 +266,47 @@ void TimeshiftManager::download_task_trampoline(void* arg) {
     self->download_task_loop();
 }
 
+void TimeshiftManager::preloader_task_trampoline(void* arg) {
+    static_cast<TimeshiftManager*>(arg)->preloader_task_loop();
+}
+
+void TimeshiftManager::preloader_task_loop() {
+    LOG_INFO("File preloader task started");
+    size_t last_preloaded_chunk = INVALID_CHUNK_ID;
+
+    while (is_running_) {
+        vTaskDelay(pdMS_TO_TICKS(100)); // Controlla ogni 100ms
+
+        xSemaphoreTake(mutex_, portMAX_DELAY);
+
+        if (current_playback_chunk_id_ == INVALID_CHUNK_ID || ready_chunks_.empty()) {
+            xSemaphoreGive(mutex_);
+            continue;
+        }
+
+        // Se il chunk successivo non è già stato pre-caricato, caricalo
+        size_t next_chunk_to_preload = current_playback_chunk_id_ + 1;
+        if (next_chunk_to_preload != last_preloaded_chunk) {
+            // Calcola il progresso nel chunk corrente
+            const auto& current_chunk = ready_chunks_[current_playback_chunk_id_];
+            size_t offset_in_chunk = current_read_offset_ - current_chunk.start_offset;
+            float progress = (float)offset_in_chunk / (float)current_chunk.length;
+
+            // Trigger di pre-caricamento (es. al 50% del chunk corrente)
+            if (progress >= 0.50f) {
+                if (preload_next_chunk(current_playback_chunk_id_)) {
+                    LOG_DEBUG("Preloader task loaded chunk %u", (unsigned)next_chunk_to_preload);
+                    last_preloaded_chunk = next_chunk_to_preload;
+                }
+            }
+        }
+
+        xSemaphoreGive(mutex_);
+    }
+    LOG_INFO("File preloader task terminated");
+    vTaskDelete(nullptr);
+}
+
 void TimeshiftManager::download_task_loop() {
     LOG_INFO("TimeshiftManager download task started - connecting to %s", uri_.c_str());
 
@@ -268,6 +332,7 @@ void TimeshiftManager::download_task_loop() {
     size_t total_downloaded = 0;
     uint32_t last_log_time = millis();
 
+    uint32_t start_wait = millis();
     uint32_t last_data_time = millis();
     const uint32_t STREAM_TIMEOUT = 30000; // 30 seconds without data = timeout
 
@@ -286,24 +351,28 @@ void TimeshiftManager::download_task_loop() {
             if (len > 0) {
                 last_data_time = millis(); // Reset timeout on successful read
 
-                xSemaphoreTake(mutex_, portMAX_DELAY);
-
                 // Write to recording_buffer_ (circular)
                 for (int i = 0; i < len; i++) {
                     recording_buffer_[rec_write_head_] = buf[i];
                     rec_write_head_ = (rec_write_head_ + 1) % BUFFER_SIZE;
                     bytes_in_current_chunk_++;
-
-                    // Flush when buffer is almost full (must flush before wrap corrupts data)
-                    if (bytes_in_current_chunk_ >= BUFFER_SIZE - 4096) {
-                        LOG_INFO("Buffer near full (%u bytes), flushing to SD", (unsigned)bytes_in_current_chunk_);
-                        if (!flush_recording_chunk()) {
-                            LOG_ERROR("Failed to flush recording chunk");
-                        }
-                    }
                 }
                 total_downloaded += len;
 
+                // --- LOGICA DI FLUSH DECOUPLED ---
+                // Controlliamo se è necessario un flush, ma lo eseguiamo *fuori* dal mutex
+                // per non bloccare il thread di playback durante la scrittura su SD.
+                bool needs_flush = (bytes_in_current_chunk_ >= MIN_CHUNK_FLUSH_SIZE);
+
+                if (needs_flush) {
+                    LOG_INFO("Buffer near full (%u bytes), flushing to SD", (unsigned)bytes_in_current_chunk_);
+                    if (!flush_recording_chunk()) {
+                        LOG_ERROR("Failed to flush recording chunk");
+                        // Potremmo voler gestire l'errore in modo più robusto qui
+                    }
+                }
+
+                xSemaphoreTake(mutex_, portMAX_DELAY);
                 // Log progress every 5 seconds
                 if (millis() - last_log_time > 5000) {
                     LOG_INFO("Recording: %u KB total, %u bytes in current chunk, %u ready chunks",
@@ -312,7 +381,6 @@ void TimeshiftManager::download_task_loop() {
                              (unsigned)ready_chunks_.size());
                     last_log_time = millis();
                 }
-
                 xSemaphoreGive(mutex_);
             }
         } else {
@@ -348,11 +416,6 @@ void TimeshiftManager::download_task_loop() {
 // ========== RECORDING SIDE METHODS ==========
 
 bool TimeshiftManager::flush_recording_chunk() {
-    if (bytes_in_current_chunk_ < MIN_CHUNK_FLUSH_SIZE) {
-        // Not enough data to flush yet
-        return true;
-    }
-
     // Create ChunkInfo for PENDING chunk
     ChunkInfo chunk;
     chunk.id = next_chunk_id_++;
@@ -363,11 +426,20 @@ bool TimeshiftManager::flush_recording_chunk() {
     chunk.state = ChunkState::PENDING;
     chunk.crc32 = 0; // TODO: calculate CRC if needed
 
-    // Write chunk to SD
+    // *** MODIFICA CHIAVE: La scrittura su SD avviene SENZA tenere il mutex ***
     if (!write_chunk_to_sd(chunk)) {
         LOG_ERROR("Failed to write chunk %u to SD", chunk.id);
         return false;
     }
+
+    // *** MODIFICA CHIAVE: Acquisiamo il mutex SOLO ora, per promuovere il chunk ***
+    // Questa operazione è velocissima (rename + push_back) e non bloccherà il playback.
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+
+    // Aggiorna gli offset di registrazione *dentro* il lock per consistenza
+    current_recording_offset_ += bytes_in_current_chunk_;
+    bytes_in_current_chunk_ = 0;
+    // rec_write_head_ non viene resettato, il buffer è circolare
 
     // Validate and promote to READY
     if (validate_chunk(chunk)) {
@@ -378,13 +450,11 @@ bool TimeshiftManager::flush_recording_chunk() {
         return false;
     }
 
-    // Update recording state
-    current_recording_offset_ += bytes_in_current_chunk_;
-    bytes_in_current_chunk_ = 0;
-    // DON'T reset rec_write_head_ - buffer continues circularly
-
     // Cleanup old chunks
     cleanup_old_chunks();
+
+    // Rilasciamo il mutex
+    xSemaphoreGive(mutex_);
 
     return true;
 }
@@ -614,17 +684,80 @@ void TimeshiftManager::cleanup_old_chunks() {
     }
 }
 
+bool TimeshiftManager::preload_next_chunk(size_t current_chunk_id) {
+    size_t next_chunk_id = current_chunk_id + 1;
+    
+    // Il preloader task non attende, controlla solo se il chunk è disponibile
+    if (next_chunk_id >= ready_chunks_.size()) {
+        return false; // Non è ancora pronto, riproverà al prossimo ciclo
+    }
+
+    const ChunkInfo& next_chunk = ready_chunks_[next_chunk_id];
+    if (next_chunk.state != ChunkState::READY) { // Controllo di sicurezza
+        LOG_WARN("Preload failed: chunk %u is not in READY state", (unsigned)next_chunk_id);
+        return false;
+    }
+
+    // Il buffer di playback è 256KB. Il chunk corrente è a [0-128KB].
+    // Pre-carichiamo il successivo a [128KB-256KB].
+    File file = SD_MMC.open(next_chunk.filename.c_str(), FILE_READ);
+    if (!file) {
+        LOG_ERROR("Preload failed: cannot open %s", next_chunk.filename.c_str());
+        return false;
+    }
+
+    // Carica nella seconda metà del buffer
+    size_t read = file.read(playback_buffer_ + CHUNK_SIZE, next_chunk.length);
+    file.close();
+
+    if (read != next_chunk.length) {
+        LOG_ERROR("Preload read mismatch: expected %u, got %u", next_chunk.length, read);
+        return false;
+    }
+
+    LOG_DEBUG("Preloaded chunk %u (%u KB) at buffer offset %u",
+              next_chunk.id, next_chunk.length / 1024, (unsigned)CHUNK_SIZE);
+
+    return true;
+}
+
 // ========== PLAYBACK SIDE METHODS ==========
 
 size_t TimeshiftManager::find_chunk_for_offset(size_t offset) {
-    // Binary search in ready_chunks_ (ordered by start_offset)
-    for (size_t i = 0; i < ready_chunks_.size(); i++) {
-        const ChunkInfo& chunk = ready_chunks_[i];
-        if (offset >= chunk.start_offset && offset < chunk.end_offset) {
-            return i; // Found
+    // --- RICERCA ROBUSTA ---
+    // Cerca il chunk che CONTIENE l'offset o il chunk SUCCESSIVO se l'offset
+    // si trova in un piccolo "buco" tra due chunk.
+    if (ready_chunks_.empty()) {
+        return INVALID_CHUNK_ID;
+    }
+
+    // Binary search per trovare il primo chunk il cui end_offset è > offset
+    size_t low = 0, high = ready_chunks_.size();
+    size_t best_match = INVALID_CHUNK_ID;
+
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (ready_chunks_[mid].start_offset > offset) {
+            high = mid;
+        } else {
+            best_match = mid;
+            low = mid + 1;
         }
     }
-    return INVALID_CHUNK_ID; // Not found
+
+    if (best_match != INVALID_CHUNK_ID) {
+        const auto& chunk = ready_chunks_[best_match];
+        // Se l'offset è nel chunk o in un piccolo gap prima del successivo, è valido.
+        // Il "gap" massimo tollerato è di 4KB, più che sufficiente.
+        if (offset <= chunk.end_offset || (best_match + 1 < ready_chunks_.size() && offset < ready_chunks_[best_match + 1].start_offset + 4096)) {
+            return best_match;
+        }
+    }
+
+    // Se arriviamo qui, l'offset è veramente fuori range. Logghiamo per debug.
+    LOG_ERROR("STUTTER DETECTED: No chunk found for offset %u. Last chunk ends at %u.",
+              (unsigned)offset, (unsigned)ready_chunks_.back().end_offset);
+    return INVALID_CHUNK_ID;
 }
 
 bool TimeshiftManager::load_chunk_to_playback(size_t chunk_id) {
@@ -678,42 +811,38 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
     size_t chunk_id = find_chunk_for_offset(offset);
     if (chunk_id == INVALID_CHUNK_ID) {
         LOG_WARN("No chunk found for offset %u", (unsigned)offset);
-        return 0; // Offset not available in ready chunks
+        return 0;
     }
 
-    // If chunk not loaded, load it
-    if (current_playback_chunk_id_ != chunk_id) {
+    // Se il chunk richiesto è quello successivo, esegui lo switch "seamless"
+    if (chunk_id > current_playback_chunk_id_) {
+        // Causa #2: Usiamo la dimensione reale del chunk pre-caricato per memmove.
+        const ChunkInfo& preloaded_chunk_info = ready_chunks_[chunk_id];
+        size_t preloaded_size = preloaded_chunk_info.length;
+        // Sposta il chunk pre-caricato (che si trova nella seconda metà del buffer) all'inizio.
+        memmove(playback_buffer_, playback_buffer_ + CHUNK_SIZE, preloaded_size);
+        
+        current_playback_chunk_id_ = chunk_id;
+        playback_chunk_loaded_size_ = ready_chunks_[chunk_id].length;
+        last_preload_check_chunk_ = INVALID_CHUNK_ID; // Resetta il tracking per il nuovo chunk
+        LOG_DEBUG("Switching to preloaded chunk %u (seamless)", (unsigned)chunk_id);
+
+    } else if (current_playback_chunk_id_ != chunk_id) {
+        // Seek o situazione anomala: carica il chunk richiesto da SD (potrebbe causare stutter)
+        LOG_WARN("Chunk %u not preloaded, loading now (may cause stutter)", (unsigned)chunk_id);
         if (!load_chunk_to_playback(chunk_id)) {
-            LOG_ERROR("Failed to load chunk %u for playback", chunk_id);
+            LOG_ERROR("Failed to load chunk %u for playback", (unsigned)chunk_id);
             return 0;
         }
-        last_preload_check_chunk_ = INVALID_CHUNK_ID; // Reset preload tracking
     }
 
     // Calculate offset relative to chunk
     const ChunkInfo& chunk = ready_chunks_[chunk_id];
     size_t chunk_offset = offset - chunk.start_offset;
-    size_t available = chunk.length - chunk_offset;
+    size_t available = playback_chunk_loaded_size_ - chunk_offset;
     size_t to_read = std::min(size, available);
 
-    // PRE-LOAD OPTIMIZATION: Check if we should preload next chunk
-    // Do this AFTER memcpy to avoid blocking current read
-    if (chunk_id != last_preload_check_chunk_) {
-        float progress = (float)chunk_offset / (float)chunk.length;
-
-        // When we reach 75% of current chunk, preload next chunk into secondary buffer
-        if (progress >= 0.75f && chunk_id + 1 < ready_chunks_.size()) {
-            // Note: Currently we only have ONE playback buffer, so we can't truly preload
-            // without blocking. We'll just reduce the check frequency to avoid logging spam.
-            // A proper fix would need a double-buffer system.
-            last_preload_check_chunk_ = chunk_id;
-
-            LOG_DEBUG("Approaching end of chunk %u (%.0f%%), next chunk %u will load soon",
-                     chunk.id, progress * 100.0f, ready_chunks_[chunk_id + 1].id);
-        }
-    }
-
-    // Copy from playback_buffer_
+    // Copia i dati dal buffer di playback
     memcpy(buffer, playback_buffer_ + chunk_offset, to_read);
 
     return to_read;

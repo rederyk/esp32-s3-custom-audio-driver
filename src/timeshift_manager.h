@@ -50,8 +50,8 @@ public:
 
 private:
     static const size_t BUFFER_SIZE = 128 * 1024;       // 128KB recording buffer
-    static const size_t PLAYBACK_BUFFER_SIZE = 256 * 1024;  // 256KB playback buffer (2 chunks)
-    static const size_t CHUNK_SIZE = 512 * 1024;        // 512KB SD chunks
+    static const size_t PLAYBACK_BUFFER_SIZE = 256 * 1024;  // Raddoppiato a 256KB per contenere chunk corrente + successivo
+    static const size_t CHUNK_SIZE = 128 * 1024;        // Manteniamo i chunk da 128KB
     static const size_t INVALID_CHUNK_ID = SIZE_MAX;
 
     enum class ChunkState {
@@ -86,7 +86,7 @@ private:
     uint8_t* playback_buffer_ = nullptr;
     size_t current_playback_chunk_id_ = INVALID_CHUNK_ID;  // Currently loaded chunk
     size_t playback_chunk_loaded_size_ = 0;                // Size of loaded chunk
-    size_t last_preload_check_chunk_ = INVALID_CHUNK_ID;  // Last chunk we checked for preload
+    size_t last_preload_check_chunk_ = INVALID_CHUNK_ID;   // Per evitare controlli di preload ripetuti
     
     // Global stream state
     std::string uri_;
@@ -97,6 +97,11 @@ private:
     TaskHandle_t download_task_handle_ = nullptr;
     static void download_task_trampoline(void* arg);
     void download_task_loop();
+
+    // File Preloader Task (NEW)
+    TaskHandle_t preloader_task_handle_ = nullptr;
+    static void preloader_task_trampoline(void* arg);
+    void preloader_task_loop();
     
     // CHUNK MANAGEMENT
     std::vector<ChunkInfo> pending_chunks_;  // Chunks being written (PENDING state)
@@ -125,6 +130,7 @@ private:
     // PLAYBACK SIDE (private helpers)
     size_t find_chunk_for_offset(size_t offset);    // Find chunk ID containing offset
     bool load_chunk_to_playback(size_t chunk_id);   // Load chunk into playback_buffer_
+    bool preload_next_chunk(size_t current_chunk_id);
     size_t read_from_playback_buffer(size_t offset, void* buffer, size_t size);
 
     // CLEANUP
