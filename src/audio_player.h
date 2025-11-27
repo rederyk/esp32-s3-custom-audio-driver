@@ -53,6 +53,7 @@ bool select_source(std::unique_ptr<IDataSource> source);
     void start();
     void stop();
     void toggle_pause();
+    void set_pause(bool pause);  // Set pause state programmatically
     void request_seek(int seconds);
     void set_volume(int vol_pct);
     void print_status() const;

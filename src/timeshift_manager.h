@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <functional>
 
 // Forward declarations
 class HTTPClient;
@@ -57,6 +58,13 @@ public:
     size_t seek_to_time(uint32_t target_ms);     // Seek to timestamp, returns byte offset
     uint32_t total_duration_ms() const;          // Total available duration
     uint32_t current_position_ms() const;        // Current playback position in ms
+
+    // Auto-pause callback for buffering (NEW)
+    void set_auto_pause_callback(std::function<void(bool)> callback) { auto_pause_callback_ = callback; }
+    void set_auto_pause_margin(uint32_t delay_ms, size_t min_chunks) {
+        auto_pause_delay_ms_ = delay_ms;
+        auto_pause_min_chunks_ = min_chunks;
+    }
 
 private:
     static const size_t BUFFER_SIZE = 128 * 1024;       // 128KB recording buffer
@@ -128,6 +136,12 @@ private:
     // Synchronization
     SemaphoreHandle_t mutex_ = nullptr;
     bool pause_download_ = false;  // Flag to pause/resume recording
+
+    // Auto-pause callback for buffering
+    std::function<void(bool)> auto_pause_callback_ = nullptr;  // Called when buffering required
+    bool is_auto_paused_ = false;  // Track if we're in auto-pause state
+    uint32_t auto_pause_delay_ms_ = 1500;  // Delay before resuming (configurable)
+    size_t auto_pause_min_chunks_ = 2;      // Minimum chunks needed before resuming (configurable)
 
     // Seek Table (built incrementally)
     Mp3SeekTable seek_table_;

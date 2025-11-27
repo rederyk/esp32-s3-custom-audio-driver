@@ -17,6 +17,7 @@ constexpr size_t MIN_CHUNK_FLUSH_SIZE = 124 * 1024; // Flush vicino alla dimensi
 
 TimeshiftManager::TimeshiftManager() {
     mutex_ = xSemaphoreCreateMutex();
+    is_auto_paused_ = false;
 }
 
 TimeshiftManager::~TimeshiftManager() {
@@ -43,6 +44,7 @@ bool TimeshiftManager::open(const char* uri) {
     pending_chunks_.clear();
     ready_chunks_.clear();
     pause_download_ = false;
+    is_auto_paused_ = false;
     cumulative_time_ms_ = 0;  // Reset temporal tracking
 
     // Initialize storage backend based on current mode
@@ -297,7 +299,8 @@ void TimeshiftManager::preloader_task_trampoline(void* arg) {
 
 void TimeshiftManager::preloader_task_loop() {
     LOG_INFO("File preloader task started");
-    size_t last_preloaded_chunk = INVALID_CHUNK_ID;
+    size_t last_playback_chunk_seen = INVALID_CHUNK_ID;
+    bool next_chunk_preloaded = false;
 
     while (is_running_) {
         vTaskDelay(pdMS_TO_TICKS(100)); // Controlla ogni 100ms
@@ -309,19 +312,42 @@ void TimeshiftManager::preloader_task_loop() {
             continue;
         }
 
-        // Se il chunk successivo non è già stato pre-caricato, caricalo
-        size_t next_chunk_to_preload = current_playback_chunk_id_ + 1;
-        if (next_chunk_to_preload != last_preloaded_chunk) {
+        // Rileva se siamo passati a un nuovo chunk
+        if (current_playback_chunk_id_ != last_playback_chunk_seen) {
+            last_playback_chunk_seen = current_playback_chunk_id_;
+            next_chunk_preloaded = false; // Reset: il nuovo chunk successivo non è ancora stato precaricato
+            LOG_DEBUG("Preloader: switched to chunk %u, will preload %u when ready",
+                      (unsigned)current_playback_chunk_id_,
+                      (unsigned)(current_playback_chunk_id_ + 1));
+        }
+
+        // Se il chunk successivo non è ancora stato pre-caricato, controlla se è il momento giusto
+        if (!next_chunk_preloaded) {
+            size_t next_chunk_id = current_playback_chunk_id_ + 1;
+
+            // Verifica che il chunk successivo esista
+            if (next_chunk_id >= ready_chunks_.size()) {
+                xSemaphoreGive(mutex_);
+                continue; // Chunk non ancora disponibile
+            }
+
             // Calcola il progresso nel chunk corrente
             const auto& current_chunk = ready_chunks_[current_playback_chunk_id_];
             size_t offset_in_chunk = current_read_offset_ - current_chunk.start_offset;
+
+            // Protezione contro offset negativi (può capitare subito dopo uno switch)
+            if (current_read_offset_ < current_chunk.start_offset) {
+                xSemaphoreGive(mutex_);
+                continue;
+            }
+
             float progress = (float)offset_in_chunk / (float)current_chunk.length;
 
-            // Trigger di pre-caricamento (es. al 50% del chunk corrente)
+            // Trigger di pre-caricamento (al 50% del chunk corrente)
             if (progress >= 0.50f) {
                 if (preload_next_chunk(current_playback_chunk_id_)) {
-                    LOG_DEBUG("Preloader task loaded chunk %u", (unsigned)next_chunk_to_preload);
-                    last_preloaded_chunk = next_chunk_to_preload;
+                    LOG_DEBUG("Preloader task loaded chunk %u", (unsigned)next_chunk_id);
+                    next_chunk_preloaded = true;
                 }
             }
         }
@@ -1027,18 +1053,75 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
         size_t preloaded_size = preloaded_chunk_info.length;
         // Sposta il chunk pre-caricato (che si trova nella seconda metà del buffer) all'inizio.
         memmove(playback_buffer_, playback_buffer_ + CHUNK_SIZE, preloaded_size);
-        
+
         current_playback_chunk_id_ = chunk_id;
         playback_chunk_loaded_size_ = ready_chunks_[chunk_id].length;
         last_preload_check_chunk_ = INVALID_CHUNK_ID; // Resetta il tracking per il nuovo chunk
         LOG_DEBUG("Switching to preloaded chunk %u (seamless)", (unsigned)chunk_id);
 
+        // Triggera immediatamente il preload del prossimo chunk
+        // (il preloader task lo caricherà non appena arriveremo al 50% di questo chunk)
+        if (chunk_id + 1 < ready_chunks_.size()) {
+            // Potremmo anche triggerare un preload immediato qui se vogliamo essere più aggressivi
+            // Per ora lasciamo che il preloader task lo gestisca al 50% del chunk corrente
+        }
+
     } else if (current_playback_chunk_id_ != chunk_id) {
         // Seek o situazione anomala: carica il chunk richiesto da SD (potrebbe causare stutter)
         LOG_WARN("Chunk %u not preloaded, loading now (may cause stutter)", (unsigned)chunk_id);
+
+        // Attiva la pausa automatica per buffering se il callback è registrato
+        if (auto_pause_callback_ && !is_auto_paused_) {
+            LOG_INFO("Auto-pausing playback for buffering...");
+            is_auto_paused_ = true;
+            auto_pause_callback_(true);  // true = pause
+        }
+
         if (!load_chunk_to_playback(chunk_id)) {
             LOG_ERROR("Failed to load chunk %u for playback", (unsigned)chunk_id);
             return 0;
+        }
+
+        // Attendi il margine configurato per permettere al preloader di caricare i chunk successivi
+        if (auto_pause_callback_ && is_auto_paused_) {
+            // Se il margine è 0, riprendi immediatamente senza attese
+            if (auto_pause_delay_ms_ == 0 && auto_pause_min_chunks_ == 0) {
+                LOG_INFO("Chunk loaded, resuming immediately (no buffer margin configured)");
+                is_auto_paused_ = false;
+                xSemaphoreGive(mutex_);
+                auto_pause_callback_(false);  // false = resume
+                xSemaphoreTake(mutex_, portMAX_DELAY);
+            } else {
+                LOG_INFO("Chunk loaded, waiting for buffer margin before resuming...");
+
+                // Rilascia il mutex durante l'attesa per non bloccare il download task
+                if (auto_pause_delay_ms_ > 0) {
+                    xSemaphoreGive(mutex_);
+                    vTaskDelay(pdMS_TO_TICKS(auto_pause_delay_ms_));
+                    xSemaphoreTake(mutex_, portMAX_DELAY);
+                }
+
+                // Verifica che ci siano abbastanza chunk pronti prima di riprendere
+                if (auto_pause_min_chunks_ > 0) {
+                    const uint32_t MAX_WAIT_MS = 3000;  // Massimo 3 secondi di attesa aggiuntiva
+                    uint32_t start_wait = millis();
+                    size_t target_chunks = chunk_id + auto_pause_min_chunks_;
+
+                    while (ready_chunks_.size() < target_chunks && (millis() - start_wait) < MAX_WAIT_MS) {
+                        xSemaphoreGive(mutex_);
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        xSemaphoreTake(mutex_, portMAX_DELAY);
+                    }
+                }
+
+                LOG_INFO("Buffer ready (%u chunks available), resuming playback...", (unsigned)ready_chunks_.size());
+                is_auto_paused_ = false;
+
+                // Riprendi la riproduzione DOPO aver ri-acquisito il mutex
+                xSemaphoreGive(mutex_);
+                auto_pause_callback_(false);  // false = resume
+                xSemaphoreTake(mutex_, portMAX_DELAY);
+            }
         }
     }
 

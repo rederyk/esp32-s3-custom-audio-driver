@@ -20,6 +20,12 @@ static const char *kRadioStreamURL = "http://stream.radioparadise.com/mp3-128";
 static AudioPlayer player;
 static StorageMode preferred_storage_mode = StorageMode::SD_CARD;  // Default: SD card mode
 
+// Auto-pause buffering settings (configurabile per connessioni diverse)
+// Per connessioni veloci: impostare a 0 per disabilitare il margine
+// Per connessioni lente: aumentare per evitare pause ripetute
+static uint32_t auto_pause_delay_ms = 0;   // Delay prima di riprendere (0 = disabilitato)
+static size_t auto_pause_min_chunks = 2;      // Chunk minimi prima di riprendere (0 = disabilitato)
+
 void start_timeshift_radio() {
     // Stop any current playback first
     if (player.is_playing() || player.state() == PlayerState::PLAYING || player.state() == PlayerState::PAUSED) {
@@ -70,6 +76,20 @@ void start_timeshift_radio() {
     }
 
     LOG_INFO("First chunk ready! Starting playback...");
+
+    // Register auto-pause callback BEFORE transferring ownership
+    ts->set_auto_pause_callback([](bool should_pause) {
+        player.set_pause(should_pause);
+    });
+
+    // Configure auto-pause buffering margin
+    ts->set_auto_pause_margin(auto_pause_delay_ms, auto_pause_min_chunks);
+    if (auto_pause_delay_ms == 0 && auto_pause_min_chunks == 0) {
+        LOG_INFO("Auto-pause buffering: DISABLED (fast connection mode)");
+    } else {
+        LOG_INFO("Auto-pause buffering: %u ms delay, %u min chunks (slow connection mode)",
+                 auto_pause_delay_ms, (unsigned)auto_pause_min_chunks);
+    }
 
     // Transfer ownership to player
     player.select_source(std::unique_ptr<IDataSource>(ts));

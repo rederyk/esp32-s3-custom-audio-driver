@@ -315,6 +315,22 @@ void AudioPlayer::toggle_pause() {
     }
 }
 
+void AudioPlayer::set_pause(bool pause) {
+    if (pause && player_state_ == PlayerState::PLAYING) {
+        // Pause playback
+        pause_flag_ = true;
+        output_.set_volume(0);
+        player_state_ = PlayerState::PAUSED;
+        LOG_INFO("Playback paused");
+    } else if (!pause && player_state_ == PlayerState::PAUSED) {
+        // Resume playback
+        output_.set_volume(user_volume_percent_);
+        pause_flag_ = false;
+        player_state_ = PlayerState::PLAYING;
+        LOG_INFO("Playback resumed");
+    }
+}
+
 void AudioPlayer::request_seek(int seconds) {
     seek_seconds_ = seconds;
     LOG_INFO("Seek to %d seconds requested", seconds);
