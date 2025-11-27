@@ -18,6 +18,7 @@ static const char *kSampleFilePath = "/audioontag.mp3";
 static const char *kRadioStreamURL = "http://stream.radioparadise.com/mp3-128";
 
 static AudioPlayer player;
+static bool timeshift_use_psram_only = false;
 
 void start_timeshift_radio() {
     // Stop any current playback first
@@ -29,6 +30,7 @@ void start_timeshift_radio() {
 
     // Create and configure timeshift manager
     auto* ts = new TimeshiftManager();
+    ts->set_use_psram_only(timeshift_use_psram_only);
     if (!ts->open(kRadioStreamURL)) {
         LOG_ERROR("Failed to open timeshift stream URL");
         delete ts;
@@ -173,6 +175,7 @@ static void handle_command_string(String cmd)
             LOG_INFO("");
             LOG_INFO("DEBUG:");
             LOG_INFO("  m - Memory stats");
+            LOG_INFO("  y - Toggle timeshift storage mode (PSRAM-only <> SD)");
             LOG_INFO("  h - Mostra questo help");
             break;
         case 'l':
@@ -247,6 +250,11 @@ static void handle_command_string(String cmd)
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
                      (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
+            break;
+        case 'y':
+        case 'Y':
+            timeshift_use_psram_only = !timeshift_use_psram_only;
+            LOG_INFO("Timeshift storage mode now: %s", timeshift_use_psram_only ? "PSRAM-only" : "SD-backed");
             break;
         case 'x':
         case 'X':

@@ -1,14 +1,15 @@
 #include "timeshift_manager.h"
 #include "logger.h"
 #include "drivers/sd_card_driver.h"  // For SD card access
+#include <cstring>
 #include <SD_MMC.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <esp_heap_caps.h>
 #include "mp3_seek_table.h"
 
 constexpr size_t BUFFER_SIZE = 128 * 1024;       // 128KB per buffer
 constexpr size_t CHUNK_SIZE = 128 * 1024;        // Chunk fissi da 128KB
-constexpr size_t MAX_TS_WINDOW = 1024 * 1024 * 512; // 512 MB max window
 constexpr size_t DOWNLOAD_CHUNK = 4096;          // Aumentiamo per efficienza
 constexpr size_t MIN_CHUNK_FLUSH_SIZE = 124 * 1024; // Flush vicino alla dimensione target
 
@@ -22,6 +23,72 @@ TimeshiftManager::~TimeshiftManager() {
     if (mutex_) vSemaphoreDelete(mutex_);
     if (recording_buffer_) free(recording_buffer_);
     if (playback_buffer_) free(playback_buffer_);
+}
+
+void TimeshiftManager::set_use_psram_only(bool enable) {
+    if (enable == use_psram_only_) {
+        LOG_INFO("Timeshift storage mode already: %s", enable ? "PSRAM-only" : "SD-backed");
+        return;
+    }
+
+    if (enable) {
+        if (!allocate_psram_pool()) {
+            LOG_ERROR("Cannot enable PSRAM-only mode (allocation failure), falling back to SD");
+            return;
+        }
+    } else {
+        free_psram_pool();
+    }
+
+    use_psram_only_ = enable;
+    LOG_INFO("Timeshift storage mode: %s", enable ? "PSRAM-only" : "SD-backed");
+}
+
+bool TimeshiftManager::allocate_psram_pool() {
+    if (!psram_slot_buffers_.empty()) return true;
+
+    psram_slot_buffers_.resize(PSRAM_SLOT_COUNT);
+    for (size_t i = 0; i < PSRAM_SLOT_COUNT; ++i) {
+        psram_slot_buffers_[i] = reinterpret_cast<uint8_t*>(heap_caps_malloc(CHUNK_SIZE, MALLOC_CAP_SPIRAM));
+        if (!psram_slot_buffers_[i]) {
+            LOG_ERROR("Failed to allocate PSRAM slot %u (%u KB)", (unsigned)i, CHUNK_SIZE / 1024);
+            free_psram_pool();
+            return false;
+        }
+        psram_free_slots_.push_back(i);
+    }
+    LOG_INFO("Allocated %u KB of PSRAM for timeshift (%u slots)", (unsigned)(CHUNK_SIZE * PSRAM_SLOT_COUNT / 1024), (unsigned)PSRAM_SLOT_COUNT);
+    return true;
+}
+
+void TimeshiftManager::free_psram_pool() {
+    for (auto slot : psram_slot_buffers_) {
+        if (slot) {
+            heap_caps_free(slot);
+        }
+    }
+    psram_slot_buffers_.clear();
+    psram_free_slots_.clear();
+}
+
+bool TimeshiftManager::acquire_psram_slot(size_t& out_slot) {
+    if (psram_free_slots_.empty()) {
+        return false;
+    }
+    out_slot = psram_free_slots_.front();
+    psram_free_slots_.pop_front();
+    return true;
+}
+
+void TimeshiftManager::release_psram_slot(size_t slot) {
+    if (slot == INVALID_CHUNK_ID || slot >= psram_slot_buffers_.size()) {
+        return;
+    }
+    psram_free_slots_.push_back(slot);
+}
+
+size_t TimeshiftManager::current_window_limit_bytes() const {
+    return use_psram_only_ ? PSRAM_TS_WINDOW : SD_MAX_TS_WINDOW;
 }
 
 bool TimeshiftManager::open(const char* uri) {
@@ -41,25 +108,37 @@ bool TimeshiftManager::open(const char* uri) {
     pause_download_ = false;
     cumulative_time_ms_ = 0;  // Reset temporal tracking
 
-    // Create timeshift directory if it doesn't exist
-    if (!SD_MMC.exists("/timeshift")) {
-        SD_MMC.mkdir("/timeshift");
-        LOG_INFO("Created /timeshift directory");
+    if (!use_psram_only_) {
+        // Create timeshift directory if it doesn't exist
+        if (!SD_MMC.exists("/timeshift")) {
+            SD_MMC.mkdir("/timeshift");
+            LOG_INFO("Created /timeshift directory");
+        }
+
+        // Clean up old timeshift files from previous sessions
+        File tsDir = SD_MMC.open("/timeshift");
+        if (tsDir && tsDir.isDirectory()) {
+            File file = tsDir.openNextFile();
+            while (file) {
+                String fname = String("/timeshift/") + file.name();
+                file.close();
+                SD_MMC.remove(fname.c_str());
+                LOG_DEBUG("Cleaned up: %s", fname.c_str());
+                file = tsDir.openNextFile();
+            }
+            tsDir.close();
+            LOG_INFO("Timeshift directory cleaned");
+        }
+    } else {
+        LOG_INFO("PSRAM-only storage enabled; skipping SD initialization");
     }
 
-    // Clean up old timeshift files from previous sessions
-    File tsDir = SD_MMC.open("/timeshift");
-    if (tsDir && tsDir.isDirectory()) {
-        File file = tsDir.openNextFile();
-        while (file) {
-            String fname = String("/timeshift/") + file.name();
-            file.close();
-            SD_MMC.remove(fname.c_str());
-            LOG_DEBUG("Cleaned up: %s", fname.c_str());
-            file = tsDir.openNextFile();
+    if (use_psram_only_ && psram_slot_buffers_.empty()) {
+        if (!allocate_psram_pool()) {
+            LOG_ERROR("PSRAM pool allocation failed");
+            close();
+            return false;
         }
-        tsDir.close();
-        LOG_INFO("Timeshift directory cleaned");
     }
 
     recording_buffer_ = (uint8_t*)malloc(BUFFER_SIZE);
@@ -87,11 +166,13 @@ void TimeshiftManager::close() {
     stop();
 
     // Clean up all chunks (both pending and ready)
-    for (const auto& chunk : pending_chunks_) {
-        SD_MMC.remove(chunk.filename.c_str());
-    }
-    for (const auto& chunk : ready_chunks_) {
-        SD_MMC.remove(chunk.filename.c_str());
+    if (!use_psram_only_) {
+        for (const auto& chunk : pending_chunks_) {
+            SD_MMC.remove(chunk.filename.c_str());
+        }
+        for (const auto& chunk : ready_chunks_) {
+            SD_MMC.remove(chunk.filename.c_str());
+        }
     }
     pending_chunks_.clear();
     ready_chunks_.clear();
@@ -108,6 +189,10 @@ void TimeshiftManager::close() {
 
     is_open_ = false;
     seek_table_.clear();
+
+    if (use_psram_only_) {
+        free_psram_pool();
+    }
 }
 
 bool TimeshiftManager::start() {
@@ -427,8 +512,8 @@ bool TimeshiftManager::flush_recording_chunk() {
     chunk.crc32 = 0; // TODO: calculate CRC if needed
 
     // *** MODIFICA CHIAVE: La scrittura su SD avviene SENZA tenere il mutex ***
-    if (!write_chunk_to_sd(chunk)) {
-        LOG_ERROR("Failed to write chunk %u to SD", chunk.id);
+    if (!store_chunk_data(chunk)) {
+        LOG_ERROR("Failed to store chunk %u", chunk.id);
         return false;
     }
 
@@ -446,7 +531,12 @@ bool TimeshiftManager::flush_recording_chunk() {
         promote_chunk_to_ready(chunk);
     } else {
         LOG_ERROR("Chunk %u validation failed", chunk.id);
-        SD_MMC.remove(chunk.filename.c_str());
+        if (!use_psram_only_) {
+            SD_MMC.remove(chunk.filename.c_str());
+        } else {
+            release_psram_slot(chunk.psram_slot_index);
+            chunk.psram_slot_index = INVALID_CHUNK_ID;
+        }
         return false;
     }
 
@@ -504,7 +594,55 @@ bool TimeshiftManager::write_chunk_to_sd(ChunkInfo& chunk) {
     return true;
 }
 
+bool TimeshiftManager::store_chunk_data(ChunkInfo& chunk) {
+    if (use_psram_only_) {
+        size_t slot = INVALID_CHUNK_ID;
+        if (!acquire_psram_slot(slot)) {
+            LOG_ERROR("No PSRAM slot available for chunk %u", chunk.id);
+            return false;
+        }
+        chunk.psram_slot_index = slot;
+        if (!copy_chunk_from_recording(psram_slot_buffers_[slot], chunk.length)) {
+            release_psram_slot(slot);
+            chunk.psram_slot_index = INVALID_CHUNK_ID;
+            return false;
+        }
+        return true;
+    }
+    return write_chunk_to_sd(chunk);
+}
+
+bool TimeshiftManager::copy_chunk_from_recording(uint8_t* dest, size_t length) {
+    if (!dest) return false;
+    if (length == 0) return true;
+    if (length > BUFFER_SIZE) {
+        LOG_ERROR("Chunk length (%u) exceeds recording buffer size", (unsigned)length);
+        return false;
+    }
+
+    size_t start_pos = 0;
+    if (rec_write_head_ >= length) {
+        start_pos = rec_write_head_ - length;
+        memcpy(dest, recording_buffer_ + start_pos, length);
+    } else {
+        size_t remainder = length - rec_write_head_;
+        start_pos = BUFFER_SIZE - remainder;
+        memcpy(dest, recording_buffer_ + start_pos, remainder);
+        memcpy(dest + remainder, recording_buffer_, rec_write_head_);
+    }
+    return true;
+}
+
 bool TimeshiftManager::validate_chunk(ChunkInfo& chunk) {
+    if (use_psram_only_) {
+        if (chunk.psram_slot_index == INVALID_CHUNK_ID || chunk.psram_slot_index >= psram_slot_buffers_.size() ||
+            !psram_slot_buffers_[chunk.psram_slot_index]) {
+            LOG_ERROR("Validation failed: PSRAM slot missing for chunk %u", chunk.id);
+            return false;
+        }
+        return true;
+    }
+
     // Basic validation: check file exists and size matches
     File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
     if (!file) {
@@ -528,6 +666,10 @@ bool TimeshiftManager::calculate_chunk_duration(const ChunkInfo& chunk,
                                                  uint32_t& out_frames,
                                                  uint32_t& out_duration_ms)
 {
+    if (use_psram_only_) {
+        return calculate_chunk_duration_from_buffer(chunk, out_frames, out_duration_ms);
+    }
+
     File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
     if (!file) {
         LOG_ERROR("Cannot open chunk for duration calculation: %s", chunk.filename.c_str());
@@ -626,7 +768,134 @@ bool TimeshiftManager::calculate_chunk_duration(const ChunkInfo& chunk,
     return true;
 }
 
+bool TimeshiftManager::calculate_chunk_duration_from_buffer(const ChunkInfo& chunk,
+                                                  uint32_t& out_frames,
+                                                  uint32_t& out_duration_ms)
+{
+    if (chunk.psram_slot_index == INVALID_CHUNK_ID ||
+        chunk.psram_slot_index >= psram_slot_buffers_.size() ||
+        !psram_slot_buffers_[chunk.psram_slot_index]) {
+        LOG_WARN("Chunk %u: invalid PSRAM slot for duration parsing", chunk.id);
+        return false;
+    }
+
+    const uint8_t* data = psram_slot_buffers_[chunk.psram_slot_index];
+    size_t data_size = chunk.length;
+
+    if (data_size < 4) {
+        LOG_WARN("Chunk %u: PSRAM data too small for duration parsing", chunk.id);
+        return false;
+    }
+
+    size_t pos = 0;
+    uint32_t total_samples = 0;
+    uint32_t sample_rate = 44100;
+
+    static const uint16_t bitrate_table[2][16] = {
+        {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0},
+        {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0}
+    };
+    static const uint32_t sr_table[3][3] = {
+        {44100, 48000, 32000},
+        {22050, 24000, 16000},
+        {11025, 12000, 8000}
+    };
+
+    while (pos + 4 <= data_size) {
+        const uint8_t* header = data + pos;
+
+        if ((header[0] != 0xFF) || ((header[1] & 0xE0) != 0xE0)) {
+            pos++;
+            continue;
+        }
+
+        uint8_t b1 = header[1];
+        uint8_t b2 = header[2];
+
+        int version_id = (b1 >> 3) & 0x03;
+        int layer_idx = (b1 >> 1) & 0x03;
+        int bitrate_idx = (b2 >> 4) & 0x0F;
+        int sr_idx = (b2 >> 2) & 0x03;
+        int padding = (b2 >> 1) & 0x01;
+
+        if (layer_idx == 0 || bitrate_idx == 0x0F || sr_idx == 0x03) {
+            pos++;
+            continue;
+        }
+
+        int version_row = (version_id == 0x03) ? 0 : 1;
+        uint32_t bitrate_kbps = bitrate_table[version_row][bitrate_idx];
+
+        int sr_row = (version_id == 0x03) ? 0 : (version_id == 0x02) ? 1 : 2;
+        sample_rate = sr_table[sr_row][sr_idx];
+
+        if (bitrate_kbps == 0 || sample_rate == 0) {
+            pos++;
+            continue;
+        }
+
+        int frame_size = (144 * bitrate_kbps * 1000) / sample_rate + padding;
+        if (frame_size <= 0 || frame_size > 4096) {
+            pos++;
+            continue;
+        }
+
+        uint32_t samples_per_frame = 1152;
+        if (layer_idx == 3) samples_per_frame = 384;
+        else if (layer_idx == 2) samples_per_frame = 1152;
+        else samples_per_frame = ((version_id == 0x03) ? 1152 : 576);
+
+        total_samples += samples_per_frame;
+
+        if (pos + frame_size <= data_size) {
+            pos += frame_size;
+        } else {
+            break;
+        }
+    }
+
+    if (total_samples == 0) {
+        LOG_WARN("Chunk %u: no valid MP3 frames found in PSRAM data", chunk.id);
+        return false;
+    }
+
+    out_frames = total_samples;
+    out_duration_ms = (total_samples * 1000) / sample_rate;
+
+    LOG_DEBUG("Chunk %u: %u samples, %u ms @ %u Hz (PSRAM)",
+              chunk.id, out_frames, out_duration_ms, sample_rate);
+
+    return true;
+}
+
 void TimeshiftManager::promote_chunk_to_ready(ChunkInfo chunk) {
+    if (use_psram_only_) {
+        chunk.filename = "/psram/ready_" + std::to_string(chunk.id) + ".bin";
+        chunk.state = ChunkState::READY;
+
+        uint32_t total_frames = 0;
+        uint32_t duration_ms = 0;
+
+        if (calculate_chunk_duration(chunk, total_frames, duration_ms)) {
+            chunk.total_frames = total_frames;
+            chunk.duration_ms = duration_ms;
+            chunk.start_time_ms = cumulative_time_ms_;
+            cumulative_time_ms_ += duration_ms;
+
+            LOG_INFO("Chunk %u promoted to READY (PSRAM, %u KB, offset %u-%u, %u ms, %u frames)",
+                     chunk.id, chunk.length / 1024,
+                     (unsigned)chunk.start_offset, (unsigned)chunk.end_offset,
+                     duration_ms, total_frames);
+        } else {
+            LOG_WARN("Chunk %u promoted to READY without duration info (PSRAM, %u KB, offset %u-%u)",
+                     chunk.id, chunk.length / 1024,
+                     (unsigned)chunk.start_offset, (unsigned)chunk.end_offset);
+        }
+
+        ready_chunks_.push_back(chunk);
+        return;
+    }
+
     // Rename file from pending to ready
     std::string ready_filename = "/timeshift/ready_" + std::to_string(chunk.id) + ".bin";
 
@@ -640,7 +909,6 @@ void TimeshiftManager::promote_chunk_to_ready(ChunkInfo chunk) {
         chunk.filename = ready_filename;
         chunk.state = ChunkState::READY;
 
-        // Calculate chunk duration
         uint32_t total_frames = 0;
         uint32_t duration_ms = 0;
 
@@ -661,7 +929,6 @@ void TimeshiftManager::promote_chunk_to_ready(ChunkInfo chunk) {
                      (unsigned)chunk.start_offset, (unsigned)chunk.end_offset);
         }
 
-        // Add to ready_chunks_ (already ordered by ID)
         ready_chunks_.push_back(chunk);
     } else {
         LOG_ERROR("Failed to rename chunk %u from pending to ready", chunk.id);
@@ -674,14 +941,54 @@ void TimeshiftManager::cleanup_old_chunks() {
     while (!ready_chunks_.empty()) {
         const ChunkInfo& oldest = ready_chunks_.front();
 
-        if (current_recording_offset_ - oldest.end_offset > MAX_TS_WINDOW) {
-            LOG_INFO("Removing old chunk %u: %s", oldest.id, oldest.filename.c_str());
-            SD_MMC.remove(oldest.filename.c_str());
+        if (current_recording_offset_ - oldest.end_offset > current_window_limit_bytes()) {
+            LOG_INFO("Removing old chunk %u: %s",
+                     oldest.id,
+                     use_psram_only_ ? oldest.filename.c_str() : oldest.filename.c_str());
+            if (!use_psram_only_) {
+                SD_MMC.remove(oldest.filename.c_str());
+            } else {
+                release_psram_slot(oldest.psram_slot_index);
+            }
             ready_chunks_.erase(ready_chunks_.begin());
         } else {
             break; // Chunks are ordered, so we can stop
         }
     }
+}
+
+bool TimeshiftManager::copy_chunk_into_buffer(const ChunkInfo& chunk, uint8_t* dest, size_t dest_capacity) {
+    if (chunk.length > dest_capacity) {
+        LOG_ERROR("Chunk %u length (%u) exceeds buffer capacity (%u)", chunk.id, (unsigned)chunk.length, (unsigned)dest_capacity);
+        return false;
+    }
+
+    if (use_psram_only_) {
+        if (chunk.psram_slot_index == INVALID_CHUNK_ID ||
+            chunk.psram_slot_index >= psram_slot_buffers_.size() ||
+            !psram_slot_buffers_[chunk.psram_slot_index]) {
+            LOG_ERROR("Chunk %u PSRAM data missing (slot %u)", chunk.id, (unsigned)chunk.psram_slot_index);
+            return false;
+        }
+        memcpy(dest, psram_slot_buffers_[chunk.psram_slot_index], chunk.length);
+        return true;
+    }
+
+    File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
+    if (!file) {
+        LOG_ERROR("Failed to open chunk for copy: %s", chunk.filename.c_str());
+        return false;
+    }
+
+    size_t read = file.read(dest, chunk.length);
+    file.close();
+
+    if (read != chunk.length) {
+        LOG_ERROR("Chunk read mismatch: expected %u, got %u", chunk.length, read);
+        return false;
+    }
+
+    return true;
 }
 
 bool TimeshiftManager::preload_next_chunk(size_t current_chunk_id) {
@@ -700,18 +1007,8 @@ bool TimeshiftManager::preload_next_chunk(size_t current_chunk_id) {
 
     // Il buffer di playback è 256KB. Il chunk corrente è a [0-128KB].
     // Pre-carichiamo il successivo a [128KB-256KB].
-    File file = SD_MMC.open(next_chunk.filename.c_str(), FILE_READ);
-    if (!file) {
-        LOG_ERROR("Preload failed: cannot open %s", next_chunk.filename.c_str());
-        return false;
-    }
-
-    // Carica nella seconda metà del buffer
-    size_t read = file.read(playback_buffer_ + CHUNK_SIZE, next_chunk.length);
-    file.close();
-
-    if (read != next_chunk.length) {
-        LOG_ERROR("Preload read mismatch: expected %u, got %u", next_chunk.length, read);
+    if (!copy_chunk_into_buffer(next_chunk, playback_buffer_ + CHUNK_SIZE, CHUNK_SIZE)) {
+        LOG_ERROR("Preload failed: could not copy chunk %u", next_chunk.id);
         return false;
     }
 
@@ -773,18 +1070,8 @@ bool TimeshiftManager::load_chunk_to_playback(size_t chunk_id) {
     }
 
     // Open chunk file
-    File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
-    if (!file) {
-        LOG_ERROR("Failed to open chunk for playback: %s", chunk.filename.c_str());
-        return false;
-    }
-
-    // Read entire chunk into playback_buffer_
-    size_t read = file.read(playback_buffer_, chunk.length);
-    file.close();
-
-    if (read != chunk.length) {
-        LOG_ERROR("Chunk read mismatch: expected %u, got %u", chunk.length, read);
+    if (!copy_chunk_into_buffer(chunk, playback_buffer_, PLAYBACK_BUFFER_SIZE)) {
+        LOG_ERROR("Failed to load chunk %u for playback", chunk.id);
         return false;
     }
 

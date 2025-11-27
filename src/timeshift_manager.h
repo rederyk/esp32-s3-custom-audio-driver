@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <deque>
 
 // Forward declarations
 class HTTPClient;
@@ -17,6 +18,10 @@ class TimeshiftManager : public IDataSource {
 public:
     TimeshiftManager();
     virtual ~TimeshiftManager();
+
+    // Toggle storage mode: default is SD-backed. PSRAM-only mode bypasses SD writes.
+    void set_use_psram_only(bool enable);
+    bool is_psram_only() const { return use_psram_only_; }
 
     // IDataSource interface implementation
     size_t read(void* buffer, size_t size) override;
@@ -53,6 +58,9 @@ private:
     static const size_t PLAYBACK_BUFFER_SIZE = 256 * 1024;  // Raddoppiato a 256KB per contenere chunk corrente + successivo
     static const size_t CHUNK_SIZE = 128 * 1024;        // Manteniamo i chunk da 128KB
     static const size_t INVALID_CHUNK_ID = SIZE_MAX;
+    static const size_t SD_MAX_TS_WINDOW = 512 * 1024 * 1024;
+    static const size_t PSRAM_TS_WINDOW = 4 * 1024 * 1024;
+    static const size_t PSRAM_SLOT_COUNT = PSRAM_TS_WINDOW / CHUNK_SIZE;
 
     enum class ChunkState {
         PENDING,    // In scrittura su SD
@@ -66,6 +74,7 @@ private:
         size_t end_offset;       // Offset globale di fine
         size_t length;           // Lunghezza effettiva
         std::string filename;
+        size_t psram_slot_index = INVALID_CHUNK_ID;
         ChunkState state;
         uint32_t crc32;          // Per validazione (opzionale)
 
@@ -108,9 +117,13 @@ private:
     std::vector<ChunkInfo> ready_chunks_;    // Chunks complete and ready for playback (READY state)
     size_t current_read_offset_ = 0;         // Current read position (logical offset)
     
+    std::vector<uint8_t*> psram_slot_buffers_;
+    std::deque<size_t> psram_free_slots_;
+
     // Synchronization
     SemaphoreHandle_t mutex_ = nullptr;
     bool pause_download_ = false;  // Flag to pause/resume recording
+    bool use_psram_only_ = false;  // If true, store chunks in PSRAM instead of SD
 
     // Seek Table (built incrementally)
     Mp3SeekTable seek_table_;
@@ -120,22 +133,35 @@ private:
     
     // RECORDING SIDE (private helpers)
     bool flush_recording_chunk();                    // Flush recording_buffer_ to SD as chunk
+    bool store_chunk_data(ChunkInfo& chunk);        // Persist chunk data based on current storage mode
     bool write_chunk_to_sd(ChunkInfo& chunk);       // Write chunk data to SD file
     bool validate_chunk(ChunkInfo& chunk);          // Validate chunk integrity
+    bool copy_chunk_from_recording(uint8_t* dest, size_t length);
     void promote_chunk_to_ready(ChunkInfo chunk);   // Move chunk from PENDING to READY
     bool calculate_chunk_duration(const ChunkInfo& chunk,
                                    uint32_t& out_frames,
                                    uint32_t& out_duration_ms);  // Calcola durata chunk
+    bool calculate_chunk_duration_from_buffer(const ChunkInfo& chunk,
+                                               uint32_t& out_frames,
+                                               uint32_t& out_duration_ms);
 
     // PLAYBACK SIDE (private helpers)
     size_t find_chunk_for_offset(size_t offset);    // Find chunk ID containing offset
     bool load_chunk_to_playback(size_t chunk_id);   // Load chunk into playback_buffer_
     bool preload_next_chunk(size_t current_chunk_id);
     size_t read_from_playback_buffer(size_t offset, void* buffer, size_t size);
+    bool copy_chunk_into_buffer(const ChunkInfo& chunk, uint8_t* dest, size_t dest_capacity);
+
+    // PSRAM pool helpers
+    bool allocate_psram_pool();
+    void free_psram_pool();
+    bool acquire_psram_slot(size_t& out_slot);
+    void release_psram_slot(size_t slot);
 
     // CLEANUP
     void cleanup_old_chunks();                      // Remove old chunks beyond window
     
+    size_t current_window_limit_bytes() const;
     // HTTP Handling (basic placeholder logic initially)
     // We might need a real HTTP client member here or in the task
 };
