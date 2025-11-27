@@ -463,28 +463,16 @@ void loop()
         
         if (player.state() == PlayerState::PLAYING)
         {
-            // Check if using TimeshiftManager for better time display
-            const IDataSource* ds = player.data_source();
-            if (ds && ds->type() == SourceType::HTTP_STREAM) {
-                // Cast to TimeshiftManager to get temporal info
-                const TimeshiftManager* ts = static_cast<const TimeshiftManager*>(ds);
-                uint32_t current_ms = ts->current_position_ms();
-                uint32_t total_ms = ts->total_duration_ms();
-
-                uint32_t curr_min = current_ms / 60000;
-                uint32_t curr_sec = (current_ms / 1000) % 60;
-                uint32_t total_min = total_ms / 60000;
-                uint32_t total_sec = (total_ms / 1000) % 60;
-
-                LOG_INFO("Timeshift: %02u:%02u / %02u:%02u available",
-                         curr_min, curr_sec, total_min, total_sec);
-            } else {
-                // Standard progress for file playback
-                uint32_t current_sec = player.played_frames() / player.current_sample_rate();
-                uint32_t total_sec = player.total_frames() / player.current_sample_rate();
-                LOG_INFO("Progress: %u/%u seconds", current_sec, total_sec);
-            }
+            // Usa la nuova interfaccia pulita di AudioPlayer
+            uint32_t current_sec = player.current_position_sec();
+            uint32_t total_sec = player.total_duration_sec();
+            uint32_t current_min = current_sec / 60;
+            uint32_t total_min = total_sec / 60;
+            
+            LOG_INFO("Progress: %02u:%02u / %02u:%02u",
+                     current_min, current_sec % 60,
+                     total_min, total_sec % 60);
         }
     }
-    delay(100);
+    vTaskDelay(pdMS_TO_TICKS(20)); // Cedi il controllo allo scheduler in modo più efficiente
 }

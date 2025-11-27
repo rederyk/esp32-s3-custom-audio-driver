@@ -79,6 +79,37 @@ bool select_source(std::unique_ptr<IDataSource> source);
     int saved_volume() const { return saved_volume_percent_; }
     int user_volume() const { return user_volume_percent_; }
 
+    // UI Interface Methods (NEW)
+    SourceType source_type() const;
+    inline uint32_t current_position_ms() const {
+        const IDataSource* ds = data_source();
+        if (ds && ds->type() == SourceType::HTTP_STREAM) {
+            // La sorgente (es. Timeshift) può riportare il tempo direttamente
+            return ds->current_position_ms();
+        }
+        // Per file locali, calcoliamo dai frame
+        if (current_sample_rate_ > 0) {
+            return (current_played_frames_ * 1000) / current_sample_rate_;
+        }
+        return 0;
+    }
+    inline uint32_t total_duration_ms() const {
+        const IDataSource* ds = data_source();
+        if (ds && ds->type() == SourceType::HTTP_STREAM) {
+            // La sorgente (es. Timeshift) può riportare la durata totale
+            return ds->total_duration_ms();
+        }
+        // Per file locali, calcoliamo dai frame
+        if (current_sample_rate_ > 0) {
+            return (total_pcm_frames_ * 1000) / current_sample_rate_;
+        }
+        return 0;
+    }
+
+    inline uint32_t current_position_sec() const { return current_position_ms() / 1000; }
+    inline uint32_t total_duration_sec() const { return total_duration_ms() / 1000; }
+    const char* current_uri() const;
+
 private:
     // Task
     static void audio_task_entry(void *param);

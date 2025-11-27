@@ -33,4 +33,11 @@ public:
     
     // Optional: Provide a build-in seek table (e.g. for Timeshift)
     virtual const Mp3SeekTable* get_seek_table() const { return nullptr; }
+
+    // Optional: Temporal seek for streamable sources
+    virtual size_t seek_to_time(uint32_t target_ms) { return SIZE_MAX; }
+
+    // Optional: For sources that can report temporal progress
+    virtual uint32_t current_position_ms() const { return 0; }
+    virtual uint32_t total_duration_ms() const { return 0; }
 };

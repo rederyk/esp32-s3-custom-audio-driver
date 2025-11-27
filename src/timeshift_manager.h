@@ -55,9 +55,9 @@ public:
     float buffer_duration_seconds() const;
 
     // Temporal seek (NEW)
-    size_t seek_to_time(uint32_t target_ms);     // Seek to timestamp, returns byte offset
-    uint32_t total_duration_ms() const;          // Total available duration
-    uint32_t current_position_ms() const;        // Current playback position in ms
+    size_t seek_to_time(uint32_t target_ms) override;     // Seek to timestamp, returns byte offset
+    uint32_t total_duration_ms() const override;          // Total available duration
+    uint32_t current_position_ms() const override;        // Current playback position in ms
 
     // Auto-pause callback for buffering (NEW)
     void set_auto_pause_callback(std::function<void(bool)> callback) { auto_pause_callback_ = callback; }

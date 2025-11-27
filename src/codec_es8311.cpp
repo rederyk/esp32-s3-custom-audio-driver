@@ -43,14 +43,25 @@ bool CodecES8311::init(int sample_rate,
 }
 
 int CodecES8311::map_user_volume_to_hw(int user_pct) {
-    if (user_pct <= 0) return 0;
-    if (user_pct >= 100) return 75;
-    int mapped = 55 + ((user_pct - 1) * 10 + 98) / 99;
-    if (mapped > 75) mapped = 75;
-    return mapped;
+    // Mappatura esponenziale per una migliore percezione uditiva.
+    // L'intervallo hardware udibile è stato identificato tra 55 e 75.
+    // 0% -> 0 (muto)
+    // 1-100% -> mappato esponenzialmente su [55, 75]
+    if (user_pct == 0) return 0;
+
+    // Parametri della curva logaritmica
+    const double hw_min = 55.0; // Volume hardware minimo udibile
+    const double hw_max = 75.0; // Volume hardware massimo desiderato
+
+    // La formula di potenza (esponenziale) mappa l'input lineare (1-100) su una curva
+    // che cresce più velocemente all'inizio e più lentamente alla fine.
+    double normalized_pct = (user_pct - 1) / 99.0; // Normalizza user_pct in [0, 1]
+    const double exponent = 0.5; // Esponente < 1 per una curva "veloce all'inizio"
+    double scaled_pct = pow(normalized_pct, exponent);
+    double hw_vol = hw_min + (hw_max - hw_min) * scaled_pct;
+
+    return static_cast<int>(round(hw_vol));
 }
-//map it better with a curve 1to10%=55to65 rest 65to75=10to100
-//in this way volume result udible lianearly
 
 void CodecES8311::set_volume(int vol_pct) {
     if (vol_pct < 0) vol_pct = 0;

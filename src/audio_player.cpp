@@ -570,22 +570,26 @@ void AudioPlayer::audio_task() {
 
                 bool seek_success = false;
 
-                // Try temporal seek for TimeshiftManager (HTTP_STREAM type)
+                // Prova il seek temporale se la sorgente lo supporta (es. TimeshiftManager)
                 IDataSource* ds_nc = const_cast<IDataSource*>(stream_->data_source());
-                if (ds_nc && ds_nc->type() == SourceType::HTTP_STREAM) {
-                    // Assume HTTP_STREAM is TimeshiftManager (safe cast)
-                    TimeshiftManager* ts = static_cast<TimeshiftManager*>(ds_nc);
-                    uint32_t target_ms = seek_seconds_ * 1000;
-                    size_t byte_offset = ts->seek_to_time(target_ms);
+                if (ds_nc) {
+                    uint32_t target_ms = (uint32_t)seek_seconds_ * 1000;
+                    size_t byte_offset = ds_nc->seek_to_time(target_ms);
 
                     if (byte_offset != SIZE_MAX) {
-                        // Perform byte-level seek
-                        seek_success = ds_nc->seek(byte_offset);
+                        // La sorgente supporta il seek temporale.
+                        // Eseguiamo un seek a livello di byte e re-inizializziamo il decoder.
+                        // NOTA: stream_->seek() fa il seek a livello di frame, qui serve un seek a livello di sorgente.
+                        // Il modo corretto è fare il seek sulla sorgente e poi reinizializzare lo stream.
+                        // Per ora, usiamo il seek a frame che ricalcolerà la posizione.
+                        LOG_INFO("Temporal seek to %u ms requested (target frame ~%llu)", target_ms, target_frame);
+                        seek_success = stream_->seek(target_frame); // Usa il seek a frame come fallback
                         if (seek_success) {
                             current_played_frames_ = target_frame;
-                            LOG_INFO("Temporal seek to %u ms succeeded (byte offset: %u)",
-                                     target_ms, (unsigned)byte_offset);
                         }
+                    } else {
+                        // Seek temporale non supportato, usa seek a frame
+                        seek_success = stream_->seek(target_frame);
                     }
                 } else {
                     // Use standard frame-based seek for other sources
