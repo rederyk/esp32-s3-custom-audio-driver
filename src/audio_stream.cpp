@@ -1,6 +1,6 @@
 #include "audio_stream.h"
+#include "audio_decoder_factory.h"
 #include "logger.h"
-#include <cstring> // for memcpy
 
 // Frame chunk size for initialization/internal buffering if needed
 static constexpr uint32_t kFramesPerChunk = 2048;
@@ -14,30 +14,87 @@ AudioStream::~AudioStream() {
 
 bool AudioStream::begin(std::unique_ptr<IDataSource> source) {
     if (!source || !source->is_open()) {
-        LOG_ERROR("Invalid or closed data source provided to AudioStream");
+        LOG_ERROR("AudioStream: Invalid or closed data source");
         return false;
     }
-    
+
+    // Auto-detect format and create appropriate decoder
+    decoder_ = AudioDecoderFactory::create_from_source(source.get());
+    if (!decoder_) {
+        LOG_ERROR("AudioStream: Failed to create decoder (unknown format)");
+        return false;
+    }
+
     source_ = std::move(source);
-    
+
     // Init decoder
-    if (!decoder_.init(source_.get(), kFramesPerChunk)) {
-        LOG_ERROR("Failed to init decoder in AudioStream");
+    if (!decoder_->init(source_.get(), kFramesPerChunk)) {
+        LOG_ERROR("AudioStream: Failed to init decoder");
+        decoder_.reset();
         return false;
     }
-    
-    if (decoder_.channels() == 0 || decoder_.sample_rate() == 0) {
-        LOG_ERROR("Invalid audio format detected by decoder");
+
+    if (decoder_->channels() == 0 || decoder_->sample_rate() == 0) {
+        LOG_ERROR("AudioStream: Invalid audio format detected");
+        decoder_->shutdown();
+        decoder_.reset();
         return false;
     }
 
     initialized_ = true;
+    LOG_INFO("AudioStream: Initialized %s stream (%u Hz, %u ch)",
+             audio_format_to_string(decoder_->format()),
+             decoder_->sample_rate(),
+             decoder_->channels());
+
+    return true;
+}
+
+bool AudioStream::begin(std::unique_ptr<IDataSource> source, AudioFormat format) {
+    if (!source || !source->is_open()) {
+        LOG_ERROR("AudioStream: Invalid or closed data source");
+        return false;
+    }
+
+    // Create decoder for explicit format
+    decoder_ = AudioDecoderFactory::create(format);
+    if (!decoder_) {
+        LOG_ERROR("AudioStream: Failed to create decoder for format %s",
+                  audio_format_to_string(format));
+        return false;
+    }
+
+    source_ = std::move(source);
+
+    // Init decoder
+    if (!decoder_->init(source_.get(), kFramesPerChunk)) {
+        LOG_ERROR("AudioStream: Failed to init decoder");
+        decoder_.reset();
+        return false;
+    }
+
+    if (decoder_->channels() == 0 || decoder_->sample_rate() == 0) {
+        LOG_ERROR("AudioStream: Invalid audio format detected");
+        decoder_->shutdown();
+        decoder_.reset();
+        return false;
+    }
+
+    initialized_ = true;
+    LOG_INFO("AudioStream: Initialized %s stream (%u Hz, %u ch)",
+             audio_format_to_string(decoder_->format()),
+             decoder_->sample_rate(),
+             decoder_->channels());
+
     return true;
 }
 
 void AudioStream::end() {
     if (initialized_) {
-        decoder_.shutdown();
+        if (decoder_) {
+            decoder_->shutdown();
+            decoder_.reset();
+        }
         if (source_) {
             source_->close();
             source_.reset();
@@ -47,19 +104,34 @@ void AudioStream::end() {
 }
 
 size_t AudioStream::read(int16_t* buffer, size_t frames_to_read) {
-    if (!initialized_) return 0;
-    
-    // Read directly from decoder into the provided buffer
-    // Note: Mp3Decoder::read_frames expects its own internal buffer usage or we can use it directly.
-    // The current Mp3Decoder implementation (based on audio_player.cpp usage) 
-    // uses read_frames(int16_t *pcm_out, size_t frames_wanted).
-    
-    drmp3_uint64 frames_decoded = decoder_.read_frames(buffer, frames_to_read);
-    return (size_t)frames_decoded;
+    if (!initialized_ || !decoder_) {
+        return 0;
+    }
+
+    uint64_t frames_decoded = decoder_->read_frames(buffer, frames_to_read);
+    return static_cast<size_t>(frames_decoded);
 }
 
 bool AudioStream::seek(uint64_t pcm_frame_index) {
-    if (!initialized_) return false;
+    if (!initialized_ || !decoder_) {
+        return false;
+    }
 
-    return decoder_.seek_to_frame(pcm_frame_index);
+    return decoder_->seek_to_frame(pcm_frame_index);
+}
+
+uint32_t AudioStream::sample_rate() const {
+    return decoder_ ? decoder_->sample_rate() : 0;
+}
+
+uint32_t AudioStream::channels() const {
+    return decoder_ ? decoder_->channels() : 0;
+}
+
+uint64_t AudioStream::total_frames() const {
+    return decoder_ ? decoder_->total_frames() : 0;
+}
+
+AudioFormat AudioStream::format() const {
+    return decoder_ ? decoder_->format() : AudioFormat::UNKNOWN;
 }

@@ -13,7 +13,7 @@ static const char *kWiFiSSID = "FASTWEB-2";
 static const char *kWiFiPassword = "mailmioWIFIfaschifo";
 
 static const char *kTestFilePath = "/sample-rich.mp3";
-static const char *kSampleFilePath = "/audioontag.mp3";
+static const char *kSampleFilePath = "/fileWAV1MG.wav";
 // Stream HTTP di test - Radio Paradise 128k MP3
 static const char *kRadioStreamURL = "http://stream.radioparadise.com/mp3-128";
 
