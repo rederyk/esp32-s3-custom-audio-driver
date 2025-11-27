@@ -26,7 +26,7 @@ static StorageMode preferred_storage_mode = StorageMode::SD_CARD;  // Default: S
 static uint32_t auto_pause_delay_ms = 0;   // Delay prima di riprendere (0 = disabilitato)
 static size_t auto_pause_min_chunks = 2;      // Chunk minimi prima di riprendere (0 = disabilitato)
 
-void start_timeshift_radio() {
+void start_timeshift_radio(const char* stream_url = kRadioStreamURL) {
     // Stop any current playback first
     if (player.is_playing() || player.state() == PlayerState::PLAYING || player.state() == PlayerState::PAUSED) {
         LOG_INFO("Stopping current playback before starting timeshift...");
@@ -42,8 +42,8 @@ void start_timeshift_radio() {
     LOG_INFO("Starting timeshift in %s mode",
              preferred_storage_mode == StorageMode::PSRAM_ONLY ? "PSRAM" : "SD");
 
-    if (!ts->open(kRadioStreamURL)) {
-        LOG_ERROR("Failed to open timeshift stream URL");
+    if (!ts->open(stream_url)) {
+        LOG_ERROR("Failed to open timeshift stream URL: %s", stream_url);
         delete ts;
         return;
     }
@@ -191,6 +191,7 @@ static void handle_command_string(String cmd)
             LOG_INFO("=== COMANDI DISPONIBILI ===");
             LOG_INFO("PLAYBACK:");
             LOG_INFO("  r - Avvia radio streaming con timeshift (tutto in uno!)");
+            LOG_INFO("  u<url> - Avvia radio streaming con timeshift da URL custom (es. uhttp://example.com/stream.mp3)");
             LOG_INFO("  t - Riproduci test file (%s)", kTestFilePath);
             LOG_INFO("  s - Riproduci sample file (%s)", kSampleFilePath);
             LOG_INFO("  p - Play/Pause toggle");
@@ -424,6 +425,17 @@ static void handle_command_string(String cmd)
             }
             player.select_source(new_path.c_str());
             LOG_INFO("Source selected: %s (use 'l' to load)", new_path.c_str());
+        }
+        else if (first_char == 'u' || first_char == 'U')
+        {
+            String url = cmd.substring(1);
+            url.trim();
+            if (url.length() == 0)
+            {
+                LOG_WARN("Invalid URL");
+                return;
+            }
+            start_timeshift_radio(url.c_str());
         }
         else
         {
