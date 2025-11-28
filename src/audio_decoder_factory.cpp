@@ -158,8 +158,8 @@ AudioFormat AudioDecoderFactory::detect_from_content(IDataSource* source) {
     // Salva posizione corrente
     size_t original_pos = source->tell();
 
-    // Leggi primi bytes per magic number
-    uint8_t magic[16];  // Increased buffer for more robust detection
+    // Leggi primi bytes per magic number - increased buffer to scan for sync patterns
+    uint8_t magic[1024];  // Larger buffer to handle metadata and find sync
     source->seek(0);
     size_t read = source->read(magic, sizeof(magic));
 
@@ -176,30 +176,26 @@ AudioFormat AudioDecoderFactory::detect_from_content(IDataSource* source) {
         return AudioFormat::MP3;
     }
 
-    // 2. Advanced MPEG Frame Sync Detection
-    if (read >= 4 && magic[0] == 0xFF && (magic[1] & 0xE0) == 0xE0) {
-        // More robust MPEG frame header check
-        // Bits: 11 sync, 2 version, 2 layer, 1 protection
-        uint8_t version = (magic[1] >> 3) & 0x03;
-        uint8_t layer = (magic[1] >> 1) & 0x03;
-        
-        // Check for valid MPEG Audio Layer III (MP3)
-        if (version != 0x01 && layer == 0x01) {
-            return AudioFormat::MP3;
+    // 2. Scan for MPEG Frame Sync (skip potential Icecast metadata)
+    for (size_t i = 0; i < read - 1; ++i) {
+        if (magic[i] == 0xFF && (magic[i+1] & 0xE0) == 0xE0) {
+            // Found potential MPEG sync, validate
+            if (i + 3 < read) {
+                uint8_t version = (magic[i+1] >> 3) & 0x03;
+                uint8_t layer = (magic[i+1] >> 1) & 0x03;
+
+                // Check for valid MPEG Audio Layer III (MP3)
+                if (version != 0x01 && layer == 0x01) {
+                    return AudioFormat::MP3;
+                }
+            }
         }
     }
 
-    // 3. Additional MP3 Sync Pattern Check
-    if (read >= 16) {
-        // Look for multiple consecutive sync patterns
-        int sync_count = 0;
-        for (int i = 0; i < 12; i++) {
-            if (magic[i] == 0xFF && (magic[i+1] & 0xE0) == 0xE0) {
-                sync_count++;
-            }
-        }
-        if (sync_count >= 3) {
-            return AudioFormat::MP3;
+    // 3. Scan for AAC ADTS sync
+    for (size_t i = 0; i < read - 1; ++i) {
+        if (magic[i] == 0xFF && (magic[i+1] & 0xF0) == 0xF0) {
+            return AudioFormat::AAC;
         }
     }
 
@@ -211,11 +207,6 @@ AudioFormat AudioDecoderFactory::detect_from_content(IDataSource* source) {
     // FLAC: fLaC marker
     if (read >= 4 && memcmp(magic, "fLaC", 4) == 0) {
         return AudioFormat::FLAC;
-    }
-
-    // AAC: ADTS header (0xFF 0xFx)
-    if (read >= 2 && magic[0] == 0xFF && (magic[1] & 0xF0) == 0xF0) {
-        return AudioFormat::AAC;
     }
 
     return AudioFormat::UNKNOWN;

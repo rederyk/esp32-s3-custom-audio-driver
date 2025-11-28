@@ -23,7 +23,7 @@ constexpr uint32_t MAX_CHUNK_DURATION_SEC = 12;    // Maximum 12 seconds
 constexpr size_t MAX_TS_WINDOW = 1024 * 1024 * 2; // 2 MB max window
 
 // Default bitrate assumption (will be auto-detected from stream)
-constexpr uint32_t DEFAULT_BITRATE_KBPS = 128;
+constexpr uint32_t DEFAULT_BITRATE_KBPS = 320;
 
 TimeshiftManager::TimeshiftManager() {
     mutex_ = xSemaphoreCreateMutex();
