@@ -20,7 +20,7 @@ constexpr uint32_t MIN_CHUNK_DURATION_SEC = 4;     // Minimum 4 seconds
 constexpr uint32_t MAX_CHUNK_DURATION_SEC = 12;    // Maximum 12 seconds
 
 // Cleanup window
-constexpr size_t MAX_TS_WINDOW = 1024 * 1024 * 2; // 2 MB max window
+constexpr size_t MAX_TS_WINDOW = 1024 * 1024 * 4; // 2 MB max window
 
 // Default bitrate assumption (will be auto-detected from stream)
 constexpr uint32_t DEFAULT_BITRATE_KBPS = 320;
@@ -50,7 +50,7 @@ void TimeshiftManager::calculate_adaptive_sizes(uint32_t bitrate_kbps) {
     uint32_t target_chunk_bytes = (bitrate_kbps * 1000 / 8) * TARGET_CHUNK_DURATION_SEC;
 
     // Clamp to reasonable limits (16KB - 512KB)
-    const size_t MIN_CHUNK_SIZE = 16 * 1024;   // 16KB minimum
+    const size_t MIN_CHUNK_SIZE = 32 * 1024;   // 16KB minimum
     const size_t MAX_CHUNK_SIZE = MAX_DYNAMIC_CHUNK_BYTES;  // 512KB maximum
 
     dynamic_chunk_size_ = std::max(MIN_CHUNK_SIZE,
@@ -1436,7 +1436,7 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
 
                 // Verifica che ci siano abbastanza chunk pronti prima di riprendere
                 if (auto_pause_min_chunks_ > 0) {
-                    const uint32_t MAX_WAIT_MS = 3000;  // Massimo 3 secondi di attesa aggiuntiva
+                    const uint32_t MAX_WAIT_MS = 5000;  // Massimo 3 secondi di attesa aggiuntiva
                     uint32_t start_wait = millis();
                     size_t target_chunks = ready_chunks_.size() + auto_pause_min_chunks_;
 
