@@ -1,3 +1,7 @@
+// Copyright (c) 2025 rederyk
+// Licensed under the MIT License. See LICENSE file for details.
+
+
 #include "audio_stream.h"
 #include "audio_decoder_factory.h"
 #include "logger.h"

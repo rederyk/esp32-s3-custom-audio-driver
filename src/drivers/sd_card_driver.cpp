@@ -1,3 +1,7 @@
+// Copyright (c) 2025 rederyk
+// Licensed under the MIT License. See LICENSE file for details.
+
+
 #include "drivers/sd_card_driver.h"
 
 #include <Arduino.h>

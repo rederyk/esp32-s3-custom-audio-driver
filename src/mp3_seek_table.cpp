@@ -1,3 +1,7 @@
+// Copyright (c) 2025 rederyk
+// Licensed under the MIT License. See LICENSE file for details.
+
+
 #include "mp3_seek_table.h"
 #include "logger.h"
 #include "data_source.h"

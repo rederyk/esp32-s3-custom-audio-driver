@@ -1,3 +1,7 @@
+// Copyright (c) 2025 rederyk
+// Licensed under the MIT License. See LICENSE file for details.
+
+
 #ifndef LOG_H
 #define LOG_H
 

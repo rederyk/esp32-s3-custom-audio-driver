@@ -1,3 +1,7 @@
+// Copyright (c) 2025 rederyk
+// Licensed under the MIT License. See LICENSE file for details.
+
+
 #include "i2s_driver.h"
 
 #include "driver/i2s.h"

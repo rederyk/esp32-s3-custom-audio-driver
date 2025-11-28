@@ -1,3 +1,7 @@
+// Copyright (c) 2025 rederyk
+// Licensed under the MIT License. See LICENSE file for details.
+
+
 #include "id3_parser.h"
 
 #include "data_source.h" // Aggiunto per IDataSource
