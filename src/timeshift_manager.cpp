@@ -1057,13 +1057,20 @@ void TimeshiftManager::cleanup_old_chunks() {
                          oldest.filename.c_str(),
                          (unsigned)(oldest.length / 1024));
 
-                bool removed = SD_MMC.remove(oldest.filename.c_str());
-                if (removed) {
-                    LOG_DEBUG("   File deleted successfully");
+                // Check if file exists before attempting to delete
+                if (SD_MMC.exists(oldest.filename.c_str())) {
+                    bool removed = SD_MMC.remove(oldest.filename.c_str());
+                    if (removed) {
+                        LOG_DEBUG("   File deleted successfully");
+                        removed_count++;
+                        total_removed_bytes += oldest.length;
+                    } else {
+                        LOG_ERROR("   Failed to delete file: %s", oldest.filename.c_str());
+                    }
+                } else {
+                    LOG_DEBUG("   File does not exist (already deleted): %s", oldest.filename.c_str());
                     removed_count++;
                     total_removed_bytes += oldest.length;
-                } else {
-                    LOG_ERROR("   Failed to delete file: %s", oldest.filename.c_str());
                 }
             } else {
                 // PSRAM mode: chunk slot will be reused automatically
