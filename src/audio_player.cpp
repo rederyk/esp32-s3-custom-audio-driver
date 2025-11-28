@@ -701,11 +701,26 @@ void AudioPlayer::audio_task() {
             if (frames_decoded == 0) {
                 if (stop_requested_) {
                     break;
-                } else {
-                    LOG_INFO("End of stream");
-                    player_state_ = PlayerState::ENDED;
-                    break;
                 }
+
+                // For live streams (timeshift), don't immediately end - wait for new chunks
+                IDataSource* ds = const_cast<IDataSource*>(stream_->data_source());
+                if (ds && ds->type() == SourceType::HTTP_STREAM) {
+                    // This is a live stream - check if it's still downloading
+                    TimeshiftManager* ts = static_cast<TimeshiftManager*>(ds);
+                    
+                    // If download is still running, wait for new chunks instead of ending
+                    if (ts && ts->is_running()) {
+                        LOG_DEBUG("Live stream: no data available, waiting for next chunk...");
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        continue;  // Try reading again
+                    }
+                }
+
+                // For non-live streams or when download has stopped, this is end of stream
+                LOG_INFO("End of stream");
+                player_state_ = PlayerState::ENDED;
+                break;
             }
 
             current_played_frames_ += frames_decoded;

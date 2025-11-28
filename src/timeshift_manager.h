@@ -45,6 +45,7 @@ public:
     void pause_recording();
     void resume_recording();
     bool is_recording_paused() const { return pause_download_; }
+    bool is_running() const { return is_running_; }
 
     // Storage mode control (can be changed when stream is closed)
     void setStorageMode(StorageMode mode) { storage_mode_ = mode; }
