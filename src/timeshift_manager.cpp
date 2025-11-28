@@ -1418,10 +1418,15 @@ size_t TimeshiftManager::seek_to_time(uint32_t target_ms) {
                            : 0;
 
     // PROTECTION AGAINST CLEANUP: Prevent seeking to chunks that might be deleted
-    // Calculate the minimum safe time based on cleanup window (MAX_TS_WINDOW)
-    // Convert MAX_TS_WINDOW (bytes) to approximate time using current bitrate
-    uint32_t cleanup_window_ms = (uint32_t)((MAX_TS_WINDOW * 8.0f * 1000.0f) / (detected_bitrate_kbps_ * 1024.0f));
-    uint32_t safe_min_ms = first_chunk.start_time_ms + cleanup_window_ms;
+    // Calculate the minimum safe time based on cleanup window (bytes) only when we have more data than the cleanup window
+    uint32_t estimated_bitrate_kbps = (detected_bitrate_kbps_ > 0) ? detected_bitrate_kbps_ : DEFAULT_BITRATE_KBPS;
+    uint32_t cleanup_window_ms = (uint32_t)((MAX_TS_WINDOW * 8.0f * 1000.0f) / (estimated_bitrate_kbps * 1024.0f));
+    uint32_t safe_min_ms = first_chunk.start_time_ms;
+    size_t oldest_chunk_age_bytes = 0;
+    if (current_recording_offset_ > first_chunk.end_offset) {
+        oldest_chunk_age_bytes = current_recording_offset_ - first_chunk.end_offset;
+    }
+    bool cleanup_clamp_applicable = oldest_chunk_age_bytes >= MAX_TS_WINDOW;
 
     // Se il target è oltre il margine di sicurezza, clampalo
     bool clamped_for_safety = false;
@@ -1434,10 +1439,11 @@ size_t TimeshiftManager::seek_to_time(uint32_t target_ms) {
 
     // Se il target è troppo vicino all'inizio (rischio cleanup), clampalo
     bool clamped_for_cleanup = false;
-    if (target_ms < safe_min_ms) {
+    if (cleanup_clamp_applicable && target_ms < safe_min_ms + cleanup_window_ms) {
+        uint32_t clamped_value = safe_min_ms + cleanup_window_ms;
         LOG_WARN("Seek to %u ms is too close to cleanup window (starts at %u ms), clamping to safe position at %u ms (cleanup margin: %u ms)",
-                 target_ms, first_chunk.start_time_ms, safe_min_ms, cleanup_window_ms);
-        target_ms = safe_min_ms;
+                 target_ms, first_chunk.start_time_ms, clamped_value, cleanup_window_ms);
+        target_ms = clamped_value;
         clamped_for_cleanup = true;
     }
 
