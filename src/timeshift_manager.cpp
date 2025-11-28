@@ -135,7 +135,7 @@ bool TimeshiftManager::open(const char* uri) {
     rec_write_head_ = 0;
     bytes_in_current_chunk_ = 0;
     next_chunk_id_ = 0;
-    current_playback_chunk_id_ = INVALID_CHUNK_ID;
+    current_playback_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;
     playback_chunk_loaded_size_ = 0;
     pending_chunks_.clear();
     ready_chunks_.clear();
@@ -319,12 +319,12 @@ bool TimeshiftManager::seek(size_t position) {
 
     xSemaphoreTake(mutex_, portMAX_DELAY);
 
-    // Causa #8: Resettiamo lo stato di pre-caricamento dopo un seek.
-    last_preload_check_chunk_ = INVALID_CHUNK_ID;
+    // Reset preload state after seek
+    last_preload_check_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;
 
     // Verify that the offset is in a READY chunk
-    size_t chunk_id = find_chunk_for_offset(position);
-    if (chunk_id == INVALID_CHUNK_ID) {
+    uint32_t abs_chunk_id = find_chunk_for_offset(position);
+    if (abs_chunk_id == INVALID_CHUNK_ABS_ID) {
         xSemaphoreGive(mutex_);
         LOG_WARN("Seek to %u failed: offset not in ready chunks", (unsigned)position);
         return false;
@@ -334,7 +334,7 @@ bool TimeshiftManager::seek(size_t position) {
     current_read_offset_ = position;
 
     xSemaphoreGive(mutex_);
-    LOG_INFO("Seek to offset %u (chunk %u)", (unsigned)position, (unsigned)ready_chunks_[chunk_id].id);
+    LOG_INFO("Seek to offset %u (chunk abs ID %u)", (unsigned)position, abs_chunk_id);
     return true;
 }
 
@@ -399,7 +399,7 @@ void TimeshiftManager::preloader_task_trampoline(void* arg) {
 
 void TimeshiftManager::preloader_task_loop() {
     LOG_INFO("File preloader task started");
-    size_t last_playback_chunk_seen = INVALID_CHUNK_ID;
+    uint32_t last_playback_chunk_abs_id_seen = INVALID_CHUNK_ABS_ID;
     bool next_chunk_preloaded = false;
 
     while (is_running_) {
@@ -407,32 +407,37 @@ void TimeshiftManager::preloader_task_loop() {
 
         xSemaphoreTake(mutex_, portMAX_DELAY);
 
-        if (current_playback_chunk_id_ == INVALID_CHUNK_ID || ready_chunks_.empty()) {
+        if (current_playback_chunk_abs_id_ == INVALID_CHUNK_ABS_ID || ready_chunks_.empty()) {
             xSemaphoreGive(mutex_);
             continue;
         }
 
         // Rileva se siamo passati a un nuovo chunk
-        if (current_playback_chunk_id_ != last_playback_chunk_seen) {
-            last_playback_chunk_seen = current_playback_chunk_id_;
+        if (current_playback_chunk_abs_id_ != last_playback_chunk_abs_id_seen) {
+            last_playback_chunk_abs_id_seen = current_playback_chunk_abs_id_;
             next_chunk_preloaded = false; // Reset: il nuovo chunk successivo non è ancora stato precaricato
-            LOG_DEBUG("Preloader: switched to chunk %u, will preload %u when ready",
-                      (unsigned)current_playback_chunk_id_,
-                      (unsigned)(current_playback_chunk_id_ + 1));
+            LOG_DEBUG("Preloader: switched to chunk abs ID %u, will preload %u when ready",
+                      current_playback_chunk_abs_id_,
+                      current_playback_chunk_abs_id_ + 1);
         }
 
         // Se il chunk successivo non è ancora stato pre-caricato, controlla se è il momento giusto
         if (!next_chunk_preloaded) {
-            size_t next_chunk_id = current_playback_chunk_id_ + 1;
+            // Trova il chunk corrente nell'array
+            size_t current_idx = find_chunk_index_by_id(current_playback_chunk_abs_id_);
+            if (current_idx == INVALID_CHUNK_ID) {
+                xSemaphoreGive(mutex_);
+                continue; // Chunk corrente non trovato (rimosso?)
+            }
 
             // Verifica che il chunk successivo esista
-            if (next_chunk_id >= ready_chunks_.size()) {
+            if (current_idx + 1 >= ready_chunks_.size()) {
                 xSemaphoreGive(mutex_);
-                continue; // Chunk non ancora disponibile
+                continue; // Chunk successivo non ancora disponibile
             }
 
             // Calcola il progresso nel chunk corrente
-            const auto& current_chunk = ready_chunks_[current_playback_chunk_id_];
+            const auto& current_chunk = ready_chunks_[current_idx];
             size_t offset_in_chunk = current_read_offset_ - current_chunk.start_offset;
 
             // Protezione contro offset negativi (può capitare subito dopo uno switch)
@@ -445,8 +450,9 @@ void TimeshiftManager::preloader_task_loop() {
 
             // Trigger di pre-caricamento (al 50% del chunk corrente)
             if (progress >= 0.50f) {
-                if (preload_next_chunk(current_playback_chunk_id_)) {
-                    LOG_DEBUG("Preloader task loaded chunk %u", (unsigned)next_chunk_id);
+                uint32_t next_abs_id = current_playback_chunk_abs_id_ + 1;
+                if (preload_next_chunk(current_playback_chunk_abs_id_)) {
+                    LOG_DEBUG("Preloader task loaded chunk abs ID %u", next_abs_id);
                     next_chunk_preloaded = true;
                 }
             }
@@ -987,29 +993,29 @@ void TimeshiftManager::cleanup_old_chunks() {
 
     size_t removed_count = 0;
     size_t total_removed_bytes = 0;
-
-    // Causa #1: Tracciamo quanti chunk vengono rimossi per correggere l'indice di playback.
-    // Se non lo facessimo, l'indice punterebbe al chunk sbagliato dopo la pulizia.
-    size_t chunks_removed_count = 0;
+    bool playback_chunk_removed = false;
 
     while (!ready_chunks_.empty()) {
         const ChunkInfo& oldest = ready_chunks_.front();
         size_t age_bytes = current_recording_offset_ - oldest.end_offset;
         size_t age_mb = age_bytes / (1024 * 1024);
 
-        LOG_DEBUG("Checking oldest chunk %u: end_offset=%u MB, age=%u MB (%u bytes)",
+        LOG_DEBUG("Checking oldest chunk abs ID %u: end_offset=%u MB, age=%u MB (%u bytes)",
                   oldest.id,
                   (unsigned)(oldest.end_offset / (1024 * 1024)),
                   (unsigned)age_mb,
                   (unsigned)age_bytes);
 
         if (age_bytes > MAX_TS_WINDOW) {
-            // STRATEGY: Always delete old chunks to free space
-            // If playback is affected, we'll adjust it below
-            LOG_INFO("CLEANUP: Removing old chunk %u (age: %u MB > limit: %u MB)",
+            LOG_INFO("CLEANUP: Removing old chunk abs ID %u (age: %u MB > limit: %u MB)",
                      oldest.id,
                      (unsigned)age_mb,
                      (unsigned)(MAX_TS_WINDOW / (1024 * 1024)));
+
+            // Check if we're removing the currently playing chunk
+            if (current_playback_chunk_abs_id_ == oldest.id) {
+                playback_chunk_removed = true;
+            }
 
             if (storage_mode_ == StorageMode::SD_CARD) {
                 LOG_INFO("   File: %s, Size: %u KB",
@@ -1033,9 +1039,8 @@ void TimeshiftManager::cleanup_old_chunks() {
             }
 
             ready_chunks_.erase(ready_chunks_.begin());
-            chunks_removed_count++; // Incrementa il contatore dei chunk rimossi
         } else {
-            LOG_DEBUG("Oldest chunk %u is still within window (age: %u MB <= limit: %u MB), stopping cleanup",
+            LOG_DEBUG("Oldest chunk abs ID %u is still within window (age: %u MB <= limit: %u MB), stopping cleanup",
                       oldest.id,
                       (unsigned)age_mb,
                       (unsigned)(MAX_TS_WINDOW / (1024 * 1024)));
@@ -1043,30 +1048,15 @@ void TimeshiftManager::cleanup_old_chunks() {
         }
     }
 
-    // CRITICAL FIX: After cleanup, ensure playback state is valid
-    if (chunks_removed_count > 0) {
-        // Adjust chunk indices (they shifted left by chunks_removed_count)
-        if (current_playback_chunk_id_ != INVALID_CHUNK_ID) {
-            if (current_playback_chunk_id_ >= chunks_removed_count) {
-                current_playback_chunk_id_ -= chunks_removed_count;
-            } else {
-                // Playback chunk was deleted! Reset to first available
-                current_playback_chunk_id_ = 0;
-                LOG_WARN("CLEANUP: Playback chunk was deleted, resetting to chunk 0");
-            }
+    // NEW APPROACH: No more index adjustments! Just validate absolute IDs
+    if (removed_count > 0) {
+        if (playback_chunk_removed) {
+            LOG_WARN("CLEANUP: Current playback chunk was deleted");
+            current_playback_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;
+            last_preload_check_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;
         }
 
-        if (last_preload_check_chunk_ != INVALID_CHUNK_ID) {
-            if (last_preload_check_chunk_ >= chunks_removed_count) {
-                last_preload_check_chunk_ -= chunks_removed_count;
-            } else {
-                last_preload_check_chunk_ = INVALID_CHUNK_ID;
-            }
-        }
-
-        LOG_DEBUG("Adjusted playback chunk ID by -%u due to cleanup", (unsigned)chunks_removed_count);
-
-        // FORCE playback to jump to first available chunk if current position was deleted
+        // Validate that current read offset is still in valid range
         if (!ready_chunks_.empty()) {
             const ChunkInfo& first_chunk = ready_chunks_.front();
             const ChunkInfo& last_chunk = ready_chunks_.back();
@@ -1077,9 +1067,9 @@ void TimeshiftManager::cleanup_old_chunks() {
 
                 size_t old_offset = current_read_offset_;
                 current_read_offset_ = first_chunk.start_offset;
-                current_playback_chunk_id_ = 0;  // Force reload
+                current_playback_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;  // Force reload
 
-                LOG_WARN("CLEANUP: Playback jumped from offset %u to %u (live stream caught up, skipping to latest)",
+                LOG_WARN("CLEANUP: Playback jumped from offset %u to %u (live stream caught up)",
                          (unsigned)old_offset, (unsigned)current_read_offset_);
             }
         }
@@ -1097,17 +1087,37 @@ void TimeshiftManager::cleanup_old_chunks() {
     LOG_DEBUG("=== CLEANUP END ===");
 }
 
-bool TimeshiftManager::preload_next_chunk(size_t current_chunk_id) {
-    size_t next_chunk_id = current_chunk_id + 1;
+// ========== HELPER: Convert absolute chunk ID to array index ==========
+size_t TimeshiftManager::find_chunk_index_by_id(uint32_t abs_chunk_id) {
+    for (size_t i = 0; i < ready_chunks_.size(); i++) {
+        if (ready_chunks_[i].id == abs_chunk_id) {
+            return i;
+        }
+    }
+    return INVALID_CHUNK_ID;  // Not found
+}
+
+bool TimeshiftManager::preload_next_chunk(uint32_t current_abs_chunk_id) {
+    // Find next chunk by absolute ID (current + 1)
+    uint32_t next_abs_chunk_id = current_abs_chunk_id + 1;
+
+    // Find the next chunk in the array
+    size_t next_idx = INVALID_CHUNK_ID;
+    for (size_t i = 0; i < ready_chunks_.size(); i++) {
+        if (ready_chunks_[i].id == next_abs_chunk_id) {
+            next_idx = i;
+            break;
+        }
+    }
 
     // Il preloader task non attende, controlla solo se il chunk è disponibile
-    if (next_chunk_id >= ready_chunks_.size()) {
+    if (next_idx == INVALID_CHUNK_ID) {
         return false; // Non è ancora pronto, riproverà al prossimo ciclo
     }
 
-    const ChunkInfo& next_chunk = ready_chunks_[next_chunk_id];
+    const ChunkInfo& next_chunk = ready_chunks_[next_idx];
     if (next_chunk.state != ChunkState::READY) { // Controllo di sicurezza
-        LOG_WARN("Preload failed: chunk %u is not in READY state", (unsigned)next_chunk_id);
+        LOG_WARN("Preload failed: chunk abs ID %u is not in READY state", next_abs_chunk_id);
         return false;
     }
 
@@ -1131,66 +1141,66 @@ bool TimeshiftManager::preload_next_chunk(size_t current_chunk_id) {
     } else {
         // PSRAM mode: direct copy from PSRAM pool
         if (!next_chunk.psram_ptr) {
-            LOG_ERROR("Preload failed: null PSRAM pointer for chunk %u", next_chunk.id);
+            LOG_ERROR("Preload failed: null PSRAM pointer for chunk abs ID %u", next_abs_chunk_id);
             return false;
         }
         memcpy(playback_buffer_ + dynamic_chunk_size_, next_chunk.psram_ptr, next_chunk.length);
     }
 
-    LOG_DEBUG("Preloaded chunk %u (%u KB) at buffer offset %u",
-              next_chunk.id, next_chunk.length / 1024, (unsigned)dynamic_chunk_size_);
+    LOG_DEBUG("Preloaded chunk abs ID %u (%u KB) at buffer offset %u",
+              next_abs_chunk_id, next_chunk.length / 1024, (unsigned)dynamic_chunk_size_);
 
     return true;
 }
 
 // ========== PLAYBACK SIDE METHODS ==========
 
-size_t TimeshiftManager::find_chunk_for_offset(size_t offset) {
-    // --- RICERCA ROBUSTA ---
-    // Cerca il chunk che CONTIENE l'offset o il chunk SUCCESSIVO se l'offset
-    // si trova in un piccolo "buco" tra due chunk.
+uint32_t TimeshiftManager::find_chunk_for_offset(size_t offset) {
+    // Returns absolute chunk ID (NOT index) for the chunk containing the offset
     if (ready_chunks_.empty()) {
-        return INVALID_CHUNK_ID;
+        return INVALID_CHUNK_ABS_ID;
     }
 
     // Binary search per trovare il primo chunk il cui end_offset è > offset
     size_t low = 0, high = ready_chunks_.size();
-    size_t best_match = INVALID_CHUNK_ID;
+    size_t best_match_idx = INVALID_CHUNK_ID;
 
     while (low < high) {
         size_t mid = low + (high - low) / 2;
         if (ready_chunks_[mid].start_offset > offset) {
             high = mid;
         } else {
-            best_match = mid;
+            best_match_idx = mid;
             low = mid + 1;
         }
     }
 
-    if (best_match != INVALID_CHUNK_ID) {
-        const auto& chunk = ready_chunks_[best_match];
+    if (best_match_idx != INVALID_CHUNK_ID) {
+        const auto& chunk = ready_chunks_[best_match_idx];
         // Se l'offset è nel chunk o in un piccolo gap prima del successivo, è valido.
         // Il "gap" massimo tollerato è di 4KB, più che sufficiente.
-        if (offset <= chunk.end_offset || (best_match + 1 < ready_chunks_.size() && offset < ready_chunks_[best_match + 1].start_offset + 4096)) {
-            return best_match;
+        if (offset <= chunk.end_offset || (best_match_idx + 1 < ready_chunks_.size() && offset < ready_chunks_[best_match_idx + 1].start_offset + 4096)) {
+            return chunk.id;  // Return absolute ID, not index!
         }
     }
 
     // Se arriviamo qui, l'offset è veramente fuori range. Logghiamo per debug.
     LOG_ERROR("STUTTER DETECTED: No chunk found for offset %u. Last chunk ends at %u.",
               (unsigned)offset, (unsigned)ready_chunks_.back().end_offset);
-    return INVALID_CHUNK_ID;
+    return INVALID_CHUNK_ABS_ID;
 }
 
-bool TimeshiftManager::load_chunk_to_playback(size_t chunk_id) {
-    if (chunk_id >= ready_chunks_.size()) {
-        LOG_ERROR("Invalid chunk ID: %u (max: %u)", chunk_id, ready_chunks_.size());
+bool TimeshiftManager::load_chunk_to_playback(uint32_t abs_chunk_id) {
+    // Find chunk by absolute ID
+    size_t chunk_idx = find_chunk_index_by_id(abs_chunk_id);
+    if (chunk_idx == INVALID_CHUNK_ID) {
+        LOG_ERROR("Invalid chunk absolute ID: %u (not found in ready_chunks_)", abs_chunk_id);
         return false;
     }
 
-    const ChunkInfo& chunk = ready_chunks_[chunk_id];
+    const ChunkInfo& chunk = ready_chunks_[chunk_idx];
     if (chunk.state != ChunkState::READY) {
-        LOG_ERROR("Chunk %u is not READY (state: %d)", chunk.id, (int)chunk.state);
+        LOG_ERROR("Chunk abs ID %u is not READY (state: %d)", abs_chunk_id, (int)chunk.state);
         return false;
     }
 
@@ -1214,14 +1224,14 @@ bool TimeshiftManager::load_chunk_to_playback(size_t chunk_id) {
     } else {
         // PSRAM mode: direct copy from PSRAM pool
         if (!chunk.psram_ptr) {
-            LOG_ERROR("Failed to load chunk %u: null PSRAM pointer", chunk.id);
+            LOG_ERROR("Failed to load chunk abs ID %u: null PSRAM pointer", abs_chunk_id);
             return false;
         }
         memcpy(playback_buffer_, chunk.psram_ptr, chunk.length);
     }
 
-    // Update playback state
-    current_playback_chunk_id_ = chunk_id;
+    // Update playback state with ABSOLUTE ID
+    current_playback_chunk_abs_id_ = abs_chunk_id;
     playback_chunk_loaded_size_ = chunk.length;
 
     // Log with temporal info for better user understanding
@@ -1231,17 +1241,17 @@ bool TimeshiftManager::load_chunk_to_playback(size_t chunk_id) {
     uint32_t end_min = end_ms / 60000;
     uint32_t end_sec = (end_ms / 1000) % 60;
 
-    LOG_INFO("→ Loaded chunk %u (%u KB) [%02u:%02u - %02u:%02u]",
-             chunk.id, chunk.length / 1024,
+    LOG_INFO("→ Loaded chunk abs ID %u (%u KB) [%02u:%02u - %02u:%02u]",
+             abs_chunk_id, chunk.length / 1024,
              start_min, start_sec, end_min, end_sec);
 
     return true;
 }
 
 size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, size_t size) {
-    // Find chunk containing this offset
-    size_t chunk_id = find_chunk_for_offset(offset);
-    if (chunk_id == INVALID_CHUNK_ID) {
+    // Find chunk containing this offset (returns ABSOLUTE chunk ID)
+    uint32_t abs_chunk_id = find_chunk_for_offset(offset);
+    if (abs_chunk_id == INVALID_CHUNK_ABS_ID) {
         // For LIVE timeshift: if we're beyond available chunks but download is still running,
         // WAIT for new chunks instead of returning 0 (which signals EOF to audio player)
         if (is_running_ && !ready_chunks_.empty()) {
@@ -1261,8 +1271,8 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
 
                     // Check if new chunk arrived
                     if (ready_chunks_.size() > initial_chunk_count) {
-                        chunk_id = find_chunk_for_offset(offset);
-                        if (chunk_id != INVALID_CHUNK_ID) {
+                        abs_chunk_id = find_chunk_for_offset(offset);
+                        if (abs_chunk_id != INVALID_CHUNK_ABS_ID) {
                             LOG_INFO("New chunk arrived, resuming playback");
                             break;
                         }
@@ -1270,7 +1280,7 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
                 }
 
                 // If still not found after waiting, it's a real problem
-                if (chunk_id == INVALID_CHUNK_ID) {
+                if (abs_chunk_id == INVALID_CHUNK_ABS_ID) {
                     LOG_WARN("No chunk found for offset %u after waiting", (unsigned)offset);
                     return 0;
                 }
@@ -1284,29 +1294,31 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
         }
     }
 
-    // Se il chunk richiesto è quello successivo, esegui lo switch "seamless"
-    if (chunk_id > current_playback_chunk_id_) {
-        // Causa #2: Usiamo la dimensione reale del chunk pre-caricato per memmove.
-        const ChunkInfo& preloaded_chunk_info = ready_chunks_[chunk_id];
+    // Get chunk index for accessing chunk info
+    size_t chunk_idx = find_chunk_index_by_id(abs_chunk_id);
+    if (chunk_idx == INVALID_CHUNK_ID) {
+        LOG_ERROR("CRITICAL: Found abs chunk ID %u but can't find it in array!", abs_chunk_id);
+        return 0;
+    }
+
+    // Se il chunk richiesto è quello successivo (abs ID = current + 1), esegui lo switch "seamless"
+    if (current_playback_chunk_abs_id_ != INVALID_CHUNK_ABS_ID &&
+        abs_chunk_id == current_playback_chunk_abs_id_ + 1) {
+
+        // Seamless switch: il chunk è già stato pre-caricato
+        const ChunkInfo& preloaded_chunk_info = ready_chunks_[chunk_idx];
         size_t preloaded_size = preloaded_chunk_info.length;
         // Sposta il chunk pre-caricato (che si trova nella seconda metà del buffer) all'inizio.
         memmove(playback_buffer_, playback_buffer_ + dynamic_chunk_size_, preloaded_size);
 
-        current_playback_chunk_id_ = chunk_id;
-        playback_chunk_loaded_size_ = ready_chunks_[chunk_id].length;
-        last_preload_check_chunk_ = INVALID_CHUNK_ID; // Resetta il tracking per il nuovo chunk
-        LOG_DEBUG("Switching to preloaded chunk %u (seamless)", (unsigned)chunk_id);
+        current_playback_chunk_abs_id_ = abs_chunk_id;
+        playback_chunk_loaded_size_ = preloaded_size;
+        last_preload_check_chunk_abs_id_ = INVALID_CHUNK_ABS_ID; // Resetta il tracking per il nuovo chunk
+        LOG_DEBUG("Switching to preloaded chunk abs ID %u (seamless)", abs_chunk_id);
 
-        // Triggera immediatamente il preload del prossimo chunk
-        // (il preloader task lo caricherà non appena arriveremo al 50% di questo chunk)
-        if (chunk_id + 1 < ready_chunks_.size()) {
-            // Potremmo anche triggerare un preload immediato qui se vogliamo essere più aggressivi
-            // Per ora lasciamo che il preloader task lo gestisca al 50% del chunk corrente
-        }
-
-    } else if (current_playback_chunk_id_ != chunk_id) {
+    } else if (current_playback_chunk_abs_id_ != abs_chunk_id) {
         // Seek o situazione anomala: carica il chunk richiesto da SD (potrebbe causare stutter)
-        LOG_WARN("Chunk %u not preloaded, loading now (may cause stutter)", (unsigned)chunk_id);
+        LOG_WARN("Chunk abs ID %u not preloaded, loading now (may cause stutter)", abs_chunk_id);
 
         // Attiva la pausa automatica per buffering se il callback è registrato
         if (auto_pause_callback_ && !is_auto_paused_) {
@@ -1315,8 +1327,8 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
             auto_pause_callback_(true);  // true = pause
         }
 
-        if (!load_chunk_to_playback(chunk_id)) {
-            LOG_ERROR("Failed to load chunk %u for playback", (unsigned)chunk_id);
+        if (!load_chunk_to_playback(abs_chunk_id)) {
+            LOG_ERROR("Failed to load chunk abs ID %u for playback", abs_chunk_id);
             return 0;
         }
 
@@ -1343,7 +1355,7 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
                 if (auto_pause_min_chunks_ > 0) {
                     const uint32_t MAX_WAIT_MS = 3000;  // Massimo 3 secondi di attesa aggiuntiva
                     uint32_t start_wait = millis();
-                    size_t target_chunks = chunk_id + auto_pause_min_chunks_;
+                    size_t target_chunks = ready_chunks_.size() + auto_pause_min_chunks_;
 
                     while (ready_chunks_.size() < target_chunks && (millis() - start_wait) < MAX_WAIT_MS) {
                         xSemaphoreGive(mutex_);
@@ -1364,7 +1376,7 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
     }
 
     // Calculate offset relative to chunk
-    const ChunkInfo& chunk = ready_chunks_[chunk_id];
+    const ChunkInfo& chunk = ready_chunks_[chunk_idx];
     size_t chunk_offset = offset - chunk.start_offset;
     size_t available = playback_chunk_loaded_size_ - chunk_offset;
     size_t to_read = std::min(size, available);
@@ -1405,6 +1417,12 @@ size_t TimeshiftManager::seek_to_time(uint32_t target_ms) {
                            ? (total_duration_ms - SAFETY_MARGIN_MS)
                            : 0;
 
+    // PROTECTION AGAINST CLEANUP: Prevent seeking to chunks that might be deleted
+    // Calculate the minimum safe time based on cleanup window (MAX_TS_WINDOW)
+    // Convert MAX_TS_WINDOW (bytes) to approximate time using current bitrate
+    uint32_t cleanup_window_ms = (uint32_t)((MAX_TS_WINDOW * 8.0f * 1000.0f) / (detected_bitrate_kbps_ * 1024.0f));
+    uint32_t safe_min_ms = first_chunk.start_time_ms + cleanup_window_ms;
+
     // Se il target è oltre il margine di sicurezza, clampalo
     bool clamped_for_safety = false;
     if (target_ms > safe_max_ms) {
@@ -1412,6 +1430,15 @@ size_t TimeshiftManager::seek_to_time(uint32_t target_ms) {
                  target_ms, total_duration_ms, safe_max_ms, SAFETY_MARGIN_MS, (unsigned)auto_pause_min_chunks_);
         target_ms = safe_max_ms;
         clamped_for_safety = true;
+    }
+
+    // Se il target è troppo vicino all'inizio (rischio cleanup), clampalo
+    bool clamped_for_cleanup = false;
+    if (target_ms < safe_min_ms) {
+        LOG_WARN("Seek to %u ms is too close to cleanup window (starts at %u ms), clamping to safe position at %u ms (cleanup margin: %u ms)",
+                 target_ms, first_chunk.start_time_ms, safe_min_ms, cleanup_window_ms);
+        target_ms = safe_min_ms;
+        clamped_for_cleanup = true;
     }
 
     // If target is BEFORE available time, seek to BEGINNING
@@ -1441,9 +1468,13 @@ size_t TimeshiftManager::seek_to_time(uint32_t target_ms) {
 
             xSemaphoreGive(mutex_);
 
+            std::string clamp_reason = "";
+            if (clamped_for_safety) clamp_reason += " [SAFE POSITION - buffering margin]";
+            if (clamped_for_cleanup) clamp_reason += " [SAFE POSITION - cleanup protection]";
+
             LOG_INFO("Seek to %u ms → chunk %u, byte offset %u (progress %.2f%%)%s",
                      target_ms, chunk.id, (unsigned)global_offset, progress * 100.0f,
-                     clamped_for_safety ? " [SAFE POSITION - buffering margin]" : "");
+                     clamp_reason.c_str());
 
             return global_offset;
         }

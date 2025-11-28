@@ -69,6 +69,7 @@ public:
 private:
     // ADAPTIVE BUFFER SIZING - all values computed dynamically based on detected bitrate
     static const size_t INVALID_CHUNK_ID = SIZE_MAX;
+    static const uint32_t INVALID_CHUNK_ABS_ID = UINT32_MAX;
 
     // Bitrate detection and adaptive sizing
     uint32_t detected_bitrate_kbps_ = 0;        // Auto-detected stream bitrate
@@ -115,9 +116,9 @@ private:
 
     // PLAYBACK BUFFER (Read-Only by read() method)
     uint8_t* playback_buffer_ = nullptr;
-    size_t current_playback_chunk_id_ = INVALID_CHUNK_ID;  // Currently loaded chunk
+    uint32_t current_playback_chunk_abs_id_ = UINT32_MAX;  // Absolute chunk ID (NOT index)
     size_t playback_chunk_loaded_size_ = 0;                // Size of loaded chunk
-    size_t last_preload_check_chunk_ = INVALID_CHUNK_ID;   // Per evitare controlli di preload ripetuti
+    uint32_t last_preload_check_chunk_abs_id_ = UINT32_MAX;   // Per evitare controlli di preload ripetuti
     
     // Global stream state
     std::string uri_;
@@ -175,10 +176,11 @@ private:
                                    uint32_t& out_duration_ms);  // Calcola durata chunk
 
     // PLAYBACK SIDE (private helpers)
-    size_t find_chunk_for_offset(size_t offset);    // Find chunk ID containing offset
-    bool load_chunk_to_playback(size_t chunk_id);   // Load chunk into playback_buffer_
-    bool preload_next_chunk(size_t current_chunk_id);
+    uint32_t find_chunk_for_offset(size_t offset);    // Find absolute chunk ID containing offset
+    bool load_chunk_to_playback(uint32_t abs_chunk_id);   // Load chunk into playback_buffer_
+    bool preload_next_chunk(uint32_t current_abs_chunk_id);
     size_t read_from_playback_buffer(size_t offset, void* buffer, size_t size);
+    size_t find_chunk_index_by_id(uint32_t abs_chunk_id);  // Convert abs ID to array index
 
     // CLEANUP
     void cleanup_old_chunks();                      // Remove old chunks beyond window
