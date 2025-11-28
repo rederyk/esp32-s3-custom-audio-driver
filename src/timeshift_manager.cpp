@@ -86,6 +86,10 @@ void TimeshiftManager::apply_bitrate_measurement(uint32_t measured_kbps) {
         return;
     }
 
+    if (bitrate_adapted_once_) {
+        return;  // Header detection already set the sizing, do not override mid-stream
+    }
+
     bitrate_history_.push_back(measured_kbps);
     while (bitrate_history_.size() > BITRATE_HISTORY_SIZE) {
         bitrate_history_.pop_front();
@@ -803,10 +807,11 @@ bool TimeshiftManager::calculate_chunk_duration(const ChunkInfo& chunk,
 {
     uint8_t header[4];
     uint32_t total_samples = 0;
-    uint32_t sample_rate = 44100;  // Default, will be updated from first frame
-    size_t data_pos = 0;  // Current position in chunk data
+    size_t data_pos = 0;
+    bool header_detected = false;
+    uint32_t detected_sample_rate = 0;
+    uint32_t detected_bitrate_kbps = 0;
 
-    // Helper lambda to read data from either SD or PSRAM
     auto read_bytes = [&](uint8_t* buffer, size_t len) -> size_t {
         if (storage_mode_ == StorageMode::PSRAM_ONLY) {
             if (data_pos + len > chunk.length) {
@@ -817,7 +822,7 @@ bool TimeshiftManager::calculate_chunk_duration(const ChunkInfo& chunk,
             data_pos += len;
             return len;
         }
-        return 0; // Will be handled by file read in SD mode
+        return 0;
     };
 
     File file;
@@ -828,14 +833,12 @@ bool TimeshiftManager::calculate_chunk_duration(const ChunkInfo& chunk,
             return false;
         }
     } else {
-        // PSRAM mode: use psram_ptr
         if (!chunk.psram_ptr) {
             LOG_ERROR("Cannot calculate duration: null PSRAM pointer");
             return false;
         }
     }
 
-    // Scan all MP3 frames in the chunk
     while (true) {
         size_t bytes_read;
         if (storage_mode_ == StorageMode::SD_CARD) {
@@ -847,77 +850,77 @@ bool TimeshiftManager::calculate_chunk_duration(const ChunkInfo& chunk,
 
         if (bytes_read != 4) break;
 
-        // Check sync word (0xFFE or 0xFFF at start)
         if ((header[0] != 0xFF) || ((header[1] & 0xE0) != 0xE0)) {
-            continue;  // Not a frame header, advance by 1 byte and retry
+            continue;
         }
 
-        // Parse MP3 frame header
         uint8_t b1 = header[1];
         uint8_t b2 = header[2];
 
-        int version_id = (b1 >> 3) & 0x03;      // MPEG version
-        int layer_idx = (b1 >> 1) & 0x03;       // Layer
-        int bitrate_idx = (b2 >> 4) & 0x0F;     // Bitrate index
-        int sr_idx = (b2 >> 2) & 0x03;          // Sample rate index
-        int padding = (b2 >> 1) & 0x01;         // Padding bit
+        int version_id = (b1 >> 3) & 0x03;
+        int layer_idx = (b1 >> 1) & 0x03;
+        int bitrate_idx = (b2 >> 4) & 0x0F;
+        int sr_idx = (b2 >> 2) & 0x03;
+        int padding = (b2 >> 1) & 0x01;
 
-        // Validate header fields
         if (layer_idx == 0 || bitrate_idx == 0x0F || sr_idx == 0x03) {
-            continue;  // Invalid header, skip
+            continue;
         }
 
-        // Bitrate tables (kbps)
         static const uint16_t bitrate_table[2][16] = {
-            {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0},  // MPEG1
-            {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0}       // MPEG2/2.5
+            {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0},
+            {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0}
         };
 
-        // Sample rate tables
         static const uint32_t sr_table[3][3] = {
-            {44100, 48000, 32000},  // MPEG1
-            {22050, 24000, 16000},  // MPEG2
-            {11025, 12000, 8000}    // MPEG2.5
+            {44100, 48000, 32000},
+            {22050, 24000, 16000},
+            {11025, 12000, 8000}
         };
 
-        int version_row = (version_id == 0x03) ? 0 : 1;  // MPEG1 vs MPEG2/2.5
+        int version_row = (version_id == 0x03) ? 0 : 1;
         uint32_t bitrate_kbps = bitrate_table[version_row][bitrate_idx];
 
         int sr_row = (version_id == 0x03) ? 0 : (version_id == 0x02) ? 1 : 2;
-        sample_rate = sr_table[sr_row][sr_idx];
+        uint32_t sample_rate = sr_table[sr_row][sr_idx];
 
         if (bitrate_kbps == 0 || sample_rate == 0) {
-            continue;  // Invalid values, skip
+            continue;
         }
 
-        // Calculate frame size: FrameSize = 144 * BitRate / SampleRate + Padding
         int frame_size = (144 * bitrate_kbps * 1000) / sample_rate + padding;
-
-        if (frame_size <= 0 || frame_size > 4096) {
-            continue;  // Unreasonable frame size, skip
+        if (frame_size <= 4 || frame_size > 4096) {
+            continue;
         }
 
-        // Each MP3 frame contains 1152 samples per channel (Layer 3)
         uint32_t samples_per_frame = 1152;
-        if (layer_idx == 3) samples_per_frame = 384;      // Layer 1
-        else if (layer_idx == 2) samples_per_frame = 1152; // Layer 2
-        else samples_per_frame = ((version_id == 0x03) ? 1152 : 576); // Layer 3
+        if (layer_idx == 3) {
+            samples_per_frame = 384;
+        } else if (layer_idx == 2) {
+            samples_per_frame = 1152;
+        } else {
+            samples_per_frame = ((version_id == 0x03) ? 1152 : 576);
+        }
+
+        if (!header_detected) {
+            header_detected = true;
+            detected_sample_rate = sample_rate;
+            detected_bitrate_kbps = bitrate_kbps;
+        }
 
         total_samples += samples_per_frame;
 
-        // Skip to next frame
         if (storage_mode_ == StorageMode::SD_CARD) {
             size_t current_pos = file.position();
             if (current_pos + frame_size - 4 <= file.size()) {
                 file.seek(current_pos + frame_size - 4);
             } else {
-                break;  // Would go beyond file end
+                break;
             }
         } else {
-            // PSRAM mode: advance data_pos
             size_t skip_bytes = frame_size - 4;
             if (data_pos + skip_bytes > chunk.length) {
-                break;  // Would go beyond chunk end
+                break;
             }
             data_pos += skip_bytes;
         }
@@ -927,26 +930,18 @@ bool TimeshiftManager::calculate_chunk_duration(const ChunkInfo& chunk,
         file.close();
     }
 
-    if (total_samples == 0) {
+    if (!header_detected || total_samples == 0) {
         LOG_WARN("Chunk %u: no valid MP3 frames found", chunk.id);
         return false;
     }
 
-    // Calculate duration in milliseconds
     out_frames = total_samples;
-    out_duration_ms = (total_samples * 1000) / sample_rate;
-    
-    // Extract bitrate from first valid MP3 frame (already parsed above)
-    // The bitrate_kbps was calculated in the frame parsing loop
-    // For now, estimate from chunk size and duration
-    if (out_duration_ms > 0) {
-        out_bitrate_kbps = (chunk.length * 8) / (out_duration_ms / 1000);
-    } else {
-        out_bitrate_kbps = 128;  // Default fallback
-    }
+    uint32_t rate_for_duration = detected_sample_rate ? detected_sample_rate : 44100;
+    out_duration_ms = (total_samples * 1000) / rate_for_duration;
+    out_bitrate_kbps = detected_bitrate_kbps;
 
-    LOG_DEBUG("Chunk %u: %u samples, %u ms @ %u Hz, bitrate ~%u kbps",
-              chunk.id, out_frames, out_duration_ms, sample_rate, out_bitrate_kbps);
+    LOG_DEBUG("Chunk %u: %u samples, %u ms @ %u Hz, bitrate %u kbps",
+              chunk.id, out_frames, out_duration_ms, rate_for_duration, out_bitrate_kbps);
 
     return true;
 }
