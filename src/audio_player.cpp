@@ -608,8 +608,14 @@ void AudioPlayer::audio_task() {
                 vTaskDelay(pdMS_TO_TICKS(20));
                 update_memory_min();
             }
+        if (pause_flag_) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            update_memory_min();
+            continue; // Salta il resto del loop e ricontrolla le flag
+        }
 
             if (stop_requested_) break;
+        if (stop_requested_) break;
 
             // SEEK handling - ORA FUNZIONA ANCHE IN PAUSA!
             if (seek_seconds_ >= 0) {
@@ -660,9 +666,6 @@ void AudioPlayer::audio_task() {
                 } else {
                     // Use standard frame-based seek for other sources
                     seek_success = stream_->seek(target_frame);
-                    if (seek_success) {
-                        current_played_frames_ = target_frame;
-                    }
                 }
 
                 uint32_t after_decoder_seek_ms = millis();
@@ -675,6 +678,10 @@ void AudioPlayer::audio_task() {
 
                     LOG_INFO("=== SEEK COMPLETED: Total %u ms (I2S clear: %u ms, Decoder seek: %u ms) ===",
                              total_time, i2s_clear_time, decoder_time);
+                    
+                    // CRITICAL FIX: Always update the frame counter after a successful seek
+                    // to prevent state desynchronization.
+                    current_played_frames_ = target_frame;
                 } else {
                     LOG_WARN("Native seek failed, falling back to brute force");
                     uint32_t brute_start_ms = millis();
@@ -695,6 +702,11 @@ void AudioPlayer::audio_task() {
 
             update_memory_min();
 
+            // Se un seek è stato appena eseguito, salta direttamente alla prossima iterazione
+            // per leggere i dati dalla nuova posizione, invece di entrare nel blocco 'no data'.
+         //   if (seek_seconds_ == -1 && stream_->read_ptr_updated_by_seek()) {
+         //       // non fare nulla, il seek è stato gestito, continua al prossimo read
+         //   }
             // DECODE: DataSource → PCM
             size_t frames_decoded = stream_->read(pcm_buffer, pcm_buffer_size_frames);
 
@@ -714,6 +726,14 @@ void AudioPlayer::audio_task() {
                         LOG_DEBUG("Live stream: no data available, waiting for next chunk...");
                         vTaskDelay(pdMS_TO_TICKS(3000));
                         continue;  // Try reading again
+                        // Use a shorter, more responsive delay to avoid getting stuck.
+                        // This allows the task to yield and quickly re-check for data,
+                        // making it more resilient to temporary buffer underruns in live streams.
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                        continue; // Re-enter the loop to try reading again
+                    } else if (ts) {
+                        LOG_INFO("Live stream download has stopped. Ending playback.");
+                        // If the timeshift is no longer running, it's the end of the stream.
                     }
                 }
 
