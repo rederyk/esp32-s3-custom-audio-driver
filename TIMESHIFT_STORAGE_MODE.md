@@ -23,7 +23,7 @@ Il `TimeshiftManager` supporta due modalità di storage:
   - Ideale per streaming continuo senza SD
 
 - **Svantaggi:**
-  - Usa 2MB di PSRAM (16 chunks x 128KB)
+  - Usa PSRAM adattivo basato su bitrate (chunk da 16KB-512KB)
   - Timeshift window limitato a ~2MB (circa 2 minuti @ 128kbps)
   - I chunk più vecchi vengono sovrascritti automaticamente (buffer circolare)
 

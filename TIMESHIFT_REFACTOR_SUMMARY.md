@@ -131,7 +131,7 @@ std::vector<ChunkInfo> ready_chunks_;    // READY per playback
 
 **`download_task_loop()`**:
 - Scrive in `recording_buffer_` circolare
-- Quando `bytes_in_current_chunk_ >= CHUNK_SIZE` → chiama `flush_recording_chunk()`
+- Quando `bytes_in_current_chunk_ >= dynamic_min_flush_size_` → chiama `flush_recording_chunk()`
 - Supporta pausa via `pause_download_` flag
 
 **`flush_recording_chunk()`**:

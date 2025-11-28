@@ -35,8 +35,16 @@ std::unique_ptr<IAudioDecoder> AudioDecoderFactory::create_from_source(IDataSour
 
     AudioFormat format = AudioFormat::UNKNOWN;
 
-    // 1. Prova rilevamento da estensione
+    // Diagnostic buffer for logging
+    uint8_t diagnostic_buffer[32];
+    size_t diagnostic_read = 0;
+    size_t source_size = 0;
+
+    // Capture source details
     const char* uri = source->uri();
+    source_size = source->size();
+
+    // 1. Try detection from extension
     if (uri) {
         format = detect_from_extension(uri);
         if (format != AudioFormat::UNKNOWN) {
@@ -45,18 +53,47 @@ std::unique_ptr<IAudioDecoder> AudioDecoderFactory::create_from_source(IDataSour
         }
     }
 
-    // 2. Se estensione non disponibile o sconosciuta, prova magic bytes
+    // 2. If extension detection fails, try magic bytes
     if (format == AudioFormat::UNKNOWN) {
+        // Capture diagnostic information
+        size_t original_pos = source->tell();
+        source->seek(0);
+        diagnostic_read = source->read(diagnostic_buffer, sizeof(diagnostic_buffer));
+        source->seek(original_pos);
+
         format = detect_from_content(source);
         if (format != AudioFormat::UNKNOWN) {
-            LOG_INFO("AudioDecoderFactory: Detected format %s from content",
+            LOG_INFO("AudioDecoderFactory: Detected format %s from content", 
                      audio_format_to_string(format));
+        } else {
+            // Enhanced diagnostic logging for unrecognized streams
+            LOG_ERROR("AudioDecoderFactory: Format detection FAILED");
+            LOG_DEBUG("Stream Diagnostic Information:");
+            LOG_DEBUG(" URI: %s", uri ? uri : "UNKNOWN");
+            LOG_DEBUG(" Total Stream Size: %u bytes", (unsigned)source_size);
+            LOG_DEBUG(" First %u bytes:", (unsigned)diagnostic_read);
+            
+            // Hex dump of first bytes
+            char hex_dump[128] = {0};
+            char* hex_ptr = hex_dump;
+            for (size_t i = 0; i < diagnostic_read; ++i) {
+                hex_ptr += sprintf(hex_ptr, "%02X ", diagnostic_buffer[i]);
+            }
+            LOG_DEBUG(" Hex: %s", hex_dump);
+
+            // Printable ASCII representation
+            char ascii_dump[33] = {0};
+            for (size_t i = 0; i < diagnostic_read; ++i) {
+                ascii_dump[i] = (diagnostic_buffer[i] >= 32 && diagnostic_buffer[i] <= 126) 
+                    ? diagnostic_buffer[i] : '.';
+            }
+            LOG_DEBUG(" ASCII: %s", ascii_dump);
         }
     }
 
-    // 3. Crea decoder appropriato
+    // 3. Create appropriate decoder
     if (format == AudioFormat::UNKNOWN) {
-        LOG_ERROR("AudioDecoderFactory: Unable to detect audio format");
+        LOG_ERROR("AudioDecoderFactory: Definitive failure - Unable to detect audio format");
         return nullptr;
     }
 
@@ -122,7 +159,7 @@ AudioFormat AudioDecoderFactory::detect_from_content(IDataSource* source) {
     size_t original_pos = source->tell();
 
     // Leggi primi bytes per magic number
-    uint8_t magic[12];
+    uint8_t magic[16];  // Increased buffer for more robust detection
     source->seek(0);
     size_t read = source->read(magic, sizeof(magic));
 
@@ -133,14 +170,37 @@ AudioFormat AudioDecoderFactory::detect_from_content(IDataSource* source) {
         return AudioFormat::UNKNOWN;
     }
 
-    // Controlla magic bytes
-    // MP3: ID3v2 header o MPEG frame sync
+    // Enhanced MP3 Detection
+    // 1. ID3v2 Header
     if (read >= 3 && memcmp(magic, "ID3", 3) == 0) {
         return AudioFormat::MP3;
     }
-    if (read >= 2 && magic[0] == 0xFF && (magic[1] & 0xE0) == 0xE0) {
-        // MPEG frame sync (11 bit a 1)
-        return AudioFormat::MP3;
+
+    // 2. Advanced MPEG Frame Sync Detection
+    if (read >= 4 && magic[0] == 0xFF && (magic[1] & 0xE0) == 0xE0) {
+        // More robust MPEG frame header check
+        // Bits: 11 sync, 2 version, 2 layer, 1 protection
+        uint8_t version = (magic[1] >> 3) & 0x03;
+        uint8_t layer = (magic[1] >> 1) & 0x03;
+        
+        // Check for valid MPEG Audio Layer III (MP3)
+        if (version != 0x01 && layer == 0x01) {
+            return AudioFormat::MP3;
+        }
+    }
+
+    // 3. Additional MP3 Sync Pattern Check
+    if (read >= 16) {
+        // Look for multiple consecutive sync patterns
+        int sync_count = 0;
+        for (int i = 0; i < 12; i++) {
+            if (magic[i] == 0xFF && (magic[i+1] & 0xE0) == 0xE0) {
+                sync_count++;
+            }
+        }
+        if (sync_count >= 3) {
+            return AudioFormat::MP3;
+        }
     }
 
     // WAV: RIFF header

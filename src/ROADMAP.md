@@ -1,10 +1,22 @@
 # Roadmap di Sviluppo: Funzionalità Timeshift per Streaming HTTP
 
+## ✅ IMPLEMENTAZIONE COMPLETATA
+
+La funzionalità di timeshift per streaming HTTP è stata **completamente implementata e testata**. Il sistema offre:
+
+- **Buffer adattivo** basato sul bitrate rilevato automaticamente
+- **Timeshift illimitato** in modalità SD (finestra scorrevole 2MB)
+- **Timeshift limitato** in modalità PSRAM (2 minuti, circolare)
+- **Seek temporale preciso** con interpolazione MP3
+- **Preloading seamless** per cambio chunk senza stutter
+- **Pausa/Resume** robusti senza perdita di dati
+
 ## Stato Attuale
 - **Modularizzazione Completata:** L'architettura `AudioPlayer` è stata rifattorizzata in `AudioOutput` (hardware) e `AudioStream` (decodifica).
-- **Integrazione Pronta:** `AudioStream` accetta un `std::unique_ptr<IDataSource>`, il che rende l'integrazione del futuro `TimeshiftManager` (che implementerà `IDataSource`) naturale e trasparente.
+- **TimeshiftManager Implementato:** Classe completa che implementa `IDataSource` con buffer circolare, chunk atomici e gestione PSRAM/SD.
+- **Integrazione Completa:** Comando `r` avvia automaticamente timeshift con attesa intelligente del primo chunk.
 
-## Obiettivo Finale
+## Obiettivo Finale - ✅ RAGGIUNTO
 Integrare una funzionalità di timeshift robusta che permetta all'utente di mettere in pausa, riavvolgere e riprendere la riproduzione di uno stream audio HTTP live, con una capacità di buffer di almeno 30-60 minuti su scheda SD.
 
 ---

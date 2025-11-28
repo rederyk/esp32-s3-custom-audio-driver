@@ -8,7 +8,7 @@ Il **TimeshiftManager** è un sistema di buffering audio intelligente che permet
 - Mantenere una finestra temporale di ~2 minuti (2MB) in modalità PSRAM o illimitata in modalità SD
 - Gestire automaticamente la memoria con cleanup dei chunk vecchi
 
-**Architettura:** Double buffering con separazione completa tra recording path e playback path.
+**Architettura:** Double buffering con separazione completa tra recording path e playback path. Buffer adattivi basati sul bitrate rilevato automaticamente dallo stream.
 
 ---
 
@@ -22,9 +22,9 @@ Il **TimeshiftManager** è un sistema di buffering audio intelligente che permet
 │  ┌────────────────────────────────────────────────────────────────┐     │
 │  │              RECORDING PATH (download_task)                     │     │
 │  │                                                                  │     │
-│  │  HTTP Stream → recording_buffer_ [128KB circular buffer]        │     │
+│  │  HTTP Stream → recording_buffer_ [adaptive circular buffer]     │     │
 │  │       │                                                          │     │
-│  │       │ Accumula fino a ~124KB (BUFFER_SIZE - 4KB)              │     │
+│  │       │ Accumula fino a dynamic_min_flush_size_ (80% chunk)     │     │
 │  │       │                                                          │     │
 │  │       v                                                          │     │
 │  │  flush_recording_chunk()                                         │     │
@@ -59,8 +59,8 @@ Il **TimeshiftManager** è un sistema di buffering audio intelligente che permet
 │  │              └─→ memcpy() → decoder                             │     │
 │  │                                                                  │     │
 │  │  Preloader Task (background):                                   │     │
-│  │    - Pre-carica chunk N+1 quando playback è al 60% di chunk N   │     │
-│  │    - Posiziona in playback_buffer_ + CHUNK_SIZE (seconda metà)  │     │
+│  │    - Pre-carica chunk N+1 quando playback è al 50% di chunk N   │     │
+│  │    - Posiziona in playback_buffer_ + dynamic_chunk_size_        │     │
 │  └──────────────────────────────────────────────────────────────────┘     │
 │                                                                           │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -83,10 +83,12 @@ ts->start();
 **Cosa succede internamente:**
 
 1. `open()`:
-   - Alloca `recording_buffer_` (128KB, RAM normale)
-   - Alloca `playback_buffer_` (256KB per supportare preloading)
+   - Rileva bitrate stream automaticamente (default 128kbps)
+   - Calcola dimensioni adattive buffer: chunk_size, recording/playback buffers
+   - Alloca `recording_buffer_` (adattivo, RAM normale)
+   - Alloca `playback_buffer_` (adattivo per supportare preloading)
    - Inizializza mutex per thread-safety
-   - Se PSRAM mode: alloca pool da 2MB (16 chunks × 128KB)
+   - Se PSRAM mode: alloca pool circolare adattivo
    - Se SD mode: pulisce directory `/timeshift/`
 
 2. `start()`:

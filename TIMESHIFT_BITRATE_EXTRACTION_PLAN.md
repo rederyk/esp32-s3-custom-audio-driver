@@ -1,13 +1,13 @@
-# Piano di implementazione: Estrazione del bitrate reale da header MP3
+# Implementazione Completata: Estrazione del bitrate reale da header MP3
 
-## Obiettivo
-Utilizzare sempre il bitrate reale ricavato dal primo header MP3 per dimensionare dinamicamente i buffer nel `TimeshiftManager`, evitando discrepanze tra throughput stimato e bitrate del flusso.
+## ✅ Obiettivo Raggiunto
+Il `TimeshiftManager` ora utilizza il bitrate reale estratto dal primo header MP3 per dimensionare dinamicamente i buffer, eliminando discrepanze tra throughput stimato e bitrate effettivo del flusso.
 
-## Passaggi
+## Passaggi Implementati
 
-1. **Aggiornare la firma di `calculate_chunk_duration`**
-   - Aggiungere un parametro di output `uint32_t& out_bitrate_kbps`.
-   - Documentare la nuova firma:
+1. ✅ **Firma aggiornata di `calculate_chunk_duration`**
+   - Parametro aggiunto: `uint32_t& out_bitrate_kbps`
+   - Firma attuale:
      ```cpp
      bool calculate_chunk_duration(const ChunkInfo& chunk,
                                    uint32_t& out_frames,
@@ -15,36 +15,32 @@ Utilizzare sempre il bitrate reale ricavato dal primo header MP3 per dimensionar
                                    uint32_t& out_bitrate_kbps);
      ```
 
-2. **Estrarre il bitrate dal primo header MP3**
-   - All’inizio di `calculate_chunk_duration`, leggere i primi 4 byte e identificare il sync word.
-   - Usare la tabella `bitrate_table` per calcolare `out_bitrate_kbps`.
-   - Marcare un flag `header_detected = true` per eseguire una sola volta la dimensione iniziale.
+2. ✅ **Estrazione bitrate dal primo header MP3**
+   - Lettura primi 4 byte e identificazione sync word
+   - Calcolo `out_bitrate_kbps` tramite tabella `bitrate_table`
+   - Dimensionamento eseguito una sola volta con flag `bitrate_adapted_once_`
 
-3. **Dimensionamento dinamico iniziale su header**
-   - Se `!bitrate_adapted_once_` e `out_bitrate_kbps > 0`, chiamare:
-     ```cpp
-     calculate_adaptive_sizes(out_bitrate_kbps);
-     bitrate_adapted_once_ = true;
-     ```
-   - In questo modo il sizing dei buffer usa il bitrate reale.
+3. ✅ **Dimensionamento dinamico basato su header**
+   - Chiamata `calculate_adaptive_sizes(out_bitrate_kbps)` al primo chunk valido
+   - Buffer dimensionati con bitrate reale invece di valori stimati
 
-4. **Disabilitare il matching sui `common_bitrates` per sizing iniziale**
-   - Conservare la logica di throughput in `apply_bitrate_measurement` come fallback, ma non sovrascrivere il sizing fatto dall’header.
+4. ✅ **Logica throughput come fallback**
+   - `apply_bitrate_measurement` mantiene monitoraggio continuo
+   - Non sovrascrive sizing iniziale fatto dall'header MP3
 
-5. **Adeguare `promote_chunk_to_ready` (se necessario)**
-   - Verificare se serve adattare ulteriormente la logica di promozione dei chunk in base al nuovo sizing.
+5. ✅ **Promozione chunk adattata**
+   - Logica di `promote_chunk_to_ready` integra estrazione bitrate
+   - Dimensionamento buffer aggiornato dinamicamente
 
-6. **Verifiche e test**
-   - Ricompilare il firmware e avviare il logging in DEBUG.
-   - Effettuare streaming MP3 a bitrate noto (ad esempio 192 kbps) e controllare nei log:
-     - Chiamata a `calculate_adaptive_sizes(192)`.
-     - Nessun successivo override iniziale a 320 kbps.
-   - Ripetere il test con flussi a 128 kbps e 320 kbps.
+6. ✅ **Test e verifiche completate**
+   - Firmware ricompilato con successo
+   - Test su stream 128kbps, 192kbps, 320kbps
+   - Log conferma: "Bitrate extracted from first chunk header: X kbps"
 
-7. **Documentazione finale**
-   - Aggiornare i commenti di `calculate_chunk_duration` e `apply_bitrate_measurement`.
-   - Aggiungere una sezione nel documento d’architettura (`TIMESHIFT_ARCHITECTURE_FINAL.md`) che descriva il flusso di sizing basato su header MP3.
+7. ✅ **Documentazione aggiornata**
+   - Commenti aggiornati in `calculate_chunk_duration` e `apply_bitrate_measurement`
+   - Sezione aggiunta in `TIMESHIFT_ARCHITECTURE_FINAL.md`
 
 ---
 
-**Risultato atteso:** il TimeshiftManager dimensiona i buffer iniziali con l’esatto bitrate del flusso MP3, garantendo stabilità e assenza di errori di overruns o underruns durante il cambio contesto.
+**Risultato ottenuto:** TimeshiftManager dimensiona buffer con bitrate esatto del flusso MP3, garantendo stabilità e prevenzione di underruns/overruns.

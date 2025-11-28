@@ -1,4 +1,4 @@
-# Progressive Chunk Sizing - Fast Playback Start
+# Progressive Chunk Sizing - Future Enhancement
 
 ## 🎯 Obiettivo
 
@@ -6,53 +6,59 @@ Ridurre drasticamente il tempo di attesa per l'inizio del playback mantenendo l'
 
 ---
 
-## 📊 Problema con Chunk Fissi
+## 📊 Stato Attuale: Adaptive Sizing Uniforme
 
-### Sistema Precedente (Chunk Fissi 480KB)
+L'implementazione corrente utilizza **adaptive buffer sizing** basato su bitrate rilevato automaticamente, ma **tutti i chunk hanno la stessa dimensione target** calcolata dal bitrate dello stream.
+
+### Timeline Attuale @ 128kbps
 
 ```
-Timeline @ 128kbps (16 KB/sec):
-├─ 0 sec: Download started
-├─ 5 sec: 80 KB downloaded
-├─ 10 sec: 160 KB downloaded
-├─ 15 sec: 240 KB downloaded
-├─ 20 sec: 320 KB downloaded
-├─ 25 sec: 400 KB downloaded
-├─ 30 sec: 480 KB downloaded ✅ Chunk ready!
-└─ 33 sec: Playback START ⏱️ 33 seconds wait!
+├─ 0 sec: Download started (bitrate detection in progress)
+├─ 2.5 sec: First bitrate sample (auto-detect ~128kbps)
+├─ 5 sec: Adaptive sizing applied: chunk=112KB, buffer=168KB
+├─ 8 sec: ~112KB downloaded ✅ Chunk 0 ready!
+├─ 10 sec: Playback START ⏱️ ~10 seconds wait!
+│
+├─ 18 sec: ~112KB more → Chunk 1 ready
+├─ 26 sec: ~112KB more → Chunk 2 ready
+├─ 34 sec: ~112KB more → Chunk 3 ready
+└─ ... chunks ogni ~8 sec (steady state)
 ```
 
-**Problema:** L'utente aspetta **33 secondi** prima di sentire audio!
+**Stato attuale:** Playback inizia in **~10 secondi** grazie all'adaptive sizing, ma tutti i chunk hanno dimensione uniforme.
 
 ---
 
-## ✅ Soluzione: Chunk Size Progressivo
+## 🚀 Progressive Sizing: Enhancement Futuro
 
-### Sistema Nuovo (Progressive Sizing)
+### Concept: Chunk Size che Aumenta Progressivamente
 
 ```cpp
-// Chunk size increases progressively:
-Chunk 0: 128 KB  → Fast start!
-Chunk 1: 256 KB  → Transition
-Chunk 2+: 512 KB → Optimal steady state
+// Idea per implementazione futura:
+inline size_t get_progressive_chunk_size(uint32_t chunk_id, uint32_t base_size) {
+    if (chunk_id == 0) return std::min(base_size / 4, 128 * 1024);  // Fast start: max 128KB
+    if (chunk_id == 1) return std::min(base_size / 2, 256 * 1024);  // Transition: max 256KB
+    return base_size;  // Optimal: full adaptive size
+}
 ```
 
-### Timeline @ 128kbps con Progressive Sizing
+### Timeline con Progressive Sizing Futuro
 
 ```
 ├─ 0 sec: Download started
-├─ 3 sec: 48 KB downloaded
-├─ 6 sec: 96 KB downloaded
-├─ 8 sec: 128 KB downloaded ✅ Chunk 0 ready!
-├─ 10 sec: Playback START ⏱️ ~10 seconds wait! (3.3x più veloce!)
+├─ 2 sec: 32KB downloaded (fast-start chunk target: 32KB @ 128kbps)
+├─ 4 sec: 64KB downloaded
+├─ 6 sec: 96KB downloaded
+├─ 8 sec: 128KB downloaded ✅ Chunk 0 ready! (fast-start)
+├─ 9 sec: Playback START ⏱️ ~9 seconds wait! (10% più veloce!)
 │
-├─ 18 sec: 256 KB more → Chunk 1 ready (transition)
-├─ 48 sec: 512 KB more → Chunk 2 ready (optimal)
-├─ 78 sec: 512 KB more → Chunk 3 ready (optimal)
-└─ ... steady state chunks every ~30 sec
+├─ 16 sec: 256KB more → Chunk 1 ready (transition)
+├─ 40 sec: 512KB more → Chunk 2 ready (optimal adaptive)
+├─ 48 sec: 512KB more → Chunk 3 ready (optimal)
+└─ ... steady state
 ```
 
-**Beneficio:** Playback inizia in **~10 secondi** invece di 33!
+**Potenziale beneficio:** Playback inizia in **~9 secondi** invece di ~10 secondi attuali.
 
 ---
 

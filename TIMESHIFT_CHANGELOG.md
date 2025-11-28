@@ -14,31 +14,30 @@
 
 ## 🔧 Modifiche Implementate
 
-### 1. Buffer Size Aumentati (Anti-Stuttering)
+### 1. Buffer Size Dinamici (Anti-Stuttering)
 
-#### Recording Buffer: 128KB → 1MB (8x)
+Il sistema ora usa sizing dinamico basato su bitrate rilevato:
+
+#### Recording Buffer: Adattivo (192KB @ 128kbps)
 ```cpp
 // src/timeshift_manager.h
-static const size_t BUFFER_SIZE = 1024 * 1024;  // era 128KB
+size_t dynamic_buffer_size_ = 192 * 1024;  // 1.5x chunk_size
 ```
 
 **Impatto:**
-- ✅ Chunk da 512KB invece di 124KB
-- ✅ Flush ogni ~30 sec invece di ~8 sec
-- ✅ 4x meno operazioni SD card
+- ✅ Buffer dimensionato dinamicamente per bitrate stream
+- ✅ Ottimale per diversi bitrate (64-320kbps)
+- ✅ Flush adattivo basato su throughput
 
----
-
-#### Playback Buffer: 256KB → 1.5MB (6x)
+#### Playback Buffer: Adattivo (384KB @ 128kbps)
 ```cpp
-// src/timeshift_manager.h
-static const size_t PLAYBACK_BUFFER_SIZE = 1536 * 1024;  // era 256KB
+size_t dynamic_playback_buffer_size_ = 384 * 1024;  // 3x chunk_size
 ```
 
 **Impatto:**
-- ✅ Spazio per 2 chunk completi (double buffering)
-- ✅ Switch seamless tra chunk con memmove()
-- ✅ Zero stuttering durante cambio chunk
+- ✅ Spazio per chunk completo + preload
+- ✅ Switch seamless con preloading
+- ✅ Zero stuttering grazie a double buffering
 
 ---
 

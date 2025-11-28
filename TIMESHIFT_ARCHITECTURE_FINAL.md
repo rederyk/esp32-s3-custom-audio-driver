@@ -489,14 +489,14 @@ void promote_chunk_to_ready(ChunkInfo chunk) {
 - [x] Pausa/Resume senza glitch
 - [x] Cleanup automatico oltre 512MB
 
-### Seek Temporale (🔄 Da Implementare)
+### Seek Temporale (✅ Implementato)
 
-- [ ] `calculate_chunk_duration()` accurato
-- [ ] `seek_to_time()` trova chunk corretto
-- [ ] Seek forward di 30 sec
-- [ ] Seek backward di 10 sec
-- [ ] Progressione temporale visualizzata correttamente
-- [ ] Edge case: seek oltre disponibile (fallisce gracefully)
+- [x] `calculate_chunk_duration()` accurato
+- [x] `seek_to_time()` trova chunk corretto
+- [x] Seek forward di 30 sec
+- [x] Seek backward di 10 sec
+- [x] Progressione temporale visualizzata correttamente
+- [x] Edge case: seek oltre disponibile (fallisce gracefully)
 
 ---
 

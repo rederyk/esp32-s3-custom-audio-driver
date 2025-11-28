@@ -260,7 +260,7 @@ const uint32_t STREAM_TIMEOUT = 30000;
 ## 📊 Performance Attese
 
 ### Latenza
-- **Avvio playback**: 4-5 secondi (tempo per primo chunk 512KB)
+- **Avvio playback**: ~10 secondi (tempo per primo chunk adattivo, tipicamente ~112KB @ 128kbps)
 - **Cambio chunk**: < 100ms (caricamento da SD)
 - **Pausa/Resume**: Istantaneo
 

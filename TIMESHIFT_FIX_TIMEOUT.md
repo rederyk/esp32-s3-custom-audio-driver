@@ -4,17 +4,17 @@
 
 ```
 [INFO]  Recording: 99 KB total, 102247 bytes in current chunk, 0 ready chunks
-[ERROR] Timeout waiting for first chunk to be ready
+[ERROR] Timeout waiting for initial buffer (2 chunks)
 ```
 
 ### Causa Root
 
-1. **Timeout troppo breve**: 5 secondi non sufficienti
-2. **Threshold chunk**: 480KB richiesto prima del flush
+1. **Timeout troppo breve**: 5 secondi non sufficienti per 2 chunk
+2. **Sistema buffer safety**: Aspetta 2 chunk prima di iniziare playback
 3. **Bitrate stream**: 128kbps = ~16KB/sec download
-4. **Calcolo tempo necessario**: 480KB ÷ 16KB/s = **30 secondi**
+4. **Calcolo tempo necessario**: 2 chunk (384KB) ÷ 16KB/s = **24 secondi**
 
-Il sistema aspettava solo 5 secondi ma servivano almeno 30 secondi per accumulare il primo chunk!
+Il sistema aspetta 2 chunk per garantire playback continuo, ma il timeout era troppo breve!
 
 ---
 

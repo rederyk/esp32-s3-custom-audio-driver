@@ -1,15 +1,15 @@
-# Multi-Format Audio Decoder - Guida Rapida
+# Multi-Format Audio Decoder - Stato Attuale
 
 ## 🎵 Formati Supportati
 
-Il player ora supporta **4 formati audio** con auto-rilevamento automatico:
+Il player supporta attualmente **2 formati audio** con auto-rilevamento automatico:
 
 | Formato | Estensione | Decoder | Seek | Compressione |
 |---------|------------|---------|------|--------------|
 | **MP3** | `.mp3` | dr_mp3 | ✅ Seek table | Alta |
 | **WAV** | `.wav` | Custom PCM | ✅ Istantaneo | Nessuna (PCM) |
-| **AAC** | `.aac`, `.m4a` | Helix AAC | ❌ | Alta (+ SBR) |
-| **FLAC** | `.flac` | libFLAC | ❌ | Lossless |
+
+**Note:** AAC e FLAC sono pianificati ma non ancora implementati.
 
 ---
 
@@ -24,8 +24,6 @@ t  - Play MP3 test file (sample-rich.mp3)
 s  - Play WAV sample (fileWAV1MG.wav)
 
 1  - Test WAV 440Hz tone (sample_440hz.wav)
-2  - Test AAC 440Hz tone (sample_440hz.aac)
-3  - Test FLAC 440Hz tone (sample_440hz.flac)
 
 p  - Play/Pause toggle
 q  - Stop
@@ -46,8 +44,6 @@ I seguenti file sono pronti per il test:
 
 ### File Audio Generati (440Hz tone, 3 secondi, stereo 44.1kHz)
 - `sample_440hz.wav` - 517 KB (WAV PCM 16-bit)
-- `sample_440hz.aac` - 49 KB (AAC ADTS)
-- `sample_440hz.flac` - 45 KB (FLAC lossless)
 
 ### File Esistenti
 - `sample-rich.mp3` - 302 KB (MP3)
@@ -63,17 +59,12 @@ Il sistema rileva automaticamente il formato in 2 modi:
 ```cpp
 .mp3  → AudioFormat::MP3
 .wav  → AudioFormat::WAV
-.aac  → AudioFormat::AAC
-.flac → AudioFormat::FLAC
-.m4a  → AudioFormat::AAC
 ```
 
 ### 2. Da Magic Bytes (Header)
 ```
 MP3:  ID3 tag o MPEG sync (0xFF 0xEx)
 WAV:  RIFF....WAVE
-AAC:  ADTS header (0xFF 0xFx)
-FLAC: fLaC marker
 ```
 
 ---

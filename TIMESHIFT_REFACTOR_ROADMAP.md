@@ -116,8 +116,8 @@ read() request → find_chunk_for_offset()
       flush_to_sd();
   }
 
-  // Nuovo: flush chunk di dimensione fissa (CHUNK_SIZE = 512KB)
-  if (bytes_in_current_chunk >= CHUNK_SIZE) {
+  // Nuovo: flush chunk adattivo basato su bitrate rilevato
+  if (bytes_in_current_chunk >= dynamic_min_flush_size_) {
       flush_recording_chunk();
   }
   ```
