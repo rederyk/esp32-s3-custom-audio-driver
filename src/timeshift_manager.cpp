@@ -1406,6 +1406,10 @@ size_t TimeshiftManager::seek_to_time(uint32_t target_ms) {
         return SIZE_MAX;  // Invalid offset
     }
 
+    // CHIAVE: Rendi il target relativo all'inizio del buffer disponibile.
+    // Se l'utente chiede 1000ms, significa 1000ms DALL'INIZIO del timeshift.
+    target_ms += ready_chunks_.front().start_time_ms;
+
     const ChunkInfo& first_chunk = ready_chunks_.front();
     const ChunkInfo& last_chunk = ready_chunks_.back();
     uint32_t total_duration_ms = 0;
