@@ -224,3 +224,104 @@ L'implementazione è **completa e funzionale**. Il codice:
 - ✅ Mantiene la stessa API esterna
 
 **Pronto per il testing su hardware reale!**
+
+# Guida alla Configurazione dei Chunk in PSRAM (`MAX_PSRAM_CHUNKS`)
+
+## 🎯 Cos'è `MAX_PSRAM_CHUNKS`?
+
+`MAX_PSRAM_CHUNKS` è una costante definita nel file `timeshift_manager.h` che determina il **numero di chunk di memoria** da allocare nella PSRAM per la modalità timeshift (`StorageMode::PSRAM_ONLY`).
+
+Ogni chunk ha una dimensione che si adatta dinamicamente al bitrate dello stream (tipicamente tra 112KB e 280KB). Il numero totale di chunk definisce la **dimensione totale del buffer di timeshift** e, di conseguenza, la **durata massima** (in secondi o minuti) che puoi riavvolgere.
+
+**Formula:**
+`Durata Totale Buffer ≈ (MAX_PSRAM_CHUNKS * Dimensione Media Chunk) / Bitrate Medio Stream`
+
+---
+
+## 🔧 Configurazione di Default
+
+Il valore predefinito è impostato per bilanciare l'uso della memoria e offrire un buffer ragionevole per gli stream più comuni.
+
+**File:** `src/timeshift_manager.h`
+```cpp
+static const size_t MAX_PSRAM_CHUNKS = 24; // Default: 24 chunks
+```
+
+**Cosa offre la configurazione di default (24 chunks):**
+
+-   **Stream a 128 kbps** (Bitrate standard, ~16 KB/s):
+    -   Dimensione chunk adattiva: ~112 KB
+    -   Buffer totale: `24 * 112 KB` ≈ **2.6 MB**
+    -   Durata timeshift: `2.6 MB / 16 KB/s` ≈ **160 secondi (~2.6 minuti)**
+
+-   **Stream a 320 kbps** (Alta qualità, ~40 KB/s):
+    -   Dimensione chunk adattiva: ~280 KB
+    -   Buffer totale: `24 * 280 KB` ≈ **6.7 MB**
+    -   Durata timeshift: `6.7 MB / 40 KB/s` ≈ **167 secondi (~2.7 minuti)**
+
+La configurazione di default è quindi un ottimo punto di partenza per la maggior parte degli usi.
+
+---
+
+## 🚀 Quando e Come Modificare `MAX_PSRAM_CHUNKS`
+
+Dovresti modificare questo valore se le tue esigenze differiscono da quelle standard.
+
+### Caso 1: Streaming a Bitrate Elevato (es. 320 kbps o FLAC)
+
+Per stream ad alta qualità, un buffer più lungo è fondamentale per assorbire le variazioni della rete e prevenire interruzioni.
+
+**Raccomandazione:** Aumenta il valore per avere una finestra temporale di almeno 2-3 minuti.
+
+```cpp
+// Per alta qualità, considera un valore più alto
+static const size_t MAX_PSRAM_CHUNKS = 32; // 32 chunks
+```
+
+**Impatto (32 chunks @ 320 kbps):**
+-   Buffer totale: `32 * 280 KB` ≈ **8.9 MB**
+-   Durata timeshift: `8.9 MB / 40 KB/s` ≈ **222 secondi (~3.7 minuti)**
+
+### Caso 2: Risparmiare Memoria PSRAM
+
+Se il tuo progetto necessita di più PSRAM per altre funzionalità (es. display, web server) e ti accontenti di un buffer di timeshift più corto.
+
+**Raccomandazione:** Riduci il valore.
+
+```cpp
+// Per risparmiare PSRAM, 16 chunk sono sufficienti per stream a 128kbps
+static const size_t MAX_PSRAM_CHUNKS = 16; // 16 chunks
+```
+
+**Impatto (16 chunks @ 128 kbps):**
+-   Buffer totale: `16 * 112 KB` ≈ **1.75 MB**
+-   Durata timeshift: `1.75 MB / 16 KB/s` ≈ **109 secondi (~1.8 minuti)**
+
+### Come Modificare
+
+1.  Apri il file `src/timeshift_manager.h`.
+2.  Trova la riga `static const size_t MAX_PSRAM_CHUNKS = 24;`.
+3.  Modifica il valore `24` secondo le tue necessità.
+4.  Ricompila e carica il firmware.
+
+---
+
+## ⚠️ Considerazioni Importanti
+
+1.  **Disponibilità di PSRAM**: Prima di aumentare `MAX_PSRAM_CHUNKS`, assicurati che il tuo ESP32 abbia abbastanza PSRAM libera. Un valore troppo alto può causare fallimenti di allocazione all'avvio del timeshift.
+    -   **Esempio**: `32 chunks * 280 KB/chunk` richiedono quasi 9 MB di PSRAM. Verifica che la tua scheda li abbia.
+
+2.  **Modalità SD Card**: Questa costante **non ha alcun effetto** quando si utilizza la modalità `StorageMode::SD_CARD`. In modalità SD, la durata del timeshift è limitata solo dallo spazio sulla scheda e dalla finestra di pulizia (`MAX_TS_WINDOW`).
+
+3.  **Bitrate Variabile (VBR)**: Il sistema di buffer adattivo gestisce bene anche gli stream VBR, calcolando una dimensione media del chunk basata sul throughput di rete. Le stime di durata sono quindi indicative ma generalmente accurate.
+
+## Riepilogo Raccomandazioni
+
+| Bitrate Stream | `MAX_PSRAM_CHUNKS` Raccomandato | Durata Approssimativa | Note |
+| :--- | :---: | :--- | :--- |
+| <= 128 kbps | `16` | ~1.8 minuti | Sufficiente per radio standard, risparmia PSRAM. |
+| 128 - 192 kbps | `24` (Default) | ~2.6 minuti | Ottimo bilanciamento per la maggior parte degli stream. |
+| > 192 kbps (es. 320) | `32` | ~3.7 minuti | Consigliato per alta qualità, richiede più PSRAM. |
+
+Scegli il valore che meglio si adatta al tuo caso d'uso principale, bilanciando la durata del buffer desiderata con la memoria PSRAM disponibile.
+

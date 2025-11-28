@@ -23,7 +23,7 @@ Il **TimeshiftManager** è un sistema di buffering audio intelligente che permet
 │  │              RECORDING PATH (download_task)                     │     │
 │  │                                                                  │     │
 │  │  HTTP Stream → recording_buffer_ [adaptive circular buffer]     │     │
-│  │       │                                                          │     │
+│  │       │ (usa un buffer temporaneo in PSRAM per la lettura)       │     │
 │  │       │ Accumula fino a dynamic_min_flush_size_ (80% chunk)     │     │
 │  │       │                                                          │     │
 │  │       v                                                          │     │
@@ -42,7 +42,7 @@ Il **TimeshiftManager** è un sistema di buffering audio intelligente che permet
 │  │              └─→ cleanup_old_chunks() [mantieni finestra 2MB]   │     │
 │  └──────────────────────────────────────────────────────────────────┘     │
 │                                                                           │
-│  ┌────────────────────────────────────────────────────────────────┐     │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
 │  │         PLAYBACK PATH (read() chiamato dal decoder MP3)         │     │
 │  │                                                                  │     │
 │  │  decoder->read() → TimeshiftManager::read()                     │     │
@@ -61,7 +61,7 @@ Il **TimeshiftManager** è un sistema di buffering audio intelligente che permet
 │  │  Preloader Task (background):                                   │     │
 │  │    - Pre-carica chunk N+1 quando playback è al 50% di chunk N   │     │
 │  │    - Posiziona in playback_buffer_ + dynamic_chunk_size_        │     │
-│  └──────────────────────────────────────────────────────────────────┘     │
+│  └────────────────────────────────────────────────────────────────────┘   │
 │                                                                           │
 └─────────────────────────────────────────────────────────────────────────┘
 ```

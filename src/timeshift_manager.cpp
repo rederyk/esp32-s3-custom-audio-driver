@@ -647,8 +647,21 @@ void TimeshiftManager::download_task_loop()
     // Usa un buffer di download più grande per massimizzare il throughput.
     // La dimensione effettiva della lettura sarà limitata dallo spazio disponibile
     // nel buffer di registrazione, quindi questo è solo un limite superiore.
-    const size_t DOWNLOAD_BUFFER_SIZE = 128 * 1024; // 32KB
-    uint8_t *buf = (uint8_t *)malloc(DOWNLOAD_BUFFER_SIZE);
+    const size_t DOWNLOAD_BUFFER_SIZE = 256 * 1024; // 128KB
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(DOWNLOAD_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+
+    if (!buf) {
+        LOG_ERROR("Failed to allocate download buffer in PSRAM, trying DRAM...");
+        buf = (uint8_t *)malloc(16 * 1024);
+    }
+
+    if (!buf) {
+        LOG_ERROR("CRITICAL: Failed to allocate any download buffer!");
+        is_running_ = false;
+        http.end();
+        vTaskDelete(nullptr);
+        return;
+    }
     size_t total_downloaded = 0;
     uint32_t last_log_time = millis();
 
@@ -656,14 +669,6 @@ void TimeshiftManager::download_task_loop()
     uint32_t last_data_time = millis();
     const uint32_t STREAM_TIMEOUT = 30000; // 30 seconds without data = timeout
 
-    if (!buf)
-    {
-        LOG_ERROR("Failed to allocate download buffer!");
-        is_running_ = false;
-        http.end();
-        vTaskDelete(nullptr);
-        return;
-    }
     while (is_running_)
     {
         // Check pause flag

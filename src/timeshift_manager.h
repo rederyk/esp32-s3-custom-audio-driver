@@ -89,7 +89,7 @@ private:
     static const size_t BUFFER_SIZE = 128 * 1024;
     static const size_t PLAYBACK_BUFFER_SIZE = 256 * 1024;
     static const size_t CHUNK_SIZE = 128 * 1024;
-    static const size_t MAX_PSRAM_CHUNKS = 16;          // Max 16 chunks in PSRAM = 2MB
+    static const size_t MAX_PSRAM_CHUNKS = 24;          // Max 16 chunks in PSRAM = 2MB
 
     static constexpr size_t MAX_DYNAMIC_CHUNK_BYTES = 512 * 1024;
     static constexpr size_t MAX_RECORDING_BUFFER_CAPACITY = MAX_DYNAMIC_CHUNK_BYTES + (MAX_DYNAMIC_CHUNK_BYTES / 2); // 768 KB

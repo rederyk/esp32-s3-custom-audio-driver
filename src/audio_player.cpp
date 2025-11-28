@@ -334,13 +334,7 @@ void AudioPlayer::toggle_pause() {
         pause_flag_ = false;
         player_state_ = PlayerState::PLAYING;
 
-        // Resume timeshift recording if using TimeshiftManager
-        if (stream_ && stream_->data_source() &&
-            stream_->data_source()->type() == SourceType::HTTP_STREAM) {
-            TimeshiftManager* ts = static_cast<TimeshiftManager*>(
-                const_cast<IDataSource*>(stream_->data_source()));
-            ts->resume_recording();
-        }
+
 
         LOG_INFO("Playback resumed");
     } else if (player_state_ == PlayerState::PLAYING) {
@@ -348,13 +342,7 @@ void AudioPlayer::toggle_pause() {
         output_.set_volume(0);
         player_state_ = PlayerState::PAUSED;
 
-        // Pause timeshift recording if using TimeshiftManager
-        if (stream_ && stream_->data_source() &&
-            stream_->data_source()->type() == SourceType::HTTP_STREAM) {
-            TimeshiftManager* ts = static_cast<TimeshiftManager*>(
-                const_cast<IDataSource*>(stream_->data_source()));
-            ts->pause_recording();
-        }
+
 
         LOG_INFO("Playback paused");
     }
@@ -367,13 +355,7 @@ void AudioPlayer::set_pause(bool pause) {
         output_.set_volume(0);
         player_state_ = PlayerState::PAUSED;
 
-        // Pause timeshift recording if using TimeshiftManager
-        if (stream_ && stream_->data_source() &&
-            stream_->data_source()->type() == SourceType::HTTP_STREAM) {
-            TimeshiftManager* ts = static_cast<TimeshiftManager*>(
-                const_cast<IDataSource*>(stream_->data_source()));
-            ts->pause_recording();
-        }
+
 
         LOG_INFO("Playback paused");
     } else if (!pause && player_state_ == PlayerState::PAUSED) {
@@ -381,14 +363,6 @@ void AudioPlayer::set_pause(bool pause) {
         output_.set_volume(user_volume_percent_);
         pause_flag_ = false;
         player_state_ = PlayerState::PLAYING;
-
-        // Resume timeshift recording if using TimeshiftManager
-        if (stream_ && stream_->data_source() &&
-            stream_->data_source()->type() == SourceType::HTTP_STREAM) {
-            TimeshiftManager* ts = static_cast<TimeshiftManager*>(
-                const_cast<IDataSource*>(stream_->data_source()));
-            ts->resume_recording();
-        }
 
         LOG_INFO("Playback resumed");
     }
@@ -726,11 +700,11 @@ void AudioPlayer::audio_task() {
                     
                     // If download is still running, wait for new chunks instead of ending
                     if (ts && ts->is_running()) {
-                        LOG_DEBUG("Live stream: no data available, waiting for next chunk...");
+                       // LOG_DEBUG("Live stream: no data available, waiting for next chunk...");
                         // Use a shorter, more responsive delay to avoid getting stuck.
                         // This allows the task to yield and quickly re-check for data,
                         // making it more resilient to temporary buffer underruns in live streams.
-                        vTaskDelay(pdMS_TO_TICKS(50));
+                     //   vTaskDelay(pdMS_TO_TICKS(50));
                         continue; // Re-enter the loop to try reading again
                     } else if (ts) {
                         LOG_INFO("Live stream download has stopped. Ending playback.");

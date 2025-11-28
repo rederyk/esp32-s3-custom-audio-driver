@@ -25,9 +25,9 @@ static StorageMode preferred_storage_mode = StorageMode::SD_CARD;  // Default: S
 
 // Auto-pause buffering settings (configurabile per connessioni diverse)
 // Per connessioni veloci: impostare a 0 per disabilitare il margine
-// Per connessioni lente: aumentare per evitare pause ripetute
+// Per connessioni lente: aumentare per evitare pause ripetuteq
 static uint32_t auto_pause_delay_ms = 0;   // Delay prima di riprendere (0 = disabilitato)
-static size_t auto_pause_min_chunks = 1;      // Chunk minimi prima di riprendere (0 = disabilitato)
+static size_t auto_pause_min_chunks = 0;      // Chunk minimi prima di riprendere (0 = disabilitato)
 
 void start_timeshift_radio(const char* stream_url = kRadioStreamURL) {
     // Stop any current playback first
