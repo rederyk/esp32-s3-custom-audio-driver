@@ -724,8 +724,6 @@ void AudioPlayer::audio_task() {
                     // If download is still running, wait for new chunks instead of ending
                     if (ts && ts->is_running()) {
                         LOG_DEBUG("Live stream: no data available, waiting for next chunk...");
-                        vTaskDelay(pdMS_TO_TICKS(3000));
-                        continue;  // Try reading again
                         // Use a shorter, more responsive delay to avoid getting stuck.
                         // This allows the task to yield and quickly re-check for data,
                         // making it more resilient to temporary buffer underruns in live streams.
