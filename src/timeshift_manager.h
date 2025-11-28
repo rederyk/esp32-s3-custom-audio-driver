@@ -86,6 +86,10 @@ private:
     static const size_t CHUNK_SIZE = 128 * 1024;
     static const size_t MAX_PSRAM_CHUNKS = 16;          // Max 16 chunks in PSRAM = 2MB
 
+    static constexpr size_t MAX_DYNAMIC_CHUNK_BYTES = 512 * 1024;
+    static constexpr size_t MAX_RECORDING_BUFFER_CAPACITY = MAX_DYNAMIC_CHUNK_BYTES + (MAX_DYNAMIC_CHUNK_BYTES / 2); // 768 KB
+    static constexpr size_t MAX_PLAYBACK_BUFFER_CAPACITY = MAX_DYNAMIC_CHUNK_BYTES * 3; // 1.5 MB
+
     enum class ChunkState {
         PENDING,    // In scrittura su SD/PSRAM
         READY,      // Completo e disponibile per playback
@@ -114,6 +118,7 @@ private:
     size_t bytes_in_current_chunk_ = 0;      // Bytes accumulated for current pending chunk
     size_t current_recording_offset_ = 0;    // Total bytes recorded (global offset)
     uint32_t next_chunk_id_ = 0;             // Next chunk ID to assign
+    size_t recording_buffer_capacity_ = 0;
 
     // PLAYBACK BUFFER (Read-Only by read() method)
     uint8_t* playback_buffer_ = nullptr;
@@ -142,6 +147,7 @@ private:
     std::vector<ChunkInfo> pending_chunks_;  // Chunks being written (PENDING state)
     std::vector<ChunkInfo> ready_chunks_;    // Chunks complete and ready for playback (READY state)
     size_t current_read_offset_ = 0;         // Current read position (logical offset)
+    size_t playback_buffer_capacity_ = 0;
 
     // PSRAM-only mode: circular chunk pool
     uint8_t* psram_chunk_pool_ = nullptr;    // Pre-allocated pool for PSRAM mode

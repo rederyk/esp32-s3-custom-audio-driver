@@ -48,7 +48,7 @@ void TimeshiftManager::calculate_adaptive_sizes(uint32_t bitrate_kbps) {
 
     // Clamp to reasonable limits (16KB - 512KB)
     const size_t MIN_CHUNK_SIZE = 16 * 1024;   // 16KB minimum
-    const size_t MAX_CHUNK_SIZE = 512 * 1024;  // 512KB maximum
+    const size_t MAX_CHUNK_SIZE = MAX_DYNAMIC_CHUNK_BYTES;  // 512KB maximum
 
     dynamic_chunk_size_ = std::max(MIN_CHUNK_SIZE,
                           std::min(MAX_CHUNK_SIZE, (size_t)target_chunk_bytes));
@@ -184,16 +184,18 @@ bool TimeshiftManager::open(const char* uri) {
                  MAX_PSRAM_CHUNKS, psram_pool_size_ / 1024);
     }
 
-    recording_buffer_ = (uint8_t*)malloc(dynamic_buffer_size_);
+    recording_buffer_capacity_ = MAX_RECORDING_BUFFER_CAPACITY;
+    recording_buffer_ = (uint8_t*)malloc(recording_buffer_capacity_);
     if (!recording_buffer_) {
-        LOG_ERROR("Failed to allocate recording buffer (%u KB)", (unsigned)(dynamic_buffer_size_ / 1024));
+        LOG_ERROR("Failed to allocate recording buffer (%u KB)", (unsigned)(recording_buffer_capacity_ / 1024));
         close();
         return false;
     }
 
-    playback_buffer_ = (uint8_t*)malloc(dynamic_playback_buffer_size_);
+    playback_buffer_capacity_ = MAX_PLAYBACK_BUFFER_CAPACITY;
+    playback_buffer_ = (uint8_t*)malloc(playback_buffer_capacity_);
     if (!playback_buffer_) {
-        LOG_ERROR("Failed to allocate playback buffer (%u KB)", (unsigned)(dynamic_playback_buffer_size_ / 1024));
+        LOG_ERROR("Failed to allocate playback buffer (%u KB)", (unsigned)(playback_buffer_capacity_ / 1024));
         free(recording_buffer_);
         recording_buffer_ = nullptr;
         close();
