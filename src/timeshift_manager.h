@@ -120,6 +120,7 @@ private:
     uint32_t current_playback_chunk_abs_id_ = UINT32_MAX;  // Absolute chunk ID (NOT index)
     size_t playback_chunk_loaded_size_ = 0;                // Size of loaded chunk
     uint32_t last_preload_check_chunk_abs_id_ = UINT32_MAX;   // Per evitare controlli di preload ripetuti
+    uint32_t preloaded_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;          // Chunk ID that was copied into playback_buffer_+chunk_size
     
     // Global stream state
     std::string uri_;
@@ -183,7 +184,8 @@ private:
     void promote_chunk_to_ready(ChunkInfo chunk);   // Move chunk from PENDING to READY
     bool calculate_chunk_duration(const ChunkInfo& chunk,
                                    uint32_t& out_frames,
-                                   uint32_t& out_duration_ms);  // Calcola durata chunk
+                                   uint32_t& out_duration_ms,
+                                   uint32_t& out_bitrate_kbps);  // Calcola durata chunk e estrae bitrate
 
     // PLAYBACK SIDE (private helpers)
     uint32_t find_chunk_for_offset(size_t offset);    // Find absolute chunk ID containing offset

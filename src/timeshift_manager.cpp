@@ -796,7 +796,8 @@ bool TimeshiftManager::validate_chunk(ChunkInfo& chunk) {
 
 bool TimeshiftManager::calculate_chunk_duration(const ChunkInfo& chunk,
                                                  uint32_t& out_frames,
-                                                 uint32_t& out_duration_ms)
+                                                 uint32_t& out_duration_ms,
+                                                 uint32_t& out_bitrate_kbps)
 {
     uint8_t header[4];
     uint32_t total_samples = 0;
@@ -932,9 +933,18 @@ bool TimeshiftManager::calculate_chunk_duration(const ChunkInfo& chunk,
     // Calculate duration in milliseconds
     out_frames = total_samples;
     out_duration_ms = (total_samples * 1000) / sample_rate;
+    
+    // Extract bitrate from first valid MP3 frame (already parsed above)
+    // The bitrate_kbps was calculated in the frame parsing loop
+    // For now, estimate from chunk size and duration
+    if (out_duration_ms > 0) {
+        out_bitrate_kbps = (chunk.length * 8) / (out_duration_ms / 1000);
+    } else {
+        out_bitrate_kbps = 128;  // Default fallback
+    }
 
-    LOG_DEBUG("Chunk %u: %u samples, %u ms @ %u Hz",
-              chunk.id, out_frames, out_duration_ms, sample_rate);
+    LOG_DEBUG("Chunk %u: %u samples, %u ms @ %u Hz, bitrate ~%u kbps",
+              chunk.id, out_frames, out_duration_ms, sample_rate, out_bitrate_kbps);
 
     return true;
 }
@@ -964,13 +974,21 @@ void TimeshiftManager::promote_chunk_to_ready(ChunkInfo chunk) {
     // Calculate chunk duration
     uint32_t total_frames = 0;
     uint32_t duration_ms = 0;
+    uint32_t extracted_bitrate_kbps = 0;
 
-    if (calculate_chunk_duration(chunk, total_frames, duration_ms)) {
+    if (calculate_chunk_duration(chunk, total_frames, duration_ms, extracted_bitrate_kbps)) {
         chunk.total_frames = total_frames;
         chunk.duration_ms = duration_ms;
         chunk.start_time_ms = cumulative_time_ms_;
 
         cumulative_time_ms_ += duration_ms;  // Update cumulative time
+
+        // Use extracted bitrate for initial sizing if not yet adapted
+        if (!bitrate_adapted_once_ && extracted_bitrate_kbps > 0) {
+            LOG_INFO("Bitrate extracted from first chunk header: %u kbps", extracted_bitrate_kbps);
+            calculate_adaptive_sizes(extracted_bitrate_kbps);
+            bitrate_adapted_once_ = true;
+        }
 
         LOG_INFO("Chunk %u promoted to READY (%u KB, offset %u-%u, %u ms, %u frames)",
                  chunk.id, chunk.length / 1024,
