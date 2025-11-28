@@ -712,7 +712,7 @@ void AudioPlayer::audio_task() {
                     // If download is still running, wait for new chunks instead of ending
                     if (ts && ts->is_running()) {
                         LOG_DEBUG("Live stream: no data available, waiting for next chunk...");
-                        vTaskDelay(pdMS_TO_TICKS(100));
+                        vTaskDelay(pdMS_TO_TICKS(3000));
                         continue;  // Try reading again
                     }
                 }

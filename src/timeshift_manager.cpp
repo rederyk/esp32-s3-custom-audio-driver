@@ -1299,12 +1299,17 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
         if (is_running_ && !ready_chunks_.empty()) {
             size_t last_chunk_end = ready_chunks_.back().end_offset;
             if (offset >= last_chunk_end - 4096) {  // Within 4KB of end
-                LOG_INFO("Playback catching up to live stream, waiting for next chunk...");
+                size_t initial_chunk_count = ready_chunks_.size();
+                size_t target_chunk_count = initial_chunk_count + auto_pause_min_chunks_;
+                if (target_chunk_count == initial_chunk_count) {
+                    target_chunk_count = initial_chunk_count + 1;
+                }
+                LOG_INFO("Playback catching up to live stream, waiting for %u new ready chunk(s)...",
+                         (unsigned)(target_chunk_count - initial_chunk_count));
 
                 // Wait up to 3 seconds for new chunk
                 uint32_t wait_start = millis();
                 const uint32_t MAX_WAIT_MS = 3000;
-                size_t initial_chunk_count = ready_chunks_.size();
 
                 while (is_running_ && (millis() - wait_start) < MAX_WAIT_MS) {
                     xSemaphoreGive(mutex_);
@@ -1312,7 +1317,8 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
                     xSemaphoreTake(mutex_, portMAX_DELAY);
 
                     // Check if new chunk arrived
-                    if (ready_chunks_.size() > initial_chunk_count) {
+                    if (ready_chunks_.size() >= target_chunk_count &&
+                        ready_chunks_.size() > initial_chunk_count) {
                         abs_chunk_id = find_chunk_for_offset(offset);
                         if (abs_chunk_id != INVALID_CHUNK_ABS_ID) {
                             LOG_INFO("New chunk arrived, resuming playback");
