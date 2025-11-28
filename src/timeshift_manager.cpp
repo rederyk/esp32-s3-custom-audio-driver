@@ -1,3 +1,6 @@
+// Copyright (c) 2025 rederyk
+// Licensed under the MIT License. See LICENSE file for details.
+
 #include "timeshift_manager.h"
 #include "logger.h"
 #include "drivers/sd_card_driver.h"  // For SD card access
@@ -413,6 +416,8 @@ void TimeshiftManager::preloader_task_loop() {
     LOG_INFO("File preloader task started");
     uint32_t last_playback_chunk_abs_id_seen = INVALID_CHUNK_ABS_ID;
     bool next_chunk_preloaded = false;
+    uint32_t failed_preload_attempts_ = 0;
+    const uint32_t MAX_FAILED_ATTEMPTS = 3;  // After 3 failed attempts, fallback
 
     while (is_running_) {
         vTaskDelay(pdMS_TO_TICKS(100)); // Controlla ogni 100ms
@@ -428,6 +433,7 @@ void TimeshiftManager::preloader_task_loop() {
         if (current_playback_chunk_abs_id_ != last_playback_chunk_abs_id_seen) {
             last_playback_chunk_abs_id_seen = current_playback_chunk_abs_id_;
             next_chunk_preloaded = false; // Reset: il nuovo chunk successivo non è ancora stato precaricato
+            failed_preload_attempts_ = 0;  // Reset failed attempts counter
             LOG_DEBUG("Preloader: switched to chunk abs ID %u, will preload %u when ready",
                       current_playback_chunk_abs_id_,
                       current_playback_chunk_abs_id_ + 1);
@@ -444,9 +450,35 @@ void TimeshiftManager::preloader_task_loop() {
 
             // Verifica che il chunk successivo esista
             if (current_idx + 1 >= ready_chunks_.size()) {
+                // Chunk successivo non ancora disponibile
+                failed_preload_attempts_++;
+                
+                // FALLBACK STRATEGY: Se il chunk successivo non è disponibile dopo MAX_FAILED_ATTEMPTS,
+                // salta indietro di 2 chunk per dare tempo alla rete di buffering
+                if (failed_preload_attempts_ >= MAX_FAILED_ATTEMPTS && current_playback_chunk_abs_id_ >= 2) {
+                    uint32_t fallback_chunk_id = current_playback_chunk_abs_id_ - 2;
+                    size_t fallback_idx = find_chunk_index_by_id(fallback_chunk_id);
+                    
+                    if (fallback_idx != INVALID_CHUNK_ID) {
+                        const ChunkInfo& fallback_chunk = ready_chunks_[fallback_idx];
+                        LOG_WARN("Preloader: Next chunk not ready after %u attempts. Falling back to chunk %u (-%u) to allow buffering",
+                                 MAX_FAILED_ATTEMPTS, fallback_chunk_id, 2);
+                        
+                        // Jump to fallback chunk
+                        current_read_offset_ = fallback_chunk.start_offset;
+                        current_playback_chunk_abs_id_ = fallback_chunk_id;
+                        last_playback_chunk_abs_id_seen = fallback_chunk_id;
+                        next_chunk_preloaded = false;
+                        failed_preload_attempts_ = 0;
+                    }
+                }
+                
                 xSemaphoreGive(mutex_);
-                continue; // Chunk successivo non ancora disponibile
+                continue;
             }
+
+            // Reset failed attempts when next chunk becomes available
+            failed_preload_attempts_ = 0;
 
             // Calcola il progresso nel chunk corrente
             const auto& current_chunk = ready_chunks_[current_idx];
@@ -466,6 +498,9 @@ void TimeshiftManager::preloader_task_loop() {
                 if (preload_next_chunk(current_playback_chunk_abs_id_)) {
                     LOG_DEBUG("Preloader task loaded chunk abs ID %u", next_abs_id);
                     next_chunk_preloaded = true;
+                    failed_preload_attempts_ = 0;
+                } else {
+                    failed_preload_attempts_++;
                 }
             }
         }

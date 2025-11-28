@@ -1,3 +1,6 @@
+// Copyright (c) 2025 rederyk
+// Licensed under the MIT License. See LICENSE file for details.
+
 #include "audio_decoder_factory.h"
 #include "mp3_decoder_adapter.h"
 #include "wav_decoder.h"

@@ -1,3 +1,6 @@
+// Copyright (c) 2025 rederyk
+// Licensed under the MIT License. See LICENSE file for details.
+
 #include "audio_output.h"
 #include "logger.h"
 #include "driver/i2s.h"
