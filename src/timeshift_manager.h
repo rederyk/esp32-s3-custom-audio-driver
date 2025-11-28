@@ -9,6 +9,7 @@
 #include <string>
 #include <memory>
 #include <functional>
+#include <deque>
 
 // Forward declarations
 class HTTPClient;
@@ -161,9 +162,18 @@ private:
     // Temporal tracking
     uint32_t cumulative_time_ms_ = 0;  // Tempo cumulativo di tutti i chunk processati
 
+    // Bitrate monitoring helpers
+    uint32_t bitrate_sample_start_ms_ = 0;
+    size_t bytes_since_rate_sample_ = 0;
+    std::deque<uint32_t> bitrate_history_;
+    bool bitrate_adapted_once_ = false;
+
     // ADAPTIVE BITRATE DETECTION
-    void detect_and_adapt_to_bitrate();     // Auto-detect bitrate from first chunks
-    void calculate_adaptive_sizes(uint32_t bitrate_kbps);  // Compute buffer sizes
+    static constexpr uint32_t BITRATE_SAMPLE_WINDOW_MS = 2500;
+    static constexpr size_t BITRATE_HISTORY_SIZE = 4;
+
+    void apply_bitrate_measurement(uint32_t measured_kbps);  // Analyze throughput samples
+    void calculate_adaptive_sizes(uint32_t bitrate_kbps);    // Compute buffer sizes
 
     // RECORDING SIDE (private helpers)
     bool flush_recording_chunk();                    // Flush recording_buffer_ to storage

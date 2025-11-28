@@ -7,6 +7,9 @@
 #include <esp_heap_caps.h>  // For PSRAM allocation
 #include "mp3_seek_table.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 // ========== ADAPTIVE BUFFER CONFIGURATION ==========
 // Target chunk duration: 5-10 seconds of audio for optimal balance
 constexpr uint32_t TARGET_CHUNK_DURATION_SEC = 7;  // 7 seconds per chunk (balanced)
@@ -78,51 +81,48 @@ void TimeshiftManager::calculate_adaptive_sizes(uint32_t bitrate_kbps) {
              (unsigned)dynamic_download_chunk_);
 }
 
-void TimeshiftManager::detect_and_adapt_to_bitrate() {
-    // Auto-detect bitrate from first 2 chunks
-    if (detected_bitrate_kbps_ != 0 || ready_chunks_.size() < 2) {
-        return;  // Already detected or not enough data
+void TimeshiftManager::apply_bitrate_measurement(uint32_t measured_kbps) {
+    if (measured_kbps == 0) {
+        return;
     }
 
-    xSemaphoreTake(mutex_, portMAX_DELAY);
-
-    // Calculate average bitrate from first chunks
-    const ChunkInfo& chunk0 = ready_chunks_[0];
-    const ChunkInfo& chunk1 = ready_chunks_[1];
-
-    if (chunk0.duration_ms == 0 || chunk1.duration_ms == 0) {
-        xSemaphoreGive(mutex_);
-        return;  // Duration not calculated yet
+    bitrate_history_.push_back(measured_kbps);
+    while (bitrate_history_.size() > BITRATE_HISTORY_SIZE) {
+        bitrate_history_.pop_front();
     }
 
-    // Average bytes per second
-    float avg_bytes_per_ms = (chunk0.length + chunk1.length) /
-                             (float)(chunk0.duration_ms + chunk1.duration_ms);
-    float avg_bytes_per_sec = avg_bytes_per_ms * 1000.0f;
+    if (bitrate_history_.size() < 2) {
+        return;  // Need at least two samples for averaging
+    }
 
-    // Convert to kbps
-    uint32_t detected_kbps = (uint32_t)((avg_bytes_per_sec * 8) / 1000);
+    uint32_t sum = 0;
+    for (uint32_t value : bitrate_history_) {
+        sum += value;
+    }
+    uint32_t average_kbps = sum / bitrate_history_.size();
 
-    // Round to common bitrates (32, 64, 96, 128, 160, 192, 256, 320)
     const uint32_t common_bitrates[] = {32, 64, 96, 128, 160, 192, 256, 320};
     uint32_t best_match = common_bitrates[0];
-    uint32_t min_diff = abs((int)detected_kbps - (int)best_match);
+    uint32_t min_diff = std::abs((int)average_kbps - (int)best_match);
 
-    for (size_t i = 1; i < sizeof(common_bitrates) / sizeof(common_bitrates[0]); i++) {
-        uint32_t diff = abs((int)detected_kbps - (int)common_bitrates[i]);
+    for (size_t i = 1; i < sizeof(common_bitrates) / sizeof(common_bitrates[0]); ++i) {
+        uint32_t diff = std::abs((int)average_kbps - (int)common_bitrates[i]);
         if (diff < min_diff) {
             min_diff = diff;
             best_match = common_bitrates[i];
         }
     }
 
-    xSemaphoreGive(mutex_);
+    uint32_t reference_bitrate = bitrate_adapted_once_ ? detected_bitrate_kbps_ : DEFAULT_BITRATE_KBPS;
+    uint32_t gap = reference_bitrate > best_match ? reference_bitrate - best_match : best_match - reference_bitrate;
+    uint32_t threshold = std::max<uint32_t>(8, reference_bitrate / 10);
 
-    LOG_INFO("Bitrate auto-detected: %u kbps (measured: %u kbps)",
-             best_match, detected_kbps);
-
-    // Recalculate all buffer sizes based on detected bitrate
-    calculate_adaptive_sizes(best_match);
+    if (!bitrate_adapted_once_ || gap > threshold) {
+        LOG_INFO("Bitrate auto-detected: %u kbps (avg %u kbps, sample %u kbps)",
+                 best_match, average_kbps, measured_kbps);
+        calculate_adaptive_sizes(best_match);
+        bitrate_adapted_once_ = true;
+    }
 }
 
 bool TimeshiftManager::open(const char* uri) {
@@ -142,6 +142,13 @@ bool TimeshiftManager::open(const char* uri) {
     pause_download_ = false;
     is_auto_paused_ = false;
     cumulative_time_ms_ = 0;  // Reset temporal tracking
+
+    // Reset bitrate tracking so each stream starts from the default assumption
+    bitrate_history_.clear();
+    bytes_since_rate_sample_ = 0;
+    bitrate_sample_start_ms_ = 0;
+    bitrate_adapted_once_ = false;
+    calculate_adaptive_sizes(DEFAULT_BITRATE_KBPS);
 
     // Initialize storage backend based on current mode
     if (storage_mode_ == StorageMode::SD_CARD) {
@@ -383,8 +390,7 @@ size_t TimeshiftManager::total_downloaded_bytes() const {
 }
 
 float TimeshiftManager::buffer_duration_seconds() const {
-    // Simple estimation assuming 128kbps
-    constexpr float bitrate_kbps = 128.0f;
+    float bitrate_kbps = detected_bitrate_kbps_ != 0 ? (float)detected_bitrate_kbps_ : (float)DEFAULT_BITRATE_KBPS;
     return (buffered_bytes() * 8.0f) / (bitrate_kbps * 1024.0f);
 }
 
@@ -556,7 +562,21 @@ void TimeshiftManager::download_task_loop() {
             int len = stream->readBytes(buf, to_read);
 
             if (len > 0) {
-                last_data_time = millis(); // Reset timeout on successful read
+                uint32_t now = millis();
+                last_data_time = now; // Reset timeout on successful read
+
+                if (bytes_since_rate_sample_ == 0) {
+                    bitrate_sample_start_ms_ = now;
+                }
+                bytes_since_rate_sample_ += len;
+
+                uint32_t rate_elapsed_ms = now - bitrate_sample_start_ms_;
+                if (rate_elapsed_ms >= BITRATE_SAMPLE_WINDOW_MS) {
+                    uint32_t measured_kbps = (bytes_since_rate_sample_ * 8) / rate_elapsed_ms;
+                    apply_bitrate_measurement(measured_kbps);
+                    bytes_since_rate_sample_ = 0;
+                    bitrate_sample_start_ms_ = 0;
+                }
 
                 // Write to recording_buffer_ (circular) with bounds check
                 for (int i = 0; i < len; i++) {
@@ -657,14 +677,6 @@ bool TimeshiftManager::flush_recording_chunk() {
         LOG_ERROR("Chunk %u validation failed", chunk.id);
         SD_MMC.remove(chunk.filename.c_str());
         return false;
-    }
-
-    // ADAPTIVE BITRATE DETECTION: After we have 2 chunks, auto-detect bitrate and adapt
-    if (detected_bitrate_kbps_ == DEFAULT_BITRATE_KBPS && ready_chunks_.size() >= 2) {
-        // Release mutex temporarily for bitrate detection
-        xSemaphoreGive(mutex_);
-        detect_and_adapt_to_bitrate();
-        xSemaphoreTake(mutex_, portMAX_DELAY);
     }
 
     // Cleanup old chunks (chiamato dopo ogni flush di chunk)
@@ -1398,114 +1410,58 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
 // ========== TEMPORAL SEEK METHODS ==========
 
 size_t TimeshiftManager::seek_to_time(uint32_t target_ms) {
+    // --- NUOVA LOGICA DI SEEK RELATIVO ---
+    // Tratta sempre il target_ms come un offset relativo alla durata totale del buffer disponibile.
+    // Esempio: se il buffer contiene 60 secondi di audio e si chiede un seek a 10000ms (10s),
+    // il seek avverrà a 10 secondi dall'inizio del primo chunk disponibile.
+
     xSemaphoreTake(mutex_, portMAX_DELAY);
 
     if (ready_chunks_.empty()) {
         xSemaphoreGive(mutex_);
         LOG_WARN("Seek to time failed: no ready chunks available");
-        return SIZE_MAX;  // Invalid offset
+        return SIZE_MAX; // Invalid offset
     }
 
-    // CHIAVE: Rendi il target relativo all'inizio del buffer disponibile.
-    // Se l'utente chiede 1000ms, significa 1000ms DALL'INIZIO del timeshift.
-    target_ms += ready_chunks_.front().start_time_ms;
-
-    const ChunkInfo& first_chunk = ready_chunks_.front();
-    const ChunkInfo& last_chunk = ready_chunks_.back();
+    // 1. Calcola la durata totale del buffer disponibile
     uint32_t total_duration_ms = 0;
     for (const auto& c : ready_chunks_) {
         total_duration_ms += c.duration_ms;
     }
 
-    // STRATEGIA SICURA: Calcolo dinamico del margine di sicurezza
-    // Basato sulla dimensione dei chunk e sul parametro auto_pause_min_chunks_
-    // Formula: durata_chunk = (dynamic_chunk_size_ * 8000) / (bitrate_kbps * 1024)
-    // Con bitrate a 128kbps: ~8 secondi per chunk da 128KB
-    constexpr float bitrate_kbps = 128.0f;
-    uint32_t avg_chunk_duration_ms = (uint32_t)((dynamic_chunk_size_ * 8000.0f) / (bitrate_kbps * 1024.0f));
-    uint32_t SAFETY_MARGIN_MS = avg_chunk_duration_ms * auto_pause_min_chunks_;
-
-    uint32_t safe_max_ms = (total_duration_ms > SAFETY_MARGIN_MS)
-                           ? (total_duration_ms - SAFETY_MARGIN_MS)
-                           : 0;
-
-    // PROTECTION AGAINST CLEANUP: Prevent seeking to chunks that might be deleted
-    // Calculate the minimum safe time based on cleanup window (bytes) only when we have more data than the cleanup window
-    uint32_t estimated_bitrate_kbps = (detected_bitrate_kbps_ > 0) ? detected_bitrate_kbps_ : DEFAULT_BITRATE_KBPS;
-    uint32_t cleanup_window_ms = (uint32_t)((MAX_TS_WINDOW * 8.0f * 1000.0f) / (estimated_bitrate_kbps * 1024.0f));
-    uint32_t safe_min_ms = first_chunk.start_time_ms;
-    size_t oldest_chunk_age_bytes = 0;
-    if (current_recording_offset_ > first_chunk.end_offset) {
-        oldest_chunk_age_bytes = current_recording_offset_ - first_chunk.end_offset;
-    }
-    bool cleanup_clamp_applicable = oldest_chunk_age_bytes >= MAX_TS_WINDOW;
-
-    // Se il target è oltre il margine di sicurezza, clampalo
-    bool clamped_for_safety = false;
-    if (target_ms > safe_max_ms) {
-        LOG_WARN("Seek to %u ms is too close to end (%u ms total), clamping to safe position at %u ms (margin: %u ms = %u chunks)",
-                 target_ms, total_duration_ms, safe_max_ms, SAFETY_MARGIN_MS, (unsigned)auto_pause_min_chunks_);
-        target_ms = safe_max_ms;
-        clamped_for_safety = true;
+    // 2. Limita (clampa) il target alla durata disponibile
+    if (target_ms >= total_duration_ms) {
+        LOG_WARN("Seek target %u ms is beyond available duration %u ms. Seeking to the end.",
+                 target_ms, total_duration_ms);
+        target_ms = total_duration_ms > 0 ? total_duration_ms - 1 : 0; // Vai alla fine
     }
 
-    // Se il target è troppo vicino all'inizio (rischio cleanup), clampalo
-    bool clamped_for_cleanup = false;
-    if (cleanup_clamp_applicable && target_ms < safe_min_ms + cleanup_window_ms) {
-        uint32_t clamped_value = safe_min_ms + cleanup_window_ms;
-        LOG_WARN("Seek to %u ms is too close to cleanup window (starts at %u ms), clamping to safe position at %u ms (cleanup margin: %u ms)",
-                 target_ms, first_chunk.start_time_ms, clamped_value, cleanup_window_ms);
-        target_ms = clamped_value;
-        clamped_for_cleanup = true;
-    }
+    // 3. Itera sui chunk per trovare la posizione corretta
+    uint32_t accumulated_duration_ms = 0;
+    for (const auto& chunk : ready_chunks_) {
+        if (target_ms < accumulated_duration_ms + chunk.duration_ms) {
+            // Trovato il chunk corretto!
+            uint32_t time_into_chunk = target_ms - accumulated_duration_ms;
+            float progress_in_chunk = (float)time_into_chunk / (float)chunk.duration_ms;
 
-    // If target is BEFORE available time, seek to BEGINNING
-    if (target_ms < first_chunk.start_time_ms) {
-        size_t first_offset = first_chunk.start_offset;
-        xSemaphoreGive(mutex_);
+            // Stima l'offset in byte basato sulla progressione temporale (interpolazione lineare)
+            size_t byte_offset_in_chunk = (size_t)(chunk.length * progress_in_chunk);
+            size_t final_offset = chunk.start_offset + byte_offset_in_chunk;
 
-        LOG_WARN("Seek to %u ms before available time (starts at %u ms), seeking to beginning",
-                 target_ms, first_chunk.start_time_ms);
-
-        return first_offset;
-    }
-
-    // Search for the chunk containing the (possibly clamped) target timestamp
-    for (size_t i = 0; i < ready_chunks_.size(); i++) {
-        const ChunkInfo& chunk = ready_chunks_[i];
-        uint32_t chunk_end_ms = chunk.start_time_ms + chunk.duration_ms;
-
-        if (target_ms >= chunk.start_time_ms && target_ms < chunk_end_ms) {
-            // Found the chunk! Calculate relative offset within chunk
-            uint32_t offset_ms = target_ms - chunk.start_time_ms;
-            float progress = (float)offset_ms / (float)chunk.duration_ms;
-
-            // Estimate byte offset (linear interpolation)
-            size_t byte_offset_in_chunk = (size_t)(chunk.length * progress);
-            size_t global_offset = chunk.start_offset + byte_offset_in_chunk;
+            LOG_INFO("Seek to %u ms (relative) -> chunk %u, byte offset %u (progress %.1f%%)",
+                     target_ms, chunk.id, (unsigned)final_offset, progress_in_chunk * 100.0f);
 
             xSemaphoreGive(mutex_);
-
-            std::string clamp_reason = "";
-            if (clamped_for_safety) clamp_reason += " [SAFE POSITION - buffering margin]";
-            if (clamped_for_cleanup) clamp_reason += " [SAFE POSITION - cleanup protection]";
-
-            LOG_INFO("Seek to %u ms → chunk %u, byte offset %u (progress %.2f%%)%s",
-                     target_ms, chunk.id, (unsigned)global_offset, progress * 100.0f,
-                     clamp_reason.c_str());
-
-            return global_offset;
+            return final_offset;
         }
+        accumulated_duration_ms += chunk.duration_ms;
     }
 
-    // Target not found - shouldn't happen after clamping, but handle gracefully
-    // Seek to beginning of last chunk as fallback
-    size_t safe_offset = last_chunk.start_offset;
+    // Fallback: se qualcosa va storto, vai all'inizio dell'ultimo chunk
+    LOG_WARN("Seek failed to find position, falling back to last chunk start.");
+    size_t fallback_offset = ready_chunks_.back().start_offset;
     xSemaphoreGive(mutex_);
-
-    LOG_WARN("Seek target not found after clamping, seeking to beginning of last chunk");
-
-    return safe_offset;
+    return fallback_offset;
 }
 
 uint32_t TimeshiftManager::total_duration_ms() const {
