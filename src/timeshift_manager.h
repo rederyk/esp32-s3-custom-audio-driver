@@ -67,10 +67,21 @@ public:
     }
 
 private:
-    static const size_t BUFFER_SIZE = 128 * 1024;       // 128KB recording buffer
-    static const size_t PLAYBACK_BUFFER_SIZE = 256 * 1024;  // Raddoppiato a 256KB per contenere chunk corrente + successivo
-    static const size_t CHUNK_SIZE = 128 * 1024;        // Manteniamo i chunk da 128KB
+    // ADAPTIVE BUFFER SIZING - all values computed dynamically based on detected bitrate
     static const size_t INVALID_CHUNK_ID = SIZE_MAX;
+
+    // Bitrate detection and adaptive sizing
+    uint32_t detected_bitrate_kbps_ = 0;        // Auto-detected stream bitrate
+    size_t dynamic_chunk_size_ = 128 * 1024;    // Target chunk size (adaptive)
+    size_t dynamic_buffer_size_ = 192 * 1024;   // Recording buffer (1.5x chunk_size)
+    size_t dynamic_playback_buffer_size_ = 384 * 1024;  // Playback buffer (3x chunk_size)
+    size_t dynamic_min_flush_size_ = 102 * 1024;        // Flush threshold (0.8x chunk_size)
+    size_t dynamic_download_chunk_ = 4096;      // Download block size
+
+    // Legacy constants for backward compatibility (unused, will be removed)
+    static const size_t BUFFER_SIZE = 128 * 1024;
+    static const size_t PLAYBACK_BUFFER_SIZE = 256 * 1024;
+    static const size_t CHUNK_SIZE = 128 * 1024;
     static const size_t MAX_PSRAM_CHUNKS = 16;          // Max 16 chunks in PSRAM = 2MB
 
     enum class ChunkState {
@@ -148,7 +159,11 @@ private:
 
     // Temporal tracking
     uint32_t cumulative_time_ms_ = 0;  // Tempo cumulativo di tutti i chunk processati
-    
+
+    // ADAPTIVE BITRATE DETECTION
+    void detect_and_adapt_to_bitrate();     // Auto-detect bitrate from first chunks
+    void calculate_adaptive_sizes(uint32_t bitrate_kbps);  // Compute buffer sizes
+
     // RECORDING SIDE (private helpers)
     bool flush_recording_chunk();                    // Flush recording_buffer_ to storage
     bool write_chunk_to_sd(ChunkInfo& chunk);       // Write chunk data to SD file

@@ -7,17 +7,23 @@
 #include <esp_heap_caps.h>  // For PSRAM allocation
 #include "mp3_seek_table.h"
 
-constexpr size_t BUFFER_SIZE = 128 * 1024;       // 128KB per buffer
-constexpr size_t CHUNK_SIZE = 128 * 1024;        // Chunk fissi da 128KB
-// CONFIGURABILE: Ridotto da 512MB a 256MB per cleanup più aggressivo
-// Modifica questo valore per cambiare quando vengono rimossi i chunk vecchi
-constexpr size_t MAX_TS_WINDOW = 1024 * 1024 * 2; // 256 MB max window (era 512MB)
-constexpr size_t DOWNLOAD_CHUNK = 4096;          // Aumentiamo per efficienza
-constexpr size_t MIN_CHUNK_FLUSH_SIZE = 124 * 1024; // Flush vicino alla dimensione target
+// ========== ADAPTIVE BUFFER CONFIGURATION ==========
+// Target chunk duration: 5-10 seconds of audio for optimal balance
+constexpr uint32_t TARGET_CHUNK_DURATION_SEC = 7;  // 7 seconds per chunk (balanced)
+constexpr uint32_t MIN_CHUNK_DURATION_SEC = 4;     // Minimum 4 seconds
+constexpr uint32_t MAX_CHUNK_DURATION_SEC = 12;    // Maximum 12 seconds
+
+// Cleanup window
+constexpr size_t MAX_TS_WINDOW = 1024 * 1024 * 2; // 2 MB max window
+
+// Default bitrate assumption (will be auto-detected from stream)
+constexpr uint32_t DEFAULT_BITRATE_KBPS = 128;
 
 TimeshiftManager::TimeshiftManager() {
     mutex_ = xSemaphoreCreateMutex();
     is_auto_paused_ = false;
+    // Initialize with default bitrate, will be adapted after first chunk
+    calculate_adaptive_sizes(DEFAULT_BITRATE_KBPS);
 }
 
 TimeshiftManager::~TimeshiftManager() {
@@ -27,6 +33,96 @@ TimeshiftManager::~TimeshiftManager() {
     if (recording_buffer_) free(recording_buffer_);
     if (playback_buffer_) free(playback_buffer_);
     free_psram_pool();
+}
+
+// ========== ADAPTIVE BITRATE DETECTION ==========
+
+void TimeshiftManager::calculate_adaptive_sizes(uint32_t bitrate_kbps) {
+    // FORMULA: chunk_size = (bitrate_kbps * 1000 / 8) * target_duration_sec
+    // Ensures chunks contain TARGET_CHUNK_DURATION_SEC seconds of audio
+
+    uint32_t target_chunk_bytes = (bitrate_kbps * 1000 / 8) * TARGET_CHUNK_DURATION_SEC;
+
+    // Clamp to reasonable limits (16KB - 512KB)
+    const size_t MIN_CHUNK_SIZE = 16 * 1024;   // 16KB minimum
+    const size_t MAX_CHUNK_SIZE = 512 * 1024;  // 512KB maximum
+
+    dynamic_chunk_size_ = std::max(MIN_CHUNK_SIZE,
+                          std::min(MAX_CHUNK_SIZE, (size_t)target_chunk_bytes));
+
+    // Recording buffer: 1.5x chunk size (50% safety margin)
+    dynamic_buffer_size_ = dynamic_chunk_size_ + (dynamic_chunk_size_ / 2);
+
+    // Playback buffer: 3x chunk size (current + next + safety)
+    dynamic_playback_buffer_size_ = dynamic_chunk_size_ * 3;
+
+    // Flush threshold: 80% of chunk size
+    dynamic_min_flush_size_ = (dynamic_chunk_size_ * 4) / 5;
+
+    // Download chunk: proportional to bitrate (faster streams = larger reads)
+    if (bitrate_kbps <= 64) {
+        dynamic_download_chunk_ = 2048;   // 2KB for low bitrate
+    } else if (bitrate_kbps <= 128) {
+        dynamic_download_chunk_ = 4096;   // 4KB for medium
+    } else {
+        dynamic_download_chunk_ = 8192;   // 8KB for high bitrate
+    }
+
+    detected_bitrate_kbps_ = bitrate_kbps;
+
+    LOG_INFO("Adaptive sizing for %u kbps: chunk=%u KB, buffer=%u KB, playback=%u KB, download=%u B",
+             bitrate_kbps,
+             (unsigned)(dynamic_chunk_size_ / 1024),
+             (unsigned)(dynamic_buffer_size_ / 1024),
+             (unsigned)(dynamic_playback_buffer_size_ / 1024),
+             (unsigned)dynamic_download_chunk_);
+}
+
+void TimeshiftManager::detect_and_adapt_to_bitrate() {
+    // Auto-detect bitrate from first 2 chunks
+    if (detected_bitrate_kbps_ != 0 || ready_chunks_.size() < 2) {
+        return;  // Already detected or not enough data
+    }
+
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+
+    // Calculate average bitrate from first chunks
+    const ChunkInfo& chunk0 = ready_chunks_[0];
+    const ChunkInfo& chunk1 = ready_chunks_[1];
+
+    if (chunk0.duration_ms == 0 || chunk1.duration_ms == 0) {
+        xSemaphoreGive(mutex_);
+        return;  // Duration not calculated yet
+    }
+
+    // Average bytes per second
+    float avg_bytes_per_ms = (chunk0.length + chunk1.length) /
+                             (float)(chunk0.duration_ms + chunk1.duration_ms);
+    float avg_bytes_per_sec = avg_bytes_per_ms * 1000.0f;
+
+    // Convert to kbps
+    uint32_t detected_kbps = (uint32_t)((avg_bytes_per_sec * 8) / 1000);
+
+    // Round to common bitrates (32, 64, 96, 128, 160, 192, 256, 320)
+    const uint32_t common_bitrates[] = {32, 64, 96, 128, 160, 192, 256, 320};
+    uint32_t best_match = common_bitrates[0];
+    uint32_t min_diff = abs((int)detected_kbps - (int)best_match);
+
+    for (size_t i = 1; i < sizeof(common_bitrates) / sizeof(common_bitrates[0]); i++) {
+        uint32_t diff = abs((int)detected_kbps - (int)common_bitrates[i]);
+        if (diff < min_diff) {
+            min_diff = diff;
+            best_match = common_bitrates[i];
+        }
+    }
+
+    xSemaphoreGive(mutex_);
+
+    LOG_INFO("Bitrate auto-detected: %u kbps (measured: %u kbps)",
+             best_match, detected_kbps);
+
+    // Recalculate all buffer sizes based on detected bitrate
+    calculate_adaptive_sizes(best_match);
 }
 
 bool TimeshiftManager::open(const char* uri) {
@@ -81,24 +177,26 @@ bool TimeshiftManager::open(const char* uri) {
                  MAX_PSRAM_CHUNKS, psram_pool_size_ / 1024);
     }
 
-    recording_buffer_ = (uint8_t*)malloc(BUFFER_SIZE);
+    recording_buffer_ = (uint8_t*)malloc(dynamic_buffer_size_);
     if (!recording_buffer_) {
-        LOG_ERROR("Failed to allocate recording buffer");
+        LOG_ERROR("Failed to allocate recording buffer (%u KB)", (unsigned)(dynamic_buffer_size_ / 1024));
         close();
         return false;
     }
 
-    playback_buffer_ = (uint8_t*)malloc(PLAYBACK_BUFFER_SIZE);
+    playback_buffer_ = (uint8_t*)malloc(dynamic_playback_buffer_size_);
     if (!playback_buffer_) {
-        LOG_ERROR("Failed to allocate playback buffer");
+        LOG_ERROR("Failed to allocate playback buffer (%u KB)", (unsigned)(dynamic_playback_buffer_size_ / 1024));
         free(recording_buffer_);
         recording_buffer_ = nullptr;
         close();
         return false;
     }
 
-    LOG_INFO("Timeshift buffers allocated: rec=%uKB, play=%uKB",
-             BUFFER_SIZE / 1024, PLAYBACK_BUFFER_SIZE / 1024);
+    LOG_INFO("Timeshift buffers allocated: rec=%uKB, play=%uKB (adaptive for %u kbps)",
+             (unsigned)(dynamic_buffer_size_ / 1024),
+             (unsigned)(dynamic_playback_buffer_size_ / 1024),
+             detected_bitrate_kbps_);
     return true;
 }
 
@@ -144,7 +242,9 @@ bool TimeshiftManager::start() {
     }
 
     is_running_ = true;
-    BaseType_t result = xTaskCreate(download_task_trampoline, "ts_download", 8192, this, 5, &download_task_handle_);
+    // CRITICAL FIX: Increased stack from 8KB to 24KB to prevent stack overflow
+    // HTTPClient + WiFiClient + TLS + local buffers need substantial stack space
+    BaseType_t result = xTaskCreate(download_task_trampoline, "ts_download", 24576, this, 5, &download_task_handle_);
     if (result != pdPASS) {
         LOG_ERROR("Failed to create download task");
         is_running_ = false;
@@ -152,8 +252,8 @@ bool TimeshiftManager::start() {
     }
     LOG_INFO("TimeshiftManager download task created successfully");
 
-    // Crea il nuovo task di pre-caricamento
-    result = xTaskCreate(preloader_task_trampoline, "ts_preloader", 4096, this, 4, &preloader_task_handle_);
+    // Crea il nuovo task di pre-caricamento (increased from 4KB to 8KB for safety)
+    result = xTaskCreate(preloader_task_trampoline, "ts_preloader", 8192, this, 4, &preloader_task_handle_);
     if (result != pdPASS) {
         LOG_ERROR("Failed to create preloader task");
         stop(); // Cleanup
@@ -273,9 +373,9 @@ size_t TimeshiftManager::buffered_bytes() const {
     size_t num_ready = ready_chunks_.size();
     if (num_ready == 0) return 0;
 
-    // Conservative estimate: num_chunks * CHUNK_SIZE
+    // Conservative estimate: num_chunks * dynamic_chunk_size_
     // (actual calculation would need mutex, but this is good enough for "ready?" check)
-    return num_ready * CHUNK_SIZE;
+    return num_ready * dynamic_chunk_size_;
 }
 
 size_t TimeshiftManager::total_downloaded_bytes() const {
@@ -379,7 +479,16 @@ void TimeshiftManager::download_task_loop() {
     LOG_INFO("HTTP connected, code: %d - starting download loop", httpCode);
     WiFiClient* stream = http.getStreamPtr();
 
-    uint8_t buf[DOWNLOAD_CHUNK];
+    // CRITICAL: Verify stream pointer is valid
+    if (!stream) {
+        LOG_ERROR("CRITICAL: getStreamPtr() returned NULL!");
+        is_running_ = false;
+        http.end();
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    uint8_t buf[dynamic_download_chunk_];
     size_t total_downloaded = 0;
     uint32_t last_log_time = millis();
 
@@ -394,18 +503,65 @@ void TimeshiftManager::download_task_loop() {
             continue;
         }
 
+        // SAFETY: Check stream validity before using
+        if (!stream || !stream->connected()) {
+            LOG_WARN("Stream disconnected, attempting reconnect...");
+            http.end();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+
+            http.begin(uri_.c_str());
+            http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+            http.setTimeout(10000);
+            httpCode = http.GET();
+
+            if (httpCode != HTTP_CODE_OK) {
+                LOG_ERROR("Reconnection failed: %d", httpCode);
+                break;
+            }
+            stream = http.getStreamPtr();
+            if (!stream) {
+                LOG_ERROR("Reconnection failed: NULL stream");
+                break;
+            }
+            last_data_time = millis();
+            LOG_INFO("Reconnected successfully");
+            continue;
+        }
+
         int available = stream->available();
         if (available > 0) {
-            size_t to_read = std::min(sizeof(buf), (size_t)available);
+            // OVERFLOW PROTECTION: Check if we have enough space before reading
+            size_t space_left = dynamic_buffer_size_ - bytes_in_current_chunk_;
+            if (space_left < dynamic_download_chunk_) {
+                // Buffer is critically full, force flush NOW
+                LOG_WARN("OVERFLOW PROTECTION: Buffer critically full (%u/%u bytes), forcing immediate flush",
+                         (unsigned)bytes_in_current_chunk_, (unsigned)dynamic_buffer_size_);
+                if (!flush_recording_chunk()) {
+                    LOG_ERROR("Emergency flush failed!");
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    continue; // Skip this iteration, don't write more data
+                }
+                // After flush, space_left is reset
+                space_left = dynamic_buffer_size_;
+            }
+
+            // Limit read to available space (defensive)
+            size_t to_read = std::min({sizeof(buf), (size_t)available, space_left});
             int len = stream->readBytes(buf, to_read);
 
             if (len > 0) {
                 last_data_time = millis(); // Reset timeout on successful read
 
-                // Write to recording_buffer_ (circular)
+                // Write to recording_buffer_ (circular) with bounds check
                 for (int i = 0; i < len; i++) {
+                    if (bytes_in_current_chunk_ >= dynamic_buffer_size_) {
+                        // This should NEVER happen due to checks above, but defensive programming
+                        LOG_ERROR("CRITICAL: Buffer overflow prevented! bytes=%u, dynamic_buffer_size_=%u",
+                                 (unsigned)bytes_in_current_chunk_, (unsigned)dynamic_buffer_size_);
+                        break; // Stop writing immediately
+                    }
                     recording_buffer_[rec_write_head_] = buf[i];
-                    rec_write_head_ = (rec_write_head_ + 1) % BUFFER_SIZE;
+                    rec_write_head_ = (rec_write_head_ + 1) % dynamic_buffer_size_;
                     bytes_in_current_chunk_++;
                 }
                 total_downloaded += len;
@@ -413,10 +569,10 @@ void TimeshiftManager::download_task_loop() {
                 // --- LOGICA DI FLUSH DECOUPLED ---
                 // Controlliamo se è necessario un flush, ma lo eseguiamo *fuori* dal mutex
                 // per non bloccare il thread di playback durante la scrittura su SD.
-                bool needs_flush = (bytes_in_current_chunk_ >= MIN_CHUNK_FLUSH_SIZE);
+                bool needs_flush = (bytes_in_current_chunk_ >= dynamic_min_flush_size_);
 
                 if (needs_flush) {
-                    LOG_INFO("Buffer near full (%u bytes), flushing to SD", (unsigned)bytes_in_current_chunk_);
+                    LOG_INFO("Buffer reached target (%u bytes), flushing chunk", (unsigned)bytes_in_current_chunk_);
                     if (!flush_recording_chunk()) {
                         LOG_ERROR("Failed to flush recording chunk");
                         // Potremmo voler gestire l'errore in modo più robusto qui
@@ -437,22 +593,9 @@ void TimeshiftManager::download_task_loop() {
         } else {
             // No data available, check for timeout
             if (millis() - last_data_time > STREAM_TIMEOUT) {
-                LOG_WARN("Stream timeout (no data for %u sec), reconnecting...", STREAM_TIMEOUT / 1000);
-                http.end();
-                vTaskDelay(pdMS_TO_TICKS(1000));
-
-                http.begin(uri_.c_str());
-                http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-                http.setTimeout(10000);
-                httpCode = http.GET();
-
-                if (httpCode != HTTP_CODE_OK) {
-                    LOG_ERROR("Reconnection failed: %d", httpCode);
-                    break;
-                }
-                stream = http.getStreamPtr();
-                last_data_time = millis();
-                LOG_INFO("Reconnected successfully");
+                LOG_WARN("Stream timeout (no data for %u sec), will reconnect on next iteration", STREAM_TIMEOUT / 1000);
+                // Don't reconnect here - the stream validity check at loop start will handle it
+                last_data_time = millis(); // Reset to avoid spam
             }
 
             vTaskDelay(pdMS_TO_TICKS(50)); // Wait a bit longer when no data
@@ -510,6 +653,14 @@ bool TimeshiftManager::flush_recording_chunk() {
         return false;
     }
 
+    // ADAPTIVE BITRATE DETECTION: After we have 2 chunks, auto-detect bitrate and adapt
+    if (detected_bitrate_kbps_ == DEFAULT_BITRATE_KBPS && ready_chunks_.size() >= 2) {
+        // Release mutex temporarily for bitrate detection
+        xSemaphoreGive(mutex_);
+        detect_and_adapt_to_bitrate();
+        xSemaphoreTake(mutex_, portMAX_DELAY);
+    }
+
     // Cleanup old chunks (chiamato dopo ogni flush di chunk)
     LOG_DEBUG("Calling cleanup_old_chunks() after flushing chunk %u", chunk.id);
     cleanup_old_chunks();
@@ -542,9 +693,9 @@ bool TimeshiftManager::write_chunk_to_sd(ChunkInfo& chunk) {
             return false;
         }
     } else {
-        // Data wraps around: [BUFFER_SIZE - remainder ... BUFFER_SIZE) + [0 ... rec_write_head_)
+        // Data wraps around: [dynamic_buffer_size_ - remainder ... dynamic_buffer_size_) + [0 ... rec_write_head_)
         size_t remainder = chunk.length - rec_write_head_;
-        start_pos = BUFFER_SIZE - remainder;
+        start_pos = dynamic_buffer_size_ - remainder;
 
         // Write first part (from start_pos to end of buffer)
         size_t written1 = file.write(recording_buffer_ + start_pos, remainder);
@@ -580,9 +731,9 @@ bool TimeshiftManager::write_chunk_to_psram(ChunkInfo& chunk) {
         start_pos = rec_write_head_ - chunk.length;
         memcpy(chunk.psram_ptr, recording_buffer_ + start_pos, chunk.length);
     } else {
-        // Data wraps around: [BUFFER_SIZE - remainder ... BUFFER_SIZE) + [0 ... rec_write_head_)
+        // Data wraps around: [dynamic_buffer_size_ - remainder ... dynamic_buffer_size_) + [0 ... rec_write_head_)
         size_t remainder = chunk.length - rec_write_head_;
-        start_pos = BUFFER_SIZE - remainder;
+        start_pos = dynamic_buffer_size_ - remainder;
 
         // Copy first part (from start_pos to end of buffer)
         memcpy(chunk.psram_ptr, recording_buffer_ + start_pos, remainder);
@@ -853,6 +1004,8 @@ void TimeshiftManager::cleanup_old_chunks() {
                   (unsigned)age_bytes);
 
         if (age_bytes > MAX_TS_WINDOW) {
+            // STRATEGY: Always delete old chunks to free space
+            // If playback is affected, we'll adjust it below
             LOG_INFO("CLEANUP: Removing old chunk %u (age: %u MB > limit: %u MB)",
                      oldest.id,
                      (unsigned)age_mb,
@@ -890,28 +1043,43 @@ void TimeshiftManager::cleanup_old_chunks() {
         }
     }
 
-    // Causa #1 (FIX): Se abbiamo rimosso dei chunk, dobbiamo aggiornare l'indice di playback
-    // per evitare che punti a un chunk errato.
+    // CRITICAL FIX: After cleanup, ensure playback state is valid
     if (chunks_removed_count > 0) {
-        if (current_playback_chunk_id_ != INVALID_CHUNK_ID && current_playback_chunk_id_ >= chunks_removed_count) {
-            current_playback_chunk_id_ -= chunks_removed_count;
+        // Adjust chunk indices (they shifted left by chunks_removed_count)
+        if (current_playback_chunk_id_ != INVALID_CHUNK_ID) {
+            if (current_playback_chunk_id_ >= chunks_removed_count) {
+                current_playback_chunk_id_ -= chunks_removed_count;
+            } else {
+                // Playback chunk was deleted! Reset to first available
+                current_playback_chunk_id_ = 0;
+                LOG_WARN("CLEANUP: Playback chunk was deleted, resetting to chunk 0");
+            }
         }
-        if (last_preload_check_chunk_ != INVALID_CHUNK_ID && last_preload_check_chunk_ >= chunks_removed_count) {
-            last_preload_check_chunk_ -= chunks_removed_count;
+
+        if (last_preload_check_chunk_ != INVALID_CHUNK_ID) {
+            if (last_preload_check_chunk_ >= chunks_removed_count) {
+                last_preload_check_chunk_ -= chunks_removed_count;
+            } else {
+                last_preload_check_chunk_ = INVALID_CHUNK_ID;
+            }
         }
+
         LOG_DEBUG("Adjusted playback chunk ID by -%u due to cleanup", (unsigned)chunks_removed_count);
 
-        // FIX: Aggiusta anche current_read_offset_ se punta a chunk rimossi
-        // Se current_read_offset_ è fuori dal range dei chunk disponibili, spostalo all'inizio del primo chunk
+        // FORCE playback to jump to first available chunk if current position was deleted
         if (!ready_chunks_.empty()) {
             const ChunkInfo& first_chunk = ready_chunks_.front();
             const ChunkInfo& last_chunk = ready_chunks_.back();
 
-            // Se l'offset corrente è prima del primo chunk disponibile o dopo l'ultimo
-            if (current_read_offset_ < first_chunk.start_offset || current_read_offset_ >= last_chunk.end_offset) {
+            // If read offset is before first chunk or after last chunk, jump to first
+            if (current_read_offset_ < first_chunk.start_offset ||
+                current_read_offset_ >= last_chunk.end_offset) {
+
                 size_t old_offset = current_read_offset_;
                 current_read_offset_ = first_chunk.start_offset;
-                LOG_INFO("CLEANUP: Adjusted read offset from %u to %u (first available chunk)",
+                current_playback_chunk_id_ = 0;  // Force reload
+
+                LOG_WARN("CLEANUP: Playback jumped from offset %u to %u (live stream caught up, skipping to latest)",
                          (unsigned)old_offset, (unsigned)current_read_offset_);
             }
         }
@@ -953,7 +1121,7 @@ bool TimeshiftManager::preload_next_chunk(size_t current_chunk_id) {
         }
 
         // Carica nella seconda metà del buffer
-        size_t read = file.read(playback_buffer_ + CHUNK_SIZE, next_chunk.length);
+        size_t read = file.read(playback_buffer_ + dynamic_chunk_size_, next_chunk.length);
         file.close();
 
         if (read != next_chunk.length) {
@@ -966,11 +1134,11 @@ bool TimeshiftManager::preload_next_chunk(size_t current_chunk_id) {
             LOG_ERROR("Preload failed: null PSRAM pointer for chunk %u", next_chunk.id);
             return false;
         }
-        memcpy(playback_buffer_ + CHUNK_SIZE, next_chunk.psram_ptr, next_chunk.length);
+        memcpy(playback_buffer_ + dynamic_chunk_size_, next_chunk.psram_ptr, next_chunk.length);
     }
 
     LOG_DEBUG("Preloaded chunk %u (%u KB) at buffer offset %u",
-              next_chunk.id, next_chunk.length / 1024, (unsigned)CHUNK_SIZE);
+              next_chunk.id, next_chunk.length / 1024, (unsigned)dynamic_chunk_size_);
 
     return true;
 }
@@ -1074,8 +1242,46 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
     // Find chunk containing this offset
     size_t chunk_id = find_chunk_for_offset(offset);
     if (chunk_id == INVALID_CHUNK_ID) {
-        LOG_WARN("No chunk found for offset %u", (unsigned)offset);
-        return 0;
+        // For LIVE timeshift: if we're beyond available chunks but download is still running,
+        // WAIT for new chunks instead of returning 0 (which signals EOF to audio player)
+        if (is_running_ && !ready_chunks_.empty()) {
+            size_t last_chunk_end = ready_chunks_.back().end_offset;
+            if (offset >= last_chunk_end - 4096) {  // Within 4KB of end
+                LOG_INFO("Playback catching up to live stream, waiting for next chunk...");
+
+                // Wait up to 3 seconds for new chunk
+                uint32_t wait_start = millis();
+                const uint32_t MAX_WAIT_MS = 3000;
+                size_t initial_chunk_count = ready_chunks_.size();
+
+                while (is_running_ && (millis() - wait_start) < MAX_WAIT_MS) {
+                    xSemaphoreGive(mutex_);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                    xSemaphoreTake(mutex_, portMAX_DELAY);
+
+                    // Check if new chunk arrived
+                    if (ready_chunks_.size() > initial_chunk_count) {
+                        chunk_id = find_chunk_for_offset(offset);
+                        if (chunk_id != INVALID_CHUNK_ID) {
+                            LOG_INFO("New chunk arrived, resuming playback");
+                            break;
+                        }
+                    }
+                }
+
+                // If still not found after waiting, it's a real problem
+                if (chunk_id == INVALID_CHUNK_ID) {
+                    LOG_WARN("No chunk found for offset %u after waiting", (unsigned)offset);
+                    return 0;
+                }
+            } else {
+                LOG_WARN("No chunk found for offset %u", (unsigned)offset);
+                return 0;
+            }
+        } else {
+            LOG_WARN("No chunk found for offset %u", (unsigned)offset);
+            return 0;
+        }
     }
 
     // Se il chunk richiesto è quello successivo, esegui lo switch "seamless"
@@ -1084,7 +1290,7 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void* buffer, 
         const ChunkInfo& preloaded_chunk_info = ready_chunks_[chunk_id];
         size_t preloaded_size = preloaded_chunk_info.length;
         // Sposta il chunk pre-caricato (che si trova nella seconda metà del buffer) all'inizio.
-        memmove(playback_buffer_, playback_buffer_ + CHUNK_SIZE, preloaded_size);
+        memmove(playback_buffer_, playback_buffer_ + dynamic_chunk_size_, preloaded_size);
 
         current_playback_chunk_id_ = chunk_id;
         playback_chunk_loaded_size_ = ready_chunks_[chunk_id].length;
@@ -1189,10 +1395,10 @@ size_t TimeshiftManager::seek_to_time(uint32_t target_ms) {
 
     // STRATEGIA SICURA: Calcolo dinamico del margine di sicurezza
     // Basato sulla dimensione dei chunk e sul parametro auto_pause_min_chunks_
-    // Formula: durata_chunk = (CHUNK_SIZE * 8000) / (bitrate_kbps * 1024)
+    // Formula: durata_chunk = (dynamic_chunk_size_ * 8000) / (bitrate_kbps * 1024)
     // Con bitrate a 128kbps: ~8 secondi per chunk da 128KB
     constexpr float bitrate_kbps = 128.0f;
-    uint32_t avg_chunk_duration_ms = (uint32_t)((CHUNK_SIZE * 8000.0f) / (bitrate_kbps * 1024.0f));
+    uint32_t avg_chunk_duration_ms = (uint32_t)((dynamic_chunk_size_ * 8000.0f) / (bitrate_kbps * 1024.0f));
     uint32_t SAFETY_MARGIN_MS = avg_chunk_duration_ms * auto_pause_min_chunks_;
 
     uint32_t safe_max_ms = (total_duration_ms > SAFETY_MARGIN_MS)
@@ -1309,7 +1515,7 @@ bool TimeshiftManager::init_psram_pool() {
     }
 
     // Allocate pool for MAX_PSRAM_CHUNKS chunks
-    psram_pool_size_ = MAX_PSRAM_CHUNKS * CHUNK_SIZE;
+    psram_pool_size_ = MAX_PSRAM_CHUNKS * dynamic_chunk_size_;
 
     // Try to allocate in PSRAM first (heap_caps_malloc with MALLOC_CAP_SPIRAM)
     psram_chunk_pool_ = (uint8_t*)heap_caps_malloc(psram_pool_size_, MALLOC_CAP_SPIRAM);
@@ -1321,7 +1527,7 @@ bool TimeshiftManager::init_psram_pool() {
     }
 
     LOG_INFO("PSRAM pool allocated: %u KB (%u chunks x %u KB)",
-             psram_pool_size_ / 1024, MAX_PSRAM_CHUNKS, CHUNK_SIZE / 1024);
+             psram_pool_size_ / 1024, MAX_PSRAM_CHUNKS, dynamic_chunk_size_ / 1024);
 
     return true;
 }
@@ -1343,7 +1549,7 @@ uint8_t* TimeshiftManager::allocate_psram_chunk() {
 
     // Calculate circular index based on next_chunk_id_
     size_t pool_index = next_chunk_id_ % MAX_PSRAM_CHUNKS;
-    uint8_t* chunk_ptr = psram_chunk_pool_ + (pool_index * CHUNK_SIZE);
+    uint8_t* chunk_ptr = psram_chunk_pool_ + (pool_index * dynamic_chunk_size_);
 
     LOG_DEBUG("Allocated PSRAM chunk at pool index %u (chunk ID %u)",
               (unsigned)pool_index, next_chunk_id_);
