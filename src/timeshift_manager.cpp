@@ -1006,6 +1006,14 @@ void TimeshiftManager::cleanup_old_chunks() {
                   (unsigned)age_mb,
                   (unsigned)age_bytes);
 
+        // --- SAFETY CHECK ---
+        // Do not remove the currently playing chunk or the next 2 chunks.
+        // This creates a "safe zone" to prevent deleting data that is about to be played.
+        if (oldest.id >= current_playback_chunk_abs_id_ && oldest.id <= current_playback_chunk_abs_id_ + 2) {
+            LOG_DEBUG("Oldest chunk abs ID %u is in the playback safe zone, stopping cleanup.", oldest.id);
+            break;
+        }
+
         if (age_bytes > MAX_TS_WINDOW) {
             LOG_INFO("CLEANUP: Removing old chunk abs ID %u (age: %u MB > limit: %u MB)",
                      oldest.id,
