@@ -150,6 +150,8 @@ private:
     StorageMode storage_mode_ = StorageMode::SD_CARD;  // Default to SD card mode
     StorageMode pending_storage_mode_ = StorageMode::SD_CARD;
     bool storage_switch_requested_ = false;
+    bool backend_switch_in_progress_ = false;         // True while migrating chunks between backends
+    bool switch_pause_was_paused_ = false;            // Track playback pause state before migration
 
     // Download task
     TaskHandle_t download_task_handle_ = nullptr;

@@ -200,6 +200,8 @@ bool TimeshiftManager::open(const char *uri)
     ready_chunks_.clear();
     pause_download_ = false;
     is_auto_paused_ = false;
+    backend_switch_in_progress_ = false;
+    switch_pause_was_paused_ = false;
     cumulative_time_ms_ = 0; // Reset temporal tracking
 
     // Reset bitrate tracking so each stream starts from the default assumption
@@ -317,6 +319,8 @@ void TimeshiftManager::close()
 
     // Free PSRAM pool if allocated
     free_psram_pool();
+    backend_switch_in_progress_ = false;
+    switch_pause_was_paused_ = false;
 
     is_open_ = false;
     seek_table_.clear();
@@ -358,6 +362,8 @@ void TimeshiftManager::stop()
     if (is_running_)
     {
         is_running_ = false;
+        backend_switch_in_progress_ = false;
+        switch_pause_was_paused_ = false;
         if (download_task_handle_)
         {
             vTaskDelete(download_task_handle_);
@@ -532,6 +538,14 @@ void TimeshiftManager::preloader_task_loop()
             continue;
         }
 
+        // Skip preloading/logging while backend migration is in progress
+        if (backend_switch_in_progress_)
+        {
+            failed_preload_attempts_ = 0;
+            xSemaphoreGive(mutex_);
+            continue;
+        }
+
         // Rileva se siamo passati a un nuovo chunk
         if (current_playback_chunk_abs_id_ != last_playback_chunk_abs_id_seen)
         {
@@ -676,7 +690,21 @@ void TimeshiftManager::download_task_loop()
             xSemaphoreTake(mutex_, portMAX_DELAY);
             target = pending_storage_mode_;
             storage_switch_requested_ = false;
+            backend_switch_in_progress_ = true;
+            switch_pause_was_paused_ = is_auto_paused_;
+            bool has_callback = (auto_pause_callback_ != nullptr);
+            bool pause_playback = has_callback && !is_auto_paused_;
+            if (pause_playback)
+            {
+                is_auto_paused_ = true;
+            }
             xSemaphoreGive(mutex_);
+
+            // Pause playback while chunks are migrated to avoid underruns
+            if (pause_playback)
+            {
+                auto_pause_callback_(true);
+            }
 
             LOG_INFO("Executing backend switch to %s",
                      target == StorageMode::SD_CARD ? "SD_CARD" : "PSRAM_ONLY");
@@ -830,6 +858,27 @@ void TimeshiftManager::download_task_loop()
             else if (target == StorageMode::PSRAM_ONLY)
             {
                 free_psram_pool();
+            }
+
+            // Resume playback state after migration if we paused it here
+            bool resume_playback = false;
+            xSemaphoreTake(mutex_, portMAX_DELAY);
+            if (backend_switch_in_progress_)
+            {
+                resume_playback = (auto_pause_callback_ && !switch_pause_was_paused_);
+                if (resume_playback)
+                {
+                    is_auto_paused_ = false;
+                }
+                backend_switch_in_progress_ = false;
+                switch_pause_was_paused_ = false;
+                last_preload_check_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;
+            }
+            xSemaphoreGive(mutex_);
+
+            if (resume_playback)
+            {
+                auto_pause_callback_(false);
             }
         }
 
