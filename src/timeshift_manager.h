@@ -89,7 +89,7 @@ private:
     static const size_t BUFFER_SIZE = 128 * 1024;
     static const size_t PLAYBACK_BUFFER_SIZE = 256 * 1024;
     static const size_t CHUNK_SIZE = 128 * 1024;
-    static const size_t MAX_PSRAM_CHUNKS = 24;          // Max 16 chunks in PSRAM = 2MB
+    static constexpr size_t MAX_PSRAM_POOL_MB = 3;      // Target PSRAM pool size in MB (limit for cleanup)
 
     static constexpr size_t MAX_DYNAMIC_CHUNK_BYTES = 512 * 1024;
     static constexpr size_t MAX_RECORDING_BUFFER_CAPACITY = MAX_DYNAMIC_CHUNK_BYTES + (MAX_DYNAMIC_CHUNK_BYTES / 2); // 768 KB
@@ -157,6 +157,7 @@ private:
     // PSRAM-only mode: circular chunk pool
     uint8_t* psram_chunk_pool_ = nullptr;    // Pre-allocated pool for PSRAM mode
     size_t psram_pool_size_ = 0;             // Total size of PSRAM pool
+    size_t psram_pool_chunks_ = 0;           // Derived slots from MB target
 
     // Synchronization
     SemaphoreHandle_t mutex_ = nullptr;
@@ -211,8 +212,11 @@ private:
     // STORAGE BACKEND HELPERS
     bool init_psram_pool();                         // Initialize PSRAM chunk pool
     void free_psram_pool();                         // Free PSRAM chunk pool
-    uint8_t* allocate_psram_chunk();                // Get next available PSRAM chunk slot
+    uint8_t* allocate_psram_chunk(uint32_t chunk_id);                // Get next available PSRAM chunk slot
     void free_chunk_storage(ChunkInfo& chunk);      // Free chunk storage (SD or PSRAM)
+    // PSRAM pool parameters
+    size_t psram_slot_size_ = 0;                    // Fixed slot size used for pool indexing
+    size_t psram_pool_slots_ = 0;                   // Number of slots derived from slot size and pool size
     
     // HTTP Handling (basic placeholder logic initially)
     // We might need a real HTTP client member here or in the task

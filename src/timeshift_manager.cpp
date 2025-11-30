@@ -15,7 +15,7 @@
 
 // ========== ADAPTIVE BUFFER CONFIGURATION ==========
 // Cleanup window
-constexpr size_t MAX_TS_WINDOW = 1024 * 1024 * 4; // 2 MB max window
+constexpr size_t MAX_TS_WINDOW = 1024 * 1024 * 100; // 100MB max window
 
 // Default bitrate assumption (will be auto-detected from stream)
 constexpr uint32_t DEFAULT_BITRATE_KBPS = 320;
@@ -80,14 +80,26 @@ void TimeshiftManager::calculate_adaptive_sizes(uint32_t bitrate_kbps)
     dynamic_chunk_size_ = std::max(MIN_CHUNK_SIZE,
                                    std::min(MAX_CHUNK_SIZE, (size_t)target_chunk_bytes));
 
+    // If a PSRAM pool is already allocated, clamp to the slot size to avoid overruns
+    if (psram_slot_size_ > 0 && dynamic_chunk_size_ > psram_slot_size_)
+    {
+        dynamic_chunk_size_ = psram_slot_size_;
+        LOG_WARN("Adaptive chunk size clamped to PSRAM slot size (%u KB)",
+                 (unsigned)(psram_slot_size_ / 1024));
+    }
+
     // Recording buffer: 1.5x chunk size (50% safety margin)
     dynamic_buffer_size_ = dynamic_chunk_size_ + (dynamic_chunk_size_ / 2);
 
     // Playback buffer: 3x chunk size (current + next + safety)
     dynamic_playback_buffer_size_ = dynamic_chunk_size_ * 3;
 
-    // Flush threshold: 80% of chunk size
+    // Flush threshold: 80% of chunk size (SD), full size in PSRAM to keep slots consistent
     dynamic_min_flush_size_ = (dynamic_chunk_size_ * 4) / 5;
+    if (storage_mode_ == StorageMode::PSRAM_ONLY)
+    {
+        dynamic_min_flush_size_ = dynamic_chunk_size_;
+    }
 
     // Download chunk: proportional to bitrate (faster streams = larger reads)
     if (bitrate_kbps <= 64)
@@ -234,8 +246,10 @@ bool TimeshiftManager::open(const char *uri)
             close();
             return false;
         }
-        LOG_INFO("Timeshift mode: PSRAM_ONLY (%u chunks, %u KB total)",
-                 MAX_PSRAM_CHUNKS, psram_pool_size_ / 1024);
+        LOG_INFO("Timeshift mode: PSRAM_ONLY (~%u MB target pool, chunk %u KB, slots %u)",
+                 (unsigned)MAX_PSRAM_POOL_MB,
+                 (unsigned)(dynamic_chunk_size_ / 1024),
+                 (unsigned)psram_pool_slots_);
     }
 
     recording_buffer_capacity_ = MAX_RECORDING_BUFFER_CAPACITY;
@@ -504,7 +518,7 @@ void TimeshiftManager::preloader_task_loop()
     uint32_t last_playback_chunk_abs_id_seen = INVALID_CHUNK_ABS_ID;
     bool next_chunk_preloaded = false;
     uint32_t failed_preload_attempts_ = 0;
-    const uint32_t MAX_FAILED_ATTEMPTS = 3; // After 3 failed attempts, fallback
+    const uint32_t MAX_FAILED_ATTEMPTS = 3; // Log warning after consecutive misses
 
     while (is_running_)
     {
@@ -545,27 +559,11 @@ void TimeshiftManager::preloader_task_loop()
             {
                 // Chunk successivo non ancora disponibile
                 failed_preload_attempts_++;
-
-                // FALLBACK STRATEGY: Se il chunk successivo non è disponibile dopo MAX_FAILED_ATTEMPTS,
-                // salta indietro di 2 chunk per dare tempo alla rete di buffering
-                if (failed_preload_attempts_ >= MAX_FAILED_ATTEMPTS && current_playback_chunk_abs_id_ >= 2)
+                if (failed_preload_attempts_ >= MAX_FAILED_ATTEMPTS)
                 {
-                    uint32_t fallback_chunk_id = current_playback_chunk_abs_id_ - 2;
-                    size_t fallback_idx = find_chunk_index_by_id(fallback_chunk_id);
-
-                    if (fallback_idx != INVALID_CHUNK_ID)
-                    {
-                        const ChunkInfo &fallback_chunk = ready_chunks_[fallback_idx];
-                        LOG_WARN("Preloader: Next chunk not ready after %u attempts. Falling back to chunk %u (-%u) to allow buffering",
-                                 MAX_FAILED_ATTEMPTS, fallback_chunk_id, 2);
-
-                        // Jump to fallback chunk
-                        current_read_offset_ = fallback_chunk.start_offset;
-                        current_playback_chunk_abs_id_ = fallback_chunk_id;
-                        last_playback_chunk_abs_id_seen = fallback_chunk_id;
-                        next_chunk_preloaded = false;
-                        failed_preload_attempts_ = 0;
-                    }
+                    LOG_WARN("Preloader: Next chunk not ready after %u attempts (current abs ID %u)",
+                             MAX_FAILED_ATTEMPTS, current_playback_chunk_abs_id_);
+                    failed_preload_attempts_ = 0; // Avoid spamming logs
                 }
 
                 xSemaphoreGive(mutex_);
@@ -709,8 +707,23 @@ void TimeshiftManager::download_task_loop()
         int available = stream->available();
         if (available > 0)
         {
+            // Prevent overflowing the planned chunk size (PSRAM pool is sized to dynamic_chunk_size_)
+            if (bytes_in_current_chunk_ >= dynamic_chunk_size_)
+            {
+                LOG_WARN("Current chunk reached max size (%u bytes), flushing before reading more",
+                         (unsigned)dynamic_chunk_size_);
+                if (!flush_recording_chunk())
+                {
+                    LOG_ERROR("Failed to flush full chunk");
+                    break;
+                }
+                continue; // Start filling the next chunk
+            }
+
             // Calcola lo spazio libero nel buffer di registrazione circolare
-            size_t space_left = dynamic_buffer_size_ - bytes_in_current_chunk_;
+            size_t buffer_space_left = dynamic_buffer_size_ - bytes_in_current_chunk_;
+            size_t chunk_space_left = dynamic_chunk_size_ - bytes_in_current_chunk_;
+            size_t space_left = std::min(buffer_space_left, chunk_space_left);
 
             // Se non c'è spazio, non leggere nulla e attendi il prossimo ciclo.
             // Il flush avverrà comunque se la soglia è raggiunta.
@@ -765,7 +778,8 @@ void TimeshiftManager::download_task_loop()
                 // --- LOGICA DI FLUSH DECOUPLED ---
                 // Controlliamo se è necessario un flush, ma lo eseguiamo *fuori* dal mutex
                 // per non bloccare il thread di playback durante la scrittura su SD.
-                bool needs_flush = (bytes_in_current_chunk_ >= dynamic_min_flush_size_);
+                bool needs_flush = (bytes_in_current_chunk_ >= dynamic_min_flush_size_) ||
+                                   (bytes_in_current_chunk_ >= dynamic_chunk_size_);
 
                 if (needs_flush)
                 {
@@ -929,7 +943,7 @@ bool TimeshiftManager::write_chunk_to_sd(ChunkInfo &chunk)
 bool TimeshiftManager::write_chunk_to_psram(ChunkInfo &chunk)
 {
     // Allocate PSRAM chunk from pool (circular)
-    chunk.psram_ptr = allocate_psram_chunk();
+    chunk.psram_ptr = allocate_psram_chunk(chunk.id);
     if (!chunk.psram_ptr)
     {
         LOG_ERROR("Failed to allocate PSRAM chunk");
@@ -958,7 +972,7 @@ bool TimeshiftManager::write_chunk_to_psram(ChunkInfo &chunk)
     }
 
     LOG_DEBUG("Wrote chunk %u: %u KB to PSRAM (pool index %u)",
-              chunk.id, chunk.length / 1024, (unsigned)(chunk.id % MAX_PSRAM_CHUNKS));
+              chunk.id, chunk.length / 1024, (unsigned)(psram_pool_slots_ ? (chunk.id % psram_pool_slots_) : 0));
     return true;
 }
 
@@ -1268,6 +1282,18 @@ void TimeshiftManager::cleanup_old_chunks()
         const ChunkInfo &oldest = ready_chunks_.front();
         size_t age_bytes = current_recording_offset_ - oldest.end_offset;
         size_t age_mb = age_bytes / (1024 * 1024);
+        bool pool_overflow = false;
+        size_t total_ready_bytes = 0;
+        for (const auto &c : ready_chunks_)
+        {
+            total_ready_bytes += c.length;
+        }
+        size_t pool_limit_bytes = MAX_PSRAM_POOL_MB * 1024 * 1024;
+        if (storage_mode_ == StorageMode::PSRAM_ONLY)
+        {
+            pool_overflow = (total_ready_bytes > pool_limit_bytes) ||
+                            (psram_pool_slots_ > 0 && ready_chunks_.size() >= psram_pool_slots_);
+        }
 
         LOG_DEBUG("Checking oldest chunk abs ID %u: end_offset=%u MB, age=%u MB (%u bytes)",
                   oldest.id,
@@ -1284,12 +1310,20 @@ void TimeshiftManager::cleanup_old_chunks()
             break;
         }
 
-        if (age_bytes > MAX_TS_WINDOW)
+        if (age_bytes > MAX_TS_WINDOW || pool_overflow)
         {
-            LOG_INFO("CLEANUP: Removing old chunk abs ID %u (age: %u MB > limit: %u MB)",
-                     oldest.id,
-                     (unsigned)age_mb,
-                     (unsigned)(MAX_TS_WINDOW / (1024 * 1024)));
+            if (pool_overflow)
+            {
+                LOG_WARN("CLEANUP: PSRAM pool limit reached (%u KB). Dropping oldest chunk abs ID %u to stay within pool.",
+                         (unsigned)(pool_limit_bytes / 1024), oldest.id);
+            }
+            else
+            {
+                LOG_INFO("CLEANUP: Removing old chunk abs ID %u (age: %u MB > limit: %u MB)",
+                         oldest.id,
+                         (unsigned)age_mb,
+                         (unsigned)(MAX_TS_WINDOW / (1024 * 1024)));
+            }
 
             // Check if we're removing the currently playing chunk
             if (current_playback_chunk_abs_id_ == oldest.id)
@@ -1329,7 +1363,7 @@ void TimeshiftManager::cleanup_old_chunks()
             {
                 // PSRAM mode: chunk slot will be reused automatically
                 LOG_DEBUG("   PSRAM chunk slot %u freed (will be reused)",
-                          (unsigned)(oldest.id % MAX_PSRAM_CHUNKS));
+                          (unsigned)(psram_pool_slots_ ? (oldest.id % psram_pool_slots_) : 0));
                 removed_count++;
                 total_removed_bytes += oldest.length;
             }
@@ -1883,8 +1917,16 @@ bool TimeshiftManager::init_psram_pool()
         return true;
     }
 
-    // Allocate pool for MAX_PSRAM_CHUNKS chunks
-    psram_pool_size_ = MAX_PSRAM_CHUNKS * dynamic_chunk_size_;
+    // Allocate pool targeting MAX_PSRAM_POOL_MB (derive slots from current chunk size)
+    size_t target_pool_bytes = MAX_PSRAM_POOL_MB * 1024 * 1024;
+    psram_slot_size_ = dynamic_chunk_size_;
+    if (target_pool_bytes < psram_slot_size_)
+    {
+        target_pool_bytes = psram_slot_size_;
+    }
+
+    psram_pool_slots_ = std::max<size_t>(2, target_pool_bytes / psram_slot_size_);
+    psram_pool_size_ = psram_pool_slots_ * psram_slot_size_;
 
     // Try to allocate in PSRAM first (heap_caps_malloc with MALLOC_CAP_SPIRAM)
     psram_chunk_pool_ = (uint8_t *)heap_caps_malloc(psram_pool_size_, MALLOC_CAP_SPIRAM);
@@ -1896,8 +1938,9 @@ bool TimeshiftManager::init_psram_pool()
         return false;
     }
 
-    LOG_INFO("PSRAM pool allocated: %u KB (%u chunks x %u KB)",
-             psram_pool_size_ / 1024, MAX_PSRAM_CHUNKS, dynamic_chunk_size_ / 1024);
+    LOG_INFO("PSRAM pool allocated: %u KB (%u chunks x %u KB) [target %u MB]",
+             psram_pool_size_ / 1024, (unsigned)psram_pool_slots_, psram_slot_size_ / 1024,
+             (unsigned)MAX_PSRAM_POOL_MB);
 
     return true;
 }
@@ -1909,11 +1952,13 @@ void TimeshiftManager::free_psram_pool()
         heap_caps_free(psram_chunk_pool_);
         psram_chunk_pool_ = nullptr;
         psram_pool_size_ = 0;
+        psram_pool_slots_ = 0;
+        psram_slot_size_ = 0;
         LOG_DEBUG("PSRAM pool freed");
     }
 }
 
-uint8_t *TimeshiftManager::allocate_psram_chunk()
+uint8_t *TimeshiftManager::allocate_psram_chunk(uint32_t chunk_id)
 {
     if (!psram_chunk_pool_)
     {
@@ -1921,12 +1966,18 @@ uint8_t *TimeshiftManager::allocate_psram_chunk()
         return nullptr;
     }
 
+    if (psram_pool_slots_ == 0 || psram_slot_size_ == 0)
+    {
+        LOG_ERROR("PSRAM pool slots not set");
+        return nullptr;
+    }
+
     // Calculate circular index based on next_chunk_id_
-    size_t pool_index = next_chunk_id_ % MAX_PSRAM_CHUNKS;
-    uint8_t *chunk_ptr = psram_chunk_pool_ + (pool_index * dynamic_chunk_size_);
+    size_t pool_index = chunk_id % psram_pool_slots_;
+    uint8_t *chunk_ptr = psram_chunk_pool_ + (pool_index * psram_slot_size_);
 
     LOG_DEBUG("Allocated PSRAM chunk at pool index %u (chunk ID %u)",
-              (unsigned)pool_index, next_chunk_id_);
+              (unsigned)pool_index, chunk_id);
 
     return chunk_ptr;
 }
