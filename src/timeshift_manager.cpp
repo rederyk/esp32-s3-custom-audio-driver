@@ -17,6 +17,10 @@
 // Cleanup window
 constexpr size_t MAX_TS_WINDOW = 1024 * 1024 * 100; // 100MB max window
 
+constexpr const char *TIMESHIFT_ROOT = "/timeshift";
+constexpr const char *EXPORTED_CHUNK_PREFIX = "/timeshift/exportedChunk";
+constexpr const char *EXPORTED_CHUNK_FILENAME = "chunk.bin";
+
 // Default bitrate assumption (will be auto-detected from stream)
 constexpr uint32_t DEFAULT_BITRATE_KBPS = 320;
 
@@ -225,29 +229,7 @@ bool TimeshiftManager::open(const char *uri)
     // Initialize storage backend based on current mode
     if (storage_mode_ == StorageMode::SD_CARD)
     {
-        // Create timeshift directory if it doesn't exist
-        if (!SD_MMC.exists("/timeshift"))
-        {
-            SD_MMC.mkdir("/timeshift");
-            LOG_INFO("Created /timeshift directory");
-        }
-
-        // Clean up old timeshift files from previous sessions
-        File tsDir = SD_MMC.open("/timeshift");
-        if (tsDir && tsDir.isDirectory())
-        {
-            File file = tsDir.openNextFile();
-            while (file)
-            {
-                String fname = String("/timeshift/") + file.name();
-                file.close();
-                SD_MMC.remove(fname.c_str());
-                LOG_DEBUG("Cleaned up: %s", fname.c_str());
-                file = tsDir.openNextFile();
-            }
-            tsDir.close();
-            LOG_INFO("Timeshift directory cleaned");
-        }
+        cleanup_timeshift_directory();
         LOG_INFO("Timeshift mode: SD_CARD");
     }
     else
@@ -1202,24 +1184,7 @@ void TimeshiftManager::download_task_loop()
             }
             else // target == SD_CARD
             {
-                if (!SD_MMC.exists("/timeshift"))
-                {
-                    SD_MMC.mkdir("/timeshift");
-                }
-
-                File tsDir = SD_MMC.open("/timeshift");
-                if (tsDir && tsDir.isDirectory())
-                {
-                    File file = tsDir.openNextFile();
-                    while (file)
-                    {
-                        String fname = String("/timeshift/") + file.name();
-                        file.close();
-                        SD_MMC.remove(fname.c_str());
-                        file = tsDir.openNextFile();
-                    }
-                    tsDir.close();
-                }
+                cleanup_timeshift_directory();
 
                 // Fast path: copy only current and next chunk immediately, queue the rest
                 uint32_t cur_id = current_playback_chunk_abs_id_;
@@ -1229,8 +1194,9 @@ void TimeshiftManager::download_task_loop()
                 migration_queue_.clear();
                 xSemaphoreGive(mutex_);
 
-                for (size_t i = 0; i < ready_chunks_.size() && ok; ++i)
+                for (size_t iter = ready_chunks_.size(); iter > 0 && ok; --iter)
                 {
+                    size_t i = iter - 1;
                     xSemaphoreTake(mutex_, portMAX_DELAY);
                     ChunkInfo &chunk = ready_chunks_[i];
                     uint32_t cid = chunk.id;
@@ -1930,7 +1896,6 @@ void TimeshiftManager::enforce_capacity_limits(size_t max_bytes, size_t max_slot
 
 void TimeshiftManager::cleanup_old_chunks()
 {
-    // Remove chunks beyond the timeshift window
     LOG_DEBUG("=== CLEANUP START ===");
     LOG_DEBUG("Current recording offset: %u MB (%u bytes)",
               (unsigned)(current_recording_offset_ / (1024 * 1024)),
@@ -1956,21 +1921,24 @@ void TimeshiftManager::cleanup_old_chunks()
     }
 
     size_t removed_count = 0;
+    size_t exported_count = 0;
     size_t total_removed_bytes = 0;
     bool playback_chunk_removed = false;
+
+    size_t total_ready_bytes = 0;
+    for (const auto &c : ready_chunks_)
+    {
+        total_ready_bytes += c.length;
+    }
+    size_t pool_limit_bytes = MAX_PSRAM_POOL_MB * 1024 * 1024;
 
     while (!ready_chunks_.empty())
     {
         const ChunkInfo &oldest = ready_chunks_.front();
         size_t age_bytes = current_recording_offset_ - oldest.end_offset;
         size_t age_mb = age_bytes / (1024 * 1024);
+
         bool pool_overflow = false;
-        size_t total_ready_bytes = 0;
-        for (const auto &c : ready_chunks_)
-        {
-            total_ready_bytes += c.length;
-        }
-        size_t pool_limit_bytes = MAX_PSRAM_POOL_MB * 1024 * 1024;
         if (storage_mode_ == StorageMode::PSRAM_ONLY)
         {
             pool_overflow = (total_ready_bytes > pool_limit_bytes) ||
@@ -1995,87 +1963,103 @@ void TimeshiftManager::cleanup_old_chunks()
                       (unsigned)age_bytes);
         }
 
-        // --- SAFETY CHECK ---
-        // Do not remove the currently playing chunk or the next 2 chunks.
-        // This creates a "safe zone" to prevent deleting data that is about to be played.
         if (oldest.id >= current_playback_chunk_abs_id_ && oldest.id <= current_playback_chunk_abs_id_ + 2)
         {
             LOG_DEBUG("Oldest chunk abs ID %u is in the playback safe zone, stopping cleanup.", oldest.id);
             break;
         }
 
-        if (age_bytes > MAX_TS_WINDOW || pool_overflow)
+        if (!(age_bytes > MAX_TS_WINDOW || pool_overflow))
         {
-            if (pool_overflow)
-            {
-                LOG_WARN("CLEANUP: PSRAM pool limit reached (%u KB). Dropping oldest chunk abs ID %u to stay within pool.",
-                         (unsigned)(pool_limit_bytes / 1024), oldest.id);
-            }
-            else
-            {
+            LOG_DEBUG("Oldest chunk abs ID %u is still within window (age: %u MB <= limit: %u MB), stopping cleanup",
+                      oldest.id,
+                      (unsigned)age_mb,
+                      (unsigned)(MAX_TS_WINDOW / (1024 * 1024)));
+            break;
+        }
+
+        if (pool_overflow)
+        {
+            LOG_WARN("CLEANUP: PSRAM pool limit reached (%u KB). Dropping oldest chunk abs ID %u to stay within pool.",
+                     (unsigned)(pool_limit_bytes / 1024), oldest.id);
+        }
+        else
+        {
             LOG_INFO("CLEANUP: Removing old chunk abs ID %u (age: %u MB > limit: %u MB)",
                      oldest.id,
                      (unsigned)age_mb,
                      (unsigned)(MAX_TS_WINDOW / (1024 * 1024)));
-            }
+        }
 
-            // Check if we're removing the currently playing chunk
-            if (current_playback_chunk_abs_id_ == oldest.id)
-            {
-                playback_chunk_removed = true;
-            }
+        if (current_playback_chunk_abs_id_ == oldest.id)
+        {
+            playback_chunk_removed = true;
+        }
 
         bool chunk_on_sd = !oldest.filename.empty();
+        bool removal_done = false;
+        bool file_missing = false;
+        bool exported = false;
+
         if (chunk_on_sd)
         {
             LOG_INFO("   File: %s, Size: %u KB",
                      oldest.filename.c_str(),
                      (unsigned)(oldest.length / 1024));
 
-                // Check if file exists before attempting to delete
+            if (oldest.export_marked_for_move)
+            {
+                removal_done = move_chunk_to_export_folder(oldest, file_missing);
+                exported = removal_done && !file_missing;
+                if (!removal_done && file_missing)
+                {
+                    LOG_WARN("   Export target missing for chunk %u, stopping cleanup", oldest.id);
+                }
+            }
+
+            if (!removal_done && !file_missing)
+            {
                 if (SD_MMC.exists(oldest.filename.c_str()))
                 {
-                    bool removed = SD_MMC.remove(oldest.filename.c_str());
-                    if (removed)
-                    {
-                        LOG_DEBUG("   File deleted successfully");
-                        removed_count++;
-                        total_removed_bytes += oldest.length;
-                    }
-                    else
+                    removal_done = SD_MMC.remove(oldest.filename.c_str());
+                    if (!removal_done)
                     {
                         LOG_ERROR("   Failed to delete file: %s", oldest.filename.c_str());
                     }
                 }
                 else
                 {
+                    file_missing = true;
+                    removal_done = true;
                     LOG_DEBUG("   File does not exist (already deleted): %s", oldest.filename.c_str());
-                    removed_count++;
-                    total_removed_bytes += oldest.length;
                 }
-        }
-        else
-        {
-            // PSRAM mode: chunk slot will be reused automatically
-            LOG_DEBUG("   PSRAM chunk slot %u freed (will be reused)",
-                          (unsigned)(psram_pool_slots_ ? (oldest.id % psram_pool_slots_) : 0));
-                removed_count++;
-                total_removed_bytes += oldest.length;
             }
-
-            ready_chunks_.erase(ready_chunks_.begin());
         }
         else
         {
-            LOG_DEBUG("Oldest chunk abs ID %u is still within window (age: %u MB <= limit: %u MB), stopping cleanup",
-                      oldest.id,
-                      (unsigned)age_mb,
-                      (unsigned)(MAX_TS_WINDOW / (1024 * 1024)));
-            break; // Chunks are ordered, so we can stop
+            LOG_DEBUG("   PSRAM chunk slot %u freed (will be reused)",
+                      (unsigned)(psram_pool_slots_ ? (oldest.id % psram_pool_slots_) : 0));
+            removal_done = true;
+        }
+
+        if (!removal_done)
+        {
+            LOG_WARN("Cleanup halted: unable to remove chunk %u", oldest.id);
+            break;
+        }
+
+        total_removed_bytes += oldest.length;
+        removed_count += 1;
+        exported_count += exported ? 1 : 0;
+        total_ready_bytes = (total_ready_bytes >= oldest.length) ? (total_ready_bytes - oldest.length) : 0;
+        ready_chunks_.erase(ready_chunks_.begin());
+
+        if (file_missing)
+        {
+            break;
         }
     }
 
-    // NEW APPROACH: No more index adjustments! Just validate absolute IDs
     if (removed_count > 0)
     {
         if (playback_chunk_removed)
@@ -2085,21 +2069,17 @@ void TimeshiftManager::cleanup_old_chunks()
             last_preload_check_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;
         }
 
-        // Validate that current read offset is still in valid range
         if (!ready_chunks_.empty())
         {
             const ChunkInfo &first_chunk = ready_chunks_.front();
             const ChunkInfo &last_chunk = ready_chunks_.back();
 
-            // If read offset is before first chunk or after last chunk, jump to first
             if (current_read_offset_ < first_chunk.start_offset ||
                 current_read_offset_ >= last_chunk.end_offset)
             {
-
                 size_t old_offset = current_read_offset_;
                 current_read_offset_ = first_chunk.start_offset;
-                current_playback_chunk_abs_id_ = INVALID_CHUNK_ABS_ID; // Force reload
-
+                current_playback_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;
                 LOG_WARN("CLEANUP: Playback jumped from offset %u to %u (live stream caught up)",
                          (unsigned)old_offset, (unsigned)current_read_offset_);
             }
@@ -2108,9 +2088,10 @@ void TimeshiftManager::cleanup_old_chunks()
 
     if (removed_count > 0)
     {
-        LOG_INFO("CLEANUP SUMMARY: Removed %u chunks, freed %u MB",
+        LOG_INFO("CLEANUP SUMMARY: Removed %u chunks, freed %u MB, exported %u",
                  (unsigned)removed_count,
-                 (unsigned)(total_removed_bytes / (1024 * 1024)));
+                 (unsigned)(total_removed_bytes / (1024 * 1024)),
+                 (unsigned)exported_count);
     }
     else
     {
@@ -2119,6 +2100,145 @@ void TimeshiftManager::cleanup_old_chunks()
 
     LOG_DEBUG("Remaining ready chunks: %u", (unsigned)ready_chunks_.size());
     LOG_DEBUG("=== CLEANUP END ===");
+}
+
+bool TimeshiftManager::cleanup_timeshift_directory()
+{
+    if (!SD_MMC.exists(TIMESHIFT_ROOT))
+    {
+        if (!SD_MMC.mkdir(TIMESHIFT_ROOT))
+        {
+            LOG_WARN("Timeshift cleanup: cannot create %s", TIMESHIFT_ROOT);
+            return false;
+        }
+    }
+
+    File tsDir = SD_MMC.open(TIMESHIFT_ROOT);
+    if (!tsDir || !tsDir.isDirectory())
+    {
+        LOG_WARN("Timeshift cleanup: unable to open %s", TIMESHIFT_ROOT);
+        return false;
+    }
+
+    size_t removed = 0;
+    size_t preserved = 0;
+    size_t failures = 0;
+
+    File entry = tsDir.openNextFile();
+    while (entry)
+    {
+        String name = entry.name();
+        bool is_dir = entry.isDirectory();
+        entry.close();
+
+        if (is_dir || name.startsWith("exportedChunk"))
+        {
+            preserved++;
+            entry = tsDir.openNextFile();
+            continue;
+        }
+
+        String path = String(TIMESHIFT_ROOT) + "/" + name;
+        if (SD_MMC.remove(path.c_str()))
+        {
+            removed++;
+        }
+        else
+        {
+            failures++;
+        }
+        entry = tsDir.openNextFile();
+    }
+    tsDir.close();
+
+    LOG_INFO("Timeshift directory cleanup: removed %u files, preserved %u entry(ies), failures %u",
+             (unsigned)removed, (unsigned)preserved, (unsigned)failures);
+    return true;
+}
+
+bool TimeshiftManager::mark_chunk_for_export(uint32_t abs_chunk_id)
+{
+    if (storage_mode_ != StorageMode::SD_CARD)
+    {
+        LOG_WARN("mark_chunk_for_export(): available only in SD_CARD mode");
+        return false;
+    }
+
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    size_t idx = find_chunk_index_by_id(abs_chunk_id);
+    if (idx == INVALID_CHUNK_ID)
+    {
+        xSemaphoreGive(mutex_);
+        LOG_WARN("mark_chunk_for_export(): chunk %u not ready", abs_chunk_id);
+        return false;
+    }
+
+    ChunkInfo &chunk = ready_chunks_[idx];
+    if (chunk.filename.empty())
+    {
+        xSemaphoreGive(mutex_);
+        LOG_WARN("mark_chunk_for_export(): chunk %u has no SD file", abs_chunk_id);
+        return false;
+    }
+
+    bool just_marked = false;
+    if (!chunk.export_marked_for_move)
+    {
+        chunk.export_marked_for_move = true;
+        just_marked = true;
+    }
+    xSemaphoreGive(mutex_);
+
+    if (just_marked)
+    {
+        LOG_INFO("Chunk %u scheduled for export (will be moved once it expires)", abs_chunk_id);
+    }
+    return true;
+}
+
+bool TimeshiftManager::move_chunk_to_export_folder(const ChunkInfo &chunk, bool &out_missing_file)
+{
+    out_missing_file = false;
+    if (chunk.filename.empty())
+    {
+        return false;
+    }
+
+    if (!SD_MMC.exists(chunk.filename.c_str()))
+    {
+        out_missing_file = true;
+        return false;
+    }
+
+    std::string export_dir = build_export_directory(chunk.id);
+    if (!SD_MMC.exists(export_dir.c_str()))
+    {
+        if (!SD_MMC.mkdir(export_dir.c_str()))
+        {
+            LOG_ERROR("   Cannot create export folder %s", export_dir.c_str());
+            return false;
+        }
+    }
+
+    std::string dest_path = export_dir + "/" + EXPORTED_CHUNK_FILENAME;
+    if (SD_MMC.exists(dest_path.c_str()))
+    {
+        SD_MMC.remove(dest_path.c_str());
+    }
+
+    if (!SD_MMC.rename(chunk.filename.c_str(), dest_path.c_str()))
+    {
+        LOG_ERROR("   Failed to move chunk %u to %s", chunk.id, dest_path.c_str());
+        return false;
+    }
+
+    LOG_INFO("   Exported chunk %u to %s", chunk.id, dest_path.c_str());
+    return true;
+}
+
+std::string TimeshiftManager::build_export_directory(uint32_t chunk_id) const
+{
+    return std::string(EXPORTED_CHUNK_PREFIX) + std::to_string(chunk_id);
 }
 
 // ========== HELPER: Convert absolute chunk ID to array index ==========

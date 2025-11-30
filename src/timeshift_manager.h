@@ -53,6 +53,9 @@ public:
     bool is_recording_paused() const { return pause_download_; }
     bool is_running() const { return is_running_; }
 
+    bool cleanup_timeshift_directory();
+    bool mark_chunk_for_export(uint32_t abs_chunk_id);
+
     // Storage mode control (can be changed when stream is closed)
     void setStorageMode(StorageMode mode)
     {
@@ -127,6 +130,7 @@ private:
         uint32_t start_time_ms = 0;    // Timestamp inizio chunk (millisecondi)
         uint32_t duration_ms = 0;      // Durata chunk in millisecondi
         uint32_t total_frames = 0;     // Frame PCM totali nel chunk
+        bool export_marked_for_move = false; // Whether chunk file should be exported instead of deleted
     };
 
     // RECORDING BUFFER (Write-Only by download task)
@@ -257,6 +261,8 @@ private:
     // CLEANUP
     void cleanup_old_chunks();                      // Remove old chunks beyond window
     void enforce_capacity_limits(size_t max_bytes, size_t max_slots); // Drop oldest chunks to fit target capacity
+    bool move_chunk_to_export_folder(const ChunkInfo& chunk, bool& out_missing_file);
+    std::string build_export_directory(uint32_t chunk_id) const;
 
     // STORAGE BACKEND HELPERS
     bool init_psram_pool();                         // Initialize PSRAM chunk pool
