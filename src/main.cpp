@@ -212,10 +212,11 @@ static void handle_command_string(String cmd)
             LOG_INFO("  f<path> - Seleziona file custom (es. f/song.mp3)");
             LOG_INFO("  x - Stato SD card");
             LOG_INFO("");
-            LOG_INFO("TIMESHIFT STORAGE (set BEFORE starting radio):");
+            LOG_INFO("TIMESHIFT STORAGE:");
             LOG_INFO("  W - shoW preferred storage mode");
-            LOG_INFO("  Z - set psRam mode preference (fast, ~2min buffer)");
-            LOG_INFO("  C - set sd Card mode preference (slower, unlimited buffer)");
+            LOG_INFO("  Z - Setta PSRAM come storage preferito (veloce, buffer ~2min) [USA PRIMA DI 'r']");
+            LOG_INFO("  C - Setta SD Card come storage preferito (lento, buffer illimitato) [USA PRIMA DI 'r']");
+            LOG_INFO("  G - sWitch storage mode at runtime (SD <> PSRAM, la migrazione avviene al prossimo chunk)");
             LOG_INFO("");
             LOG_INFO("DEBUG:");
             LOG_INFO("  m - Memory stats");
@@ -330,6 +331,30 @@ static void handle_command_string(String cmd)
         case 'C':
             // Set SD card mode preference
             set_preferred_storage_mode(StorageMode::SD_CARD);
+            break;
+        case 'g':
+        case 'G':
+            // Switch storage mode at runtime
+            {
+                const IDataSource* source = player.data_source();
+                if (source && source->type() == SourceType::HTTP_STREAM) {
+                    // RTTI disabled; we already validated the type, so use static_cast after const_cast.
+                    TimeshiftManager* ts_manager = static_cast<TimeshiftManager*>(const_cast<IDataSource*>(source));
+                    if (ts_manager) {
+                        StorageMode current_mode = ts_manager->getStorageMode();
+                        StorageMode new_mode = (current_mode == StorageMode::SD_CARD) ? StorageMode::PSRAM_ONLY : StorageMode::SD_CARD;
+                        LOG_INFO("Switching timeshift storage mode to %s...",
+                                 new_mode == StorageMode::PSRAM_ONLY ? "PSRAM" : "SD_CARD");
+                        if (ts_manager->switchStorageMode(new_mode)) {
+                            LOG_INFO("Storage mode switched successfully.");
+                        } else {
+                            LOG_ERROR("Failed to switch storage mode.");
+                        }
+                    }
+                } else {
+                    LOG_WARN("No timeshift stream is currently active to switch storage mode.");
+                }
+            }
             break;
         case '[':
             // Seek indietro di 5 secondi

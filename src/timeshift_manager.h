@@ -48,11 +48,22 @@ public:
     void stop();
     void pause_recording();
     void resume_recording();
+    bool switchStorageMode(StorageMode new_mode);  // Runtime switch with chunk migration
     bool is_recording_paused() const { return pause_download_; }
     bool is_running() const { return is_running_; }
 
     // Storage mode control (can be changed when stream is closed)
-    void setStorageMode(StorageMode mode) { storage_mode_ = mode; }
+    void setStorageMode(StorageMode mode)
+    {
+        if (is_open_)
+        {
+            switchStorageMode(mode);
+        }
+        else
+        {
+            storage_mode_ = mode;
+        }
+    }
     StorageMode getStorageMode() const { return storage_mode_; }
     
     // Status info
@@ -137,6 +148,8 @@ private:
     bool is_open_ = false;
     bool is_running_ = false;
     StorageMode storage_mode_ = StorageMode::SD_CARD;  // Default to SD card mode
+    StorageMode pending_storage_mode_ = StorageMode::SD_CARD;
+    bool storage_switch_requested_ = false;
 
     // Download task
     TaskHandle_t download_task_handle_ = nullptr;
@@ -208,6 +221,7 @@ private:
 
     // CLEANUP
     void cleanup_old_chunks();                      // Remove old chunks beyond window
+    void enforce_capacity_limits(size_t max_bytes, size_t max_slots); // Drop oldest chunks to fit target capacity
 
     // STORAGE BACKEND HELPERS
     bool init_psram_pool();                         // Initialize PSRAM chunk pool
