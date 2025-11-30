@@ -9,6 +9,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <freertos/queue.h>
 #include <vector>
 #include <string>
 #include <memory>
@@ -171,6 +172,11 @@ private:
     static void download_task_trampoline(void* arg);
     void download_task_loop();
 
+    // Chunk writer task (decouples network read from storage writes)
+    TaskHandle_t writer_task_handle_ = nullptr;
+    static void writer_task_trampoline(void* arg);
+    void writer_task_loop();
+
     // File Preloader Task (NEW)
     TaskHandle_t preloader_task_handle_ = nullptr;
     static void preloader_task_trampoline(void* arg);
@@ -189,6 +195,7 @@ private:
 
     // Synchronization
     SemaphoreHandle_t mutex_ = nullptr;
+    QueueHandle_t write_queue_ = nullptr;   // Queue of chunks to be written by writer task
     bool pause_download_ = false;  // Flag to pause/resume recording
 
     // Auto-pause callback for buffering
@@ -216,10 +223,18 @@ private:
     void apply_bitrate_measurement(uint32_t measured_kbps);  // Analyze throughput samples
     void calculate_adaptive_sizes(uint32_t bitrate_kbps);    // Compute buffer sizes
 
+    struct ChunkJob {
+        uint32_t id;
+        size_t start_offset;
+        size_t length;
+        uint8_t* data;
+        StorageMode mode;
+    };
+
     // RECORDING SIDE (private helpers)
-    bool flush_recording_chunk();                    // Flush recording_buffer_ to storage
-    bool write_chunk_to_sd(ChunkInfo& chunk);       // Write chunk data to SD file
-    bool write_chunk_to_psram(ChunkInfo& chunk);    // Write chunk data to PSRAM pool
+    bool flush_recording_chunk_async();             // Copy chunk to linear buffer and enqueue for writer
+    bool write_chunk_to_sd(ChunkInfo& chunk, const uint8_t* src);       // Write chunk data to SD file
+    bool write_chunk_to_psram(ChunkInfo& chunk, const uint8_t* src);    // Write chunk data to PSRAM pool
     bool validate_chunk(ChunkInfo& chunk);          // Validate chunk integrity
     void promote_chunk_to_ready(ChunkInfo chunk);   // Move chunk from PENDING to READY
     bool calculate_chunk_duration(const ChunkInfo& chunk,
@@ -231,6 +246,7 @@ private:
     uint32_t find_chunk_for_offset(size_t offset);    // Find absolute chunk ID containing offset
     bool load_chunk_to_playback(uint32_t abs_chunk_id);   // Load chunk into playback_buffer_
     bool preload_next_chunk(uint32_t current_abs_chunk_id);
+    bool rewind_playback_chunks(size_t steps, uint32_t &out_target_chunk_id);
     size_t read_from_playback_buffer(size_t offset, void* buffer, size_t size);
     size_t find_chunk_index_by_id(uint32_t abs_chunk_id);  // Convert abs ID to array index
     bool copy_chunk_into_buffer(const ChunkInfo& chunk, uint8_t* dest); // Switch cache helpers

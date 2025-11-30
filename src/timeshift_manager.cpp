@@ -350,6 +350,18 @@ bool TimeshiftManager::start()
         return false;
     }
 
+    // Create queue for chunk write jobs (depth 3 to smooth SD latency)
+    const UBaseType_t kQueueDepth = 3;
+    if (!write_queue_)
+    {
+        write_queue_ = xQueueCreate(kQueueDepth, sizeof(ChunkJob));
+        if (!write_queue_)
+        {
+            LOG_ERROR("Failed to create chunk write queue");
+            return false;
+        }
+    }
+
     is_running_ = true;
     // CRITICAL FIX: Increased stack from 8KB to 24KB to prevent stack overflow
     // HTTPClient + WiFiClient + TLS + local buffers need substantial stack space
@@ -358,9 +370,24 @@ bool TimeshiftManager::start()
     {
         LOG_ERROR("Failed to create download task");
         is_running_ = false;
+        vQueueDelete(write_queue_);
+        write_queue_ = nullptr;
         return false;
     }
     LOG_INFO("TimeshiftManager download task created successfully");
+
+    // Chunk writer task decouples network reads from storage writes
+    result = xTaskCreate(writer_task_trampoline, "ts_writer", 12288, this, 4, &writer_task_handle_);
+    if (result != pdPASS)
+    {
+        LOG_ERROR("Failed to create writer task");
+        is_running_ = false;
+        vTaskDelete(download_task_handle_);
+        download_task_handle_ = nullptr;
+        vQueueDelete(write_queue_);
+        write_queue_ = nullptr;
+        return false;
+    }
 
     // Crea il nuovo task di pre-caricamento (increased from 4KB to 8KB for safety)
     result = xTaskCreate(preloader_task_trampoline, "ts_preloader", 8192, this, 4, &preloader_task_handle_);
@@ -390,11 +417,31 @@ void TimeshiftManager::stop()
             vTaskDelete(download_task_handle_);
             download_task_handle_ = nullptr;
         }
+        if (writer_task_handle_)
+        {
+            vTaskDelete(writer_task_handle_);
+            writer_task_handle_ = nullptr;
+        }
         if (preloader_task_handle_)
         {
             vTaskDelete(preloader_task_handle_);
             preloader_task_handle_ = nullptr;
         }
+    }
+
+    // Drain and destroy queue (free any pending buffers)
+    if (write_queue_)
+    {
+        ChunkJob job;
+        while (xQueueReceive(write_queue_, &job, 0) == pdTRUE)
+        {
+            if (job.data)
+            {
+                free(job.data);
+            }
+        }
+        vQueueDelete(write_queue_);
+        write_queue_ = nullptr;
     }
 }
 
@@ -726,6 +773,11 @@ void TimeshiftManager::download_task_trampoline(void *arg)
     self->download_task_loop();
 }
 
+void TimeshiftManager::writer_task_trampoline(void *arg)
+{
+    static_cast<TimeshiftManager *>(arg)->writer_task_loop();
+}
+
 void TimeshiftManager::preloader_task_trampoline(void *arg)
 {
     static_cast<TimeshiftManager *>(arg)->preloader_task_loop();
@@ -737,7 +789,7 @@ void TimeshiftManager::preloader_task_loop()
     uint32_t last_playback_chunk_abs_id_seen = INVALID_CHUNK_ABS_ID;
     bool next_chunk_preloaded = false;
     uint32_t failed_preload_attempts_ = 0;
-    const uint32_t MAX_FAILED_ATTEMPTS = 3; // Log warning after consecutive misses
+    const uint32_t MAX_FAILED_ATTEMPTS = 16; // Log warning after consecutive misses //todo log but rewond only if next chunk (in playback) not availble
 
     while (is_running_)
     {
@@ -788,8 +840,22 @@ void TimeshiftManager::preloader_task_loop()
                 failed_preload_attempts_++;
                 if (failed_preload_attempts_ >= MAX_FAILED_ATTEMPTS)
                 {
-                    LOG_WARN("Preloader: Next chunk not ready after %u attempts (current abs ID %u)",
-                             MAX_FAILED_ATTEMPTS, current_playback_chunk_abs_id_);
+                    uint32_t original_chunk = current_playback_chunk_abs_id_;
+                    uint32_t rewound_chunk_id = INVALID_CHUNK_ABS_ID;
+                    bool rewound = rewind_playback_chunks(1, rewound_chunk_id);
+
+                    if (rewound)
+                    {
+                        LOG_WARN("Preloader: Next chunk not ready after %u attempts (current abs ID %u). Rewound to chunk %u",
+                                 MAX_FAILED_ATTEMPTS, original_chunk, rewound_chunk_id);
+                        next_chunk_preloaded = false;
+                    }
+                    else
+                    {
+                        LOG_WARN("Preloader: Next chunk not ready after %u attempts (current abs ID %u)",
+                                 MAX_FAILED_ATTEMPTS, original_chunk);
+                    }
+
                     failed_preload_attempts_ = 0; // Avoid spamming logs
                 }
 
@@ -833,6 +899,80 @@ void TimeshiftManager::preloader_task_loop()
         xSemaphoreGive(mutex_);
     }
     LOG_INFO("File preloader task terminated");
+    vTaskDelete(nullptr);
+}
+
+void TimeshiftManager::writer_task_loop()
+{
+    LOG_INFO("Chunk writer task started");
+    ChunkJob job{};
+
+    while (is_running_ || (write_queue_ && uxQueueMessagesWaiting(write_queue_) > 0))
+    {
+        if (!write_queue_)
+        {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (xQueueReceive(write_queue_, &job, pdMS_TO_TICKS(200)) != pdTRUE)
+        {
+            continue;
+        }
+
+        if (!job.data || job.length == 0)
+        {
+            if (job.data)
+            {
+                free(job.data);
+            }
+            continue;
+        }
+
+        ChunkInfo chunk;
+        chunk.id = job.id;
+        chunk.start_offset = job.start_offset;
+        chunk.length = job.length;
+        chunk.end_offset = job.start_offset + job.length;
+        chunk.state = ChunkState::PENDING;
+        chunk.psram_ptr = nullptr;
+        chunk.filename.clear();
+        chunk.crc32 = 0;
+
+        bool write_ok = false;
+        StorageMode target_mode = job.mode;
+
+        if (target_mode == StorageMode::SD_CARD)
+        {
+            chunk.filename = "/timeshift/pending_" + std::to_string(chunk.id) + ".bin";
+            write_ok = write_chunk_to_sd(chunk, job.data);
+        }
+        else
+        {
+            write_ok = write_chunk_to_psram(chunk, job.data);
+        }
+
+        if (write_ok && validate_chunk(chunk))
+        {
+            xSemaphoreTake(mutex_, portMAX_DELAY);
+            promote_chunk_to_ready(chunk);
+            cleanup_old_chunks();
+            xSemaphoreGive(mutex_);
+        }
+        else
+        {
+            LOG_ERROR("Writer task failed for chunk %u", chunk.id);
+            if (!chunk.filename.empty())
+            {
+                SD_MMC.remove(chunk.filename.c_str());
+            }
+        }
+
+        free(job.data);
+        job.data = nullptr;
+    }
+
+    LOG_INFO("Chunk writer task terminated");
     vTaskDelete(nullptr);
 }
 
@@ -1214,7 +1354,7 @@ void TimeshiftManager::download_task_loop()
             {
                 LOG_WARN("Current chunk reached max size (%u bytes), flushing before reading more",
                          (unsigned)dynamic_chunk_size_);
-                if (!flush_recording_chunk())
+                if (!flush_recording_chunk_async())
                 {
                     LOG_ERROR("Failed to flush full chunk");
                     break;
@@ -1286,7 +1426,7 @@ void TimeshiftManager::download_task_loop()
                 if (needs_flush)
                 {
                     LOG_INFO("Buffer reached target (%u bytes), flushing chunk", (unsigned)bytes_in_current_chunk_);
-                    if (!flush_recording_chunk())
+                    if (!flush_recording_chunk_async())
                     {
                         LOG_ERROR("Failed to flush recording chunk");
                         // Potremmo voler gestire l'errore in modo più robusto qui
@@ -1328,69 +1468,71 @@ void TimeshiftManager::download_task_loop()
 
 // ========== RECORDING SIDE METHODS ==========
 
-bool TimeshiftManager::flush_recording_chunk()
+bool TimeshiftManager::flush_recording_chunk_async()
 {
-    // Create ChunkInfo for PENDING chunk
-    ChunkInfo chunk;
-    chunk.id = next_chunk_id_++;
-    chunk.start_offset = current_recording_offset_;
-    chunk.length = bytes_in_current_chunk_;
-    chunk.end_offset = current_recording_offset_ + bytes_in_current_chunk_;
-    chunk.state = ChunkState::PENDING;
-    chunk.crc32 = 0; // TODO: calculate CRC if needed
-    chunk.psram_ptr = nullptr;
-
-    // Write to storage based on mode (without holding mutex)
-    bool write_success = false;
-    if (storage_mode_ == StorageMode::SD_CARD)
+    size_t length = bytes_in_current_chunk_;
+    if (length == 0)
     {
-        chunk.filename = "/timeshift/pending_" + std::to_string(chunk.id) + ".bin";
-        write_success = write_chunk_to_sd(chunk);
-    }
-    else
-    {
-        chunk.filename = ""; // Not used in PSRAM mode
-        write_success = write_chunk_to_psram(chunk);
+        return true;
     }
 
-    if (!write_success)
+    if (!write_queue_)
     {
-        LOG_ERROR("Failed to write chunk %u to storage", chunk.id);
+        LOG_ERROR("Flush requested but write queue is null");
         return false;
     }
 
-    // *** MODIFICA CHIAVE: Acquisiamo il mutex SOLO ora, per promuovere il chunk ***
-    // Questa operazione è velocissima (rename + push_back) e non bloccherà il playback.
-    xSemaphoreTake(mutex_, portMAX_DELAY);
+    ChunkJob job{};
+    job.id = next_chunk_id_++;
+    job.start_offset = current_recording_offset_;
+    job.length = length;
+    job.mode = storage_mode_;
 
-    // Aggiorna gli offset di registrazione *dentro* il lock per consistenza
+    // Allocate linear buffer for the chunk (prefer PSRAM)
+    job.data = (uint8_t *)heap_caps_malloc(length, MALLOC_CAP_SPIRAM);
+    if (!job.data)
+    {
+        job.data = (uint8_t *)malloc(length);
+    }
+    if (!job.data)
+    {
+        LOG_ERROR("Failed to allocate linear buffer for chunk %u (%u bytes)", job.id, (unsigned)length);
+        return false;
+    }
+
+    // Copy from circular recording buffer into linear buffer
+    if (rec_write_head_ >= length)
+    {
+        size_t start_pos = rec_write_head_ - length;
+        memcpy(job.data, recording_buffer_ + start_pos, length);
+    }
+    else
+    {
+        size_t remainder = length - rec_write_head_;
+        size_t start_pos = dynamic_buffer_size_ - remainder;
+        memcpy(job.data, recording_buffer_ + start_pos, remainder);
+        memcpy(job.data + remainder, recording_buffer_, rec_write_head_);
+    }
+
+    // Advance offsets for next chunk
+    xSemaphoreTake(mutex_, portMAX_DELAY);
     current_recording_offset_ += bytes_in_current_chunk_;
     bytes_in_current_chunk_ = 0;
-    // rec_write_head_ non viene resettato, il buffer è circolare
+    xSemaphoreGive(mutex_);
 
-    // Validate and promote to READY
-    if (validate_chunk(chunk))
+    // Enqueue for writer task (wait up to 1s if SD is slow)
+    BaseType_t res = xQueueSend(write_queue_, &job, pdMS_TO_TICKS(1000));
+    if (res != pdPASS)
     {
-        promote_chunk_to_ready(chunk);
-    }
-    else
-    {
-        LOG_ERROR("Chunk %u validation failed", chunk.id);
-        SD_MMC.remove(chunk.filename.c_str());
+        LOG_ERROR("Write queue full, dropping chunk %u", job.id);
+        free(job.data);
         return false;
     }
-
-    // Cleanup old chunks (chiamato dopo ogni flush di chunk)
-    LOG_DEBUG("Calling cleanup_old_chunks() after flushing chunk %u", chunk.id);
-    cleanup_old_chunks();
-
-    // Rilasciamo il mutex
-    xSemaphoreGive(mutex_);
 
     return true;
 }
 
-bool TimeshiftManager::write_chunk_to_sd(ChunkInfo &chunk)
+bool TimeshiftManager::write_chunk_to_sd(ChunkInfo &chunk, const uint8_t *src)
 {
     File file = SD_MMC.open(chunk.filename.c_str(), FILE_WRITE);
     if (!file)
@@ -1399,50 +1541,21 @@ bool TimeshiftManager::write_chunk_to_sd(ChunkInfo &chunk)
         return false;
     }
 
-    // The recording_buffer_ might have wrapped around, so we need to handle circular buffer
-    // Calculate start position: current position minus accumulated bytes
-    size_t start_pos = 0;
-    if (rec_write_head_ >= chunk.length)
+    size_t written = file.write(src, chunk.length);
+    file.close();
+
+    if (written != chunk.length)
     {
-        // Data is contiguous: [start_pos ... rec_write_head_)
-        start_pos = rec_write_head_ - chunk.length;
-        size_t written = file.write(recording_buffer_ + start_pos, chunk.length);
-        file.close();
-
-        if (written != chunk.length)
-        {
-            LOG_ERROR("Chunk write mismatch: expected %u, wrote %u", chunk.length, written);
-            SD_MMC.remove(chunk.filename.c_str());
-            return false;
-        }
-    }
-    else
-    {
-        // Data wraps around: [dynamic_buffer_size_ - remainder ... dynamic_buffer_size_) + [0 ... rec_write_head_)
-        size_t remainder = chunk.length - rec_write_head_;
-        start_pos = dynamic_buffer_size_ - remainder;
-
-        // Write first part (from start_pos to end of buffer)
-        size_t written1 = file.write(recording_buffer_ + start_pos, remainder);
-
-        // Write second part (from 0 to rec_write_head_)
-        size_t written2 = file.write(recording_buffer_, rec_write_head_);
-
-        file.close();
-
-        if (written1 + written2 != chunk.length)
-        {
-            LOG_ERROR("Chunk write mismatch: expected %u, wrote %u", chunk.length, (unsigned)(written1 + written2));
-            SD_MMC.remove(chunk.filename.c_str());
-            return false;
-        }
+        LOG_ERROR("Chunk write mismatch: expected %u, wrote %u", chunk.length, (unsigned)written);
+        SD_MMC.remove(chunk.filename.c_str());
+        return false;
     }
 
     LOG_DEBUG("Wrote chunk %u: %u KB to %s", chunk.id, chunk.length / 1024, chunk.filename.c_str());
     return true;
 }
 
-bool TimeshiftManager::write_chunk_to_psram(ChunkInfo &chunk)
+bool TimeshiftManager::write_chunk_to_psram(ChunkInfo &chunk, const uint8_t *src)
 {
     // Allocate PSRAM chunk from pool (circular)
     chunk.psram_ptr = allocate_psram_chunk(chunk.id);
@@ -1452,26 +1565,7 @@ bool TimeshiftManager::write_chunk_to_psram(ChunkInfo &chunk)
         return false;
     }
 
-    // Copy data from circular recording buffer to PSRAM chunk
-    size_t start_pos = 0;
-    if (rec_write_head_ >= chunk.length)
-    {
-        // Data is contiguous: [start_pos ... rec_write_head_)
-        start_pos = rec_write_head_ - chunk.length;
-        memcpy(chunk.psram_ptr, recording_buffer_ + start_pos, chunk.length);
-    }
-    else
-    {
-        // Data wraps around: [dynamic_buffer_size_ - remainder ... dynamic_buffer_size_) + [0 ... rec_write_head_)
-        size_t remainder = chunk.length - rec_write_head_;
-        start_pos = dynamic_buffer_size_ - remainder;
-
-        // Copy first part (from start_pos to end of buffer)
-        memcpy(chunk.psram_ptr, recording_buffer_ + start_pos, remainder);
-
-        // Copy second part (from 0 to rec_write_head_)
-        memcpy(chunk.psram_ptr + remainder, recording_buffer_, rec_write_head_);
-    }
+    memcpy(chunk.psram_ptr, src, chunk.length);
 
     LOG_DEBUG("Wrote chunk %u: %u KB to PSRAM (pool index %u)",
               chunk.id, chunk.length / 1024, (unsigned)(psram_pool_slots_ ? (chunk.id % psram_pool_slots_) : 0));
@@ -1480,7 +1574,8 @@ bool TimeshiftManager::write_chunk_to_psram(ChunkInfo &chunk)
 
 bool TimeshiftManager::validate_chunk(ChunkInfo &chunk)
 {
-    if (storage_mode_ == StorageMode::SD_CARD)
+    bool chunk_on_sd = !chunk.filename.empty();
+    if (chunk_on_sd)
     {
         // SD mode: check file exists and size matches
         File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
@@ -1930,11 +2025,12 @@ void TimeshiftManager::cleanup_old_chunks()
                 playback_chunk_removed = true;
             }
 
-            if (storage_mode_ == StorageMode::SD_CARD)
-            {
-                LOG_INFO("   File: %s, Size: %u KB",
-                         oldest.filename.c_str(),
-                         (unsigned)(oldest.length / 1024));
+        bool chunk_on_sd = !oldest.filename.empty();
+        if (chunk_on_sd)
+        {
+            LOG_INFO("   File: %s, Size: %u KB",
+                     oldest.filename.c_str(),
+                     (unsigned)(oldest.length / 1024));
 
                 // Check if file exists before attempting to delete
                 if (SD_MMC.exists(oldest.filename.c_str()))
@@ -1957,11 +2053,11 @@ void TimeshiftManager::cleanup_old_chunks()
                     removed_count++;
                     total_removed_bytes += oldest.length;
                 }
-            }
-            else
-            {
-                // PSRAM mode: chunk slot will be reused automatically
-                LOG_DEBUG("   PSRAM chunk slot %u freed (will be reused)",
+        }
+        else
+        {
+            // PSRAM mode: chunk slot will be reused automatically
+            LOG_DEBUG("   PSRAM chunk slot %u freed (will be reused)",
                           (unsigned)(psram_pool_slots_ ? (oldest.id % psram_pool_slots_) : 0));
                 removed_count++;
                 total_removed_bytes += oldest.length;
@@ -2109,6 +2205,34 @@ bool TimeshiftManager::preload_next_chunk(uint32_t current_abs_chunk_id)
     LOG_DEBUG("Preloaded chunk abs ID %u (%u KB) at buffer offset %u",
               next_abs_chunk_id, next_chunk.length / 1024, (unsigned)dynamic_chunk_size_);
 
+    return true;
+}
+
+bool TimeshiftManager::rewind_playback_chunks(size_t steps, uint32_t &out_target_chunk_id)
+{
+    out_target_chunk_id = INVALID_CHUNK_ABS_ID;
+    if (steps == 0 ||
+        ready_chunks_.empty() ||
+        current_playback_chunk_abs_id_ == INVALID_CHUNK_ABS_ID)
+    {
+        return false;
+    }
+
+    size_t current_idx = find_chunk_index_by_id(current_playback_chunk_abs_id_);
+    if (current_idx == INVALID_CHUNK_ID)
+    {
+        return false;
+    }
+
+    size_t target_idx = current_idx > steps ? current_idx - steps : 0;
+    const ChunkInfo &target_chunk = ready_chunks_[target_idx];
+
+    current_read_offset_ = target_chunk.start_offset;
+    current_playback_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;
+    playback_chunk_loaded_size_ = 0;
+    last_preload_check_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;
+
+    out_target_chunk_id = target_chunk.id;
     return true;
 }
 
