@@ -1261,9 +1261,17 @@ void TimeshiftManager::cleanup_old_chunks()
     LOG_DEBUG("Current recording offset: %u MB (%u bytes)",
               (unsigned)(current_recording_offset_ / (1024 * 1024)),
               (unsigned)current_recording_offset_);
-    LOG_DEBUG("MAX_TS_WINDOW: %u MB (%u bytes)",
-              (unsigned)(MAX_TS_WINDOW / (1024 * 1024)),
-              (unsigned)MAX_TS_WINDOW);
+    if (storage_mode_ == StorageMode::PSRAM_ONLY)
+    {
+        size_t pool_limit_bytes = MAX_PSRAM_POOL_MB * 1024 * 1024;
+        LOG_DEBUG("PSRAM pool limit: %u MB (%u bytes)", (unsigned)MAX_PSRAM_POOL_MB, (unsigned)pool_limit_bytes);
+    }
+    else
+    {
+        LOG_DEBUG("MAX_TS_WINDOW: %u MB (%u bytes)",
+                  (unsigned)(MAX_TS_WINDOW / (1024 * 1024)),
+                  (unsigned)MAX_TS_WINDOW);
+    }
     LOG_DEBUG("Total ready chunks: %u", (unsigned)ready_chunks_.size());
 
     if (ready_chunks_.empty())
@@ -1295,11 +1303,23 @@ void TimeshiftManager::cleanup_old_chunks()
                             (psram_pool_slots_ > 0 && ready_chunks_.size() >= psram_pool_slots_);
         }
 
-        LOG_DEBUG("Checking oldest chunk abs ID %u: end_offset=%u MB, age=%u MB (%u bytes)",
-                  oldest.id,
-                  (unsigned)(oldest.end_offset / (1024 * 1024)),
-                  (unsigned)age_mb,
-                  (unsigned)age_bytes);
+        if (storage_mode_ == StorageMode::PSRAM_ONLY)
+        {
+            LOG_DEBUG("Checking oldest chunk abs ID %u (end_offset=%u MB, age=%u MB, total_ready=%u KB, limit=%u KB)",
+                      oldest.id,
+                      (unsigned)(oldest.end_offset / (1024 * 1024)),
+                      (unsigned)age_mb,
+                      (unsigned)(total_ready_bytes / 1024),
+                      (unsigned)(pool_limit_bytes / 1024));
+        }
+        else
+        {
+            LOG_DEBUG("Checking oldest chunk abs ID %u: end_offset=%u MB, age=%u MB (%u bytes)",
+                      oldest.id,
+                      (unsigned)(oldest.end_offset / (1024 * 1024)),
+                      (unsigned)age_mb,
+                      (unsigned)age_bytes);
+        }
 
         // --- SAFETY CHECK ---
         // Do not remove the currently playing chunk or the next 2 chunks.
@@ -1319,10 +1339,10 @@ void TimeshiftManager::cleanup_old_chunks()
             }
             else
             {
-                LOG_INFO("CLEANUP: Removing old chunk abs ID %u (age: %u MB > limit: %u MB)",
-                         oldest.id,
-                         (unsigned)age_mb,
-                         (unsigned)(MAX_TS_WINDOW / (1024 * 1024)));
+            LOG_INFO("CLEANUP: Removing old chunk abs ID %u (age: %u MB > limit: %u MB)",
+                     oldest.id,
+                     (unsigned)age_mb,
+                     (unsigned)(MAX_TS_WINDOW / (1024 * 1024)));
             }
 
             // Check if we're removing the currently playing chunk
