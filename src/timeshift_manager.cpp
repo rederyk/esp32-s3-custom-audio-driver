@@ -201,7 +201,18 @@ bool TimeshiftManager::open(const char *uri)
     pause_download_ = false;
     is_auto_paused_ = false;
     backend_switch_in_progress_ = false;
-    switch_pause_was_paused_ = false;
+    seek_blocked_for_switch_ = false;
+    background_migration_in_progress_ = false;
+    retain_psram_until_migrated_ = false;
+    migration_queue_.clear();
+    using_switch_cache_ = false;
+    switch_cache_.clear();
+    switch_cache_cur_id_ = INVALID_CHUNK_ABS_ID;
+    switch_cache_next_id_ = INVALID_CHUNK_ABS_ID;
+    switch_cache_cur_start_ = 0;
+    switch_cache_cur_len_ = 0;
+    switch_cache_next_start_ = 0;
+    switch_cache_next_len_ = 0;
     cumulative_time_ms_ = 0; // Reset temporal tracking
 
     // Reset bitrate tracking so each stream starts from the default assumption
@@ -320,7 +331,12 @@ void TimeshiftManager::close()
     // Free PSRAM pool if allocated
     free_psram_pool();
     backend_switch_in_progress_ = false;
-    switch_pause_was_paused_ = false;
+    seek_blocked_for_switch_ = false;
+    background_migration_in_progress_ = false;
+    retain_psram_until_migrated_ = false;
+    migration_queue_.clear();
+    using_switch_cache_ = false;
+    switch_cache_.clear();
 
     is_open_ = false;
     seek_table_.clear();
@@ -363,7 +379,12 @@ void TimeshiftManager::stop()
     {
         is_running_ = false;
         backend_switch_in_progress_ = false;
-        switch_pause_was_paused_ = false;
+        seek_blocked_for_switch_ = false;
+        background_migration_in_progress_ = false;
+        retain_psram_until_migrated_ = false;
+        migration_queue_.clear();
+        using_switch_cache_ = false;
+        switch_cache_.clear();
         if (download_task_handle_)
         {
             vTaskDelete(download_task_handle_);
@@ -426,6 +447,12 @@ bool TimeshiftManager::seek(size_t position)
 {
     if (!is_open_)
         return false;
+
+    if (backend_switch_in_progress_ || seek_blocked_for_switch_)
+    {
+        LOG_WARN("Seek temporarily disabled during backend switch");
+        return false;
+    }
 
     xSemaphoreTake(mutex_, portMAX_DELAY);
 
@@ -501,6 +528,192 @@ size_t TimeshiftManager::total_downloaded_bytes() const
     return current_recording_offset_;
 }
 
+bool TimeshiftManager::copy_chunk_into_buffer(const ChunkInfo &chunk, uint8_t *dest)
+{
+    if (storage_mode_ == StorageMode::SD_CARD)
+    {
+        File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
+        if (!file)
+        {
+            LOG_ERROR("Switch cache: cannot open %s", chunk.filename.c_str());
+            return false;
+        }
+        size_t read = file.read(dest, chunk.length);
+        file.close();
+        if (read != chunk.length)
+        {
+            LOG_ERROR("Switch cache: read mismatch for chunk %u (expected %u, got %u)", chunk.id, chunk.length, read);
+            return false;
+        }
+        return true;
+    }
+
+    if (!chunk.psram_ptr)
+    {
+        LOG_ERROR("Switch cache: null PSRAM pointer for chunk %u", chunk.id);
+        return false;
+    }
+    memcpy(dest, chunk.psram_ptr, chunk.length);
+    return true;
+}
+
+bool TimeshiftManager::migrate_chunk_psram_to_sd(ChunkInfo &chunk)
+{
+    if (!chunk.psram_ptr)
+    {
+        LOG_ERROR("Migration: chunk %u has no PSRAM data", chunk.id);
+        return false;
+    }
+
+    if (!SD_MMC.exists("/timeshift"))
+    {
+        SD_MMC.mkdir("/timeshift");
+    }
+
+    chunk.filename = "/timeshift/ready_" + std::to_string(chunk.id) + ".bin";
+
+    File file = SD_MMC.open(chunk.filename.c_str(), FILE_WRITE);
+    if (!file)
+    {
+        LOG_ERROR("Migration: cannot open %s for chunk %u", chunk.filename.c_str(), chunk.id);
+        return false;
+    }
+
+    size_t written = file.write(chunk.psram_ptr, chunk.length);
+    file.close();
+    if (written != chunk.length)
+    {
+        LOG_ERROR("Migration: write mismatch for chunk %u (expected %u, wrote %u)", chunk.id, chunk.length, written);
+        SD_MMC.remove(chunk.filename.c_str());
+        return false;
+    }
+
+    LOG_DEBUG("Migration: chunk %u copied to SD (%u KB)", chunk.id, chunk.length / 1024);
+    return true;
+}
+
+bool TimeshiftManager::snapshot_playback_window()
+{
+    ChunkInfo cur_chunk;
+    ChunkInfo next_chunk;
+    bool have_next = false;
+
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    if (current_playback_chunk_abs_id_ == INVALID_CHUNK_ABS_ID)
+    {
+        xSemaphoreGive(mutex_);
+        return false;
+    }
+
+    size_t cur_idx = find_chunk_index_by_id(current_playback_chunk_abs_id_);
+    if (cur_idx == INVALID_CHUNK_ID)
+    {
+        xSemaphoreGive(mutex_);
+        return false;
+    }
+
+    cur_chunk = ready_chunks_[cur_idx];
+    if (cur_idx + 1 < ready_chunks_.size())
+    {
+        next_chunk = ready_chunks_[cur_idx + 1];
+        have_next = true;
+    }
+    xSemaphoreGive(mutex_);
+
+    size_t total_size = cur_chunk.length + (have_next ? next_chunk.length : 0);
+    if (total_size == 0)
+    {
+        return false;
+    }
+
+    switch_cache_.assign(total_size, 0);
+
+    if (!copy_chunk_into_buffer(cur_chunk, switch_cache_.data()))
+    {
+        switch_cache_.clear();
+        return false;
+    }
+
+    if (have_next)
+    {
+        if (!copy_chunk_into_buffer(next_chunk, switch_cache_.data() + cur_chunk.length))
+        {
+            switch_cache_.clear();
+            return false;
+        }
+    }
+
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    using_switch_cache_ = true;
+    switch_cache_cur_id_ = cur_chunk.id;
+    switch_cache_cur_start_ = cur_chunk.start_offset;
+    switch_cache_cur_len_ = cur_chunk.length;
+    if (have_next)
+    {
+        switch_cache_next_id_ = next_chunk.id;
+        switch_cache_next_start_ = next_chunk.start_offset;
+        switch_cache_next_len_ = next_chunk.length;
+    }
+    else
+    {
+        switch_cache_next_id_ = INVALID_CHUNK_ABS_ID;
+        switch_cache_next_start_ = 0;
+        switch_cache_next_len_ = 0;
+    }
+    xSemaphoreGive(mutex_);
+
+    LOG_INFO("Switch cache prepared: chunk %u (%u KB)%s",
+             cur_chunk.id, cur_chunk.length / 1024,
+             have_next ? " + next chunk" : "");
+    return true;
+}
+
+bool TimeshiftManager::try_read_from_switch_cache(size_t offset, void *buffer, size_t size, size_t &out_bytes)
+{
+    if (!using_switch_cache_)
+    {
+        return false;
+    }
+
+    auto serve_from_cached = [&](uint32_t id, size_t start, size_t len, size_t base_offset) -> bool
+    {
+        if (id == INVALID_CHUNK_ABS_ID || len == 0)
+        {
+            return false;
+        }
+        if (offset < start || offset >= start + len)
+        {
+            return false;
+        }
+        size_t chunk_offset = offset - start;
+        size_t available = len - chunk_offset;
+        size_t to_read = std::min(size, available);
+        memcpy(buffer, switch_cache_.data() + base_offset + chunk_offset, to_read);
+        playback_chunk_loaded_size_ = len;
+        current_playback_chunk_abs_id_ = id;
+        out_bytes = to_read;
+        return true;
+    };
+
+    // Current chunk cached at base 0
+    if (serve_from_cached(switch_cache_cur_id_, switch_cache_cur_start_, switch_cache_cur_len_, 0))
+    {
+        LOG_DEBUG("Serving playback from switch cache (chunk %u)", switch_cache_cur_id_);
+        return true;
+    }
+
+    // Optional next chunk cached after current
+    if (serve_from_cached(switch_cache_next_id_,
+                          switch_cache_next_start_,
+                          switch_cache_next_len_,
+                          switch_cache_cur_len_))
+    {
+        LOG_DEBUG("Serving playback from switch cache (chunk %u)", switch_cache_next_id_);
+        return true;
+    }
+
+    return false;
+}
 float TimeshiftManager::buffer_duration_seconds() const
 {
     float bitrate_kbps = detected_bitrate_kbps_ != 0 ? (float)detected_bitrate_kbps_ : (float)DEFAULT_BITRATE_KBPS;
@@ -683,6 +896,84 @@ void TimeshiftManager::download_task_loop()
 
     while (is_running_)
     {
+        // Background migration step (non-blocking)
+        auto process_background_migration = [&]() {
+            xSemaphoreTake(mutex_, portMAX_DELAY);
+            bool do_step = background_migration_in_progress_ && !migration_queue_.empty();
+            uint32_t chunk_id = INVALID_CHUNK_ABS_ID;
+            StorageMode target = background_migration_target_;
+            if (do_step)
+            {
+                chunk_id = migration_queue_.front();
+                migration_queue_.erase(migration_queue_.begin());
+            }
+            xSemaphoreGive(mutex_);
+
+            if (!do_step)
+            {
+                xSemaphoreTake(mutex_, portMAX_DELAY);
+                if (background_migration_in_progress_ && migration_queue_.empty())
+                {
+                    background_migration_in_progress_ = false;
+                    if (retain_psram_until_migrated_)
+                    {
+                        free_psram_pool();
+                        retain_psram_until_migrated_ = false;
+                        for (auto &c : ready_chunks_)
+                        {
+                            c.psram_ptr = nullptr;
+                        }
+                    }
+                    LOG_INFO("Background migration completed");
+                }
+                xSemaphoreGive(mutex_);
+                return;
+            }
+
+            if (target == StorageMode::SD_CARD)
+            {
+                // Copy one chunk from PSRAM to SD
+                ChunkInfo snapshot;
+                bool found = false;
+                xSemaphoreTake(mutex_, portMAX_DELAY);
+                for (auto &c : ready_chunks_)
+                {
+                    if (c.id == chunk_id)
+                    {
+                        snapshot = c;
+                        found = true;
+                        break;
+                    }
+                }
+                xSemaphoreGive(mutex_);
+
+                if (!found)
+                {
+                    LOG_WARN("Background migration: chunk %u not found (skipped)", chunk_id);
+                    return;
+                }
+
+                if (!migrate_chunk_psram_to_sd(snapshot))
+                {
+                    LOG_WARN("Background migration: failed to migrate chunk %u", chunk_id);
+                    return;
+                }
+
+                xSemaphoreTake(mutex_, portMAX_DELAY);
+                for (auto &c : ready_chunks_)
+                {
+                    if (c.id == chunk_id)
+                    {
+                        c.filename = snapshot.filename;
+                        break;
+                    }
+                }
+                xSemaphoreGive(mutex_);
+            }
+        };
+
+        process_background_migration();
+
         // Execute pending backend switch only at a chunk boundary to keep data contiguous
         if (storage_switch_requested_ && bytes_in_current_chunk_ == 0)
         {
@@ -691,19 +982,13 @@ void TimeshiftManager::download_task_loop()
             target = pending_storage_mode_;
             storage_switch_requested_ = false;
             backend_switch_in_progress_ = true;
-            switch_pause_was_paused_ = is_auto_paused_;
-            bool has_callback = (auto_pause_callback_ != nullptr);
-            bool pause_playback = has_callback && !is_auto_paused_;
-            if (pause_playback)
-            {
-                is_auto_paused_ = true;
-            }
+            seek_blocked_for_switch_ = true;
             xSemaphoreGive(mutex_);
 
-            // Pause playback while chunks are migrated to avoid underruns
-            if (pause_playback)
+            bool cached_window = snapshot_playback_window();
+            if (!cached_window)
             {
-                auto_pause_callback_(true);
+                LOG_WARN("Backend switch: failed to cache playback window, proceeding without cache");
             }
 
             LOG_INFO("Executing backend switch to %s",
@@ -796,54 +1081,42 @@ void TimeshiftManager::download_task_loop()
                     tsDir.close();
                 }
 
+                // Fast path: copy only current and next chunk immediately, queue the rest
+                uint32_t cur_id = current_playback_chunk_abs_id_;
+                uint32_t next_id = (cur_id != INVALID_CHUNK_ABS_ID) ? cur_id + 1 : INVALID_CHUNK_ABS_ID;
+
+                xSemaphoreTake(mutex_, portMAX_DELAY);
+                migration_queue_.clear();
+                xSemaphoreGive(mutex_);
+
                 for (size_t i = 0; i < ready_chunks_.size() && ok; ++i)
                 {
                     xSemaphoreTake(mutex_, portMAX_DELAY);
                     ChunkInfo &chunk = ready_chunks_[i];
-                    chunk.filename = "/timeshift/ready_" + std::to_string(chunk.id) + ".bin";
-                    const uint8_t *source_ptr = chunk.psram_ptr;
-                    std::string filename = chunk.filename;
-                    size_t length = chunk.length;
+                    uint32_t cid = chunk.id;
                     xSemaphoreGive(mutex_);
 
-                    File file = SD_MMC.open(filename.c_str(), FILE_WRITE);
-                    if (!file)
+                    if (cid == cur_id || cid == next_id)
                     {
-                        LOG_ERROR("Cannot open %s for writing during backend switch", filename.c_str());
-                        ok = false;
-                        break;
+                        if (!migrate_chunk_psram_to_sd(chunk))
+                        {
+                            ok = false;
+                            break;
+                        }
                     }
-
-                    if (!source_ptr)
+                    else
                     {
-                        LOG_ERROR("Missing PSRAM data for chunk %u while switching to SD", chunk.id);
-                        file.close();
-                        ok = false;
-                        break;
-                    }
-
-                    size_t written = file.write(source_ptr, length);
-                    file.close();
-
-                    if (written != length)
-                    {
-                        LOG_ERROR("Write mismatch while migrating chunk %u to SD (expected %u, wrote %u)",
-                                  chunk.id, length, written);
-                        ok = false;
-                        break;
+                        xSemaphoreTake(mutex_, portMAX_DELAY);
+                        migration_queue_.push_back(cid);
+                        xSemaphoreGive(mutex_);
                     }
                 }
 
-                if (ok)
-                {
-                    xSemaphoreTake(mutex_, portMAX_DELAY);
-                    free_psram_pool();
-                    for (auto &chunk : ready_chunks_)
-                    {
-                        chunk.psram_ptr = nullptr;
-                    }
-                    xSemaphoreGive(mutex_);
-                }
+                xSemaphoreTake(mutex_, portMAX_DELAY);
+                background_migration_in_progress_ = ok && !migration_queue_.empty();
+                background_migration_target_ = StorageMode::SD_CARD;
+                retain_psram_until_migrated_ = background_migration_in_progress_;
+                xSemaphoreGive(mutex_);
             }
 
             if (ok)
@@ -860,26 +1133,49 @@ void TimeshiftManager::download_task_loop()
                 free_psram_pool();
             }
 
-            // Resume playback state after migration if we paused it here
-            bool resume_playback = false;
-            xSemaphoreTake(mutex_, portMAX_DELAY);
-            if (backend_switch_in_progress_)
+            // If no background migration pending and we are in SD mode, we can free PSRAM now
+            if (ok && target == StorageMode::SD_CARD)
             {
-                resume_playback = (auto_pause_callback_ && !switch_pause_was_paused_);
-                if (resume_playback)
+                xSemaphoreTake(mutex_, portMAX_DELAY);
+                bool pending_bg = background_migration_in_progress_;
+                xSemaphoreGive(mutex_);
+                if (!pending_bg)
                 {
-                    is_auto_paused_ = false;
+                    free_psram_pool();
                 }
-                backend_switch_in_progress_ = false;
-                switch_pause_was_paused_ = false;
-                last_preload_check_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;
+            }
+
+            bool reload_current_chunk = false;
+            uint32_t chunk_to_reload = INVALID_CHUNK_ABS_ID;
+            xSemaphoreTake(mutex_, portMAX_DELAY);
+            backend_switch_in_progress_ = false;
+            seek_blocked_for_switch_ = false;
+            last_preload_check_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;
+            if (ok && current_playback_chunk_abs_id_ != INVALID_CHUNK_ABS_ID)
+            {
+                reload_current_chunk = true;
+                chunk_to_reload = current_playback_chunk_abs_id_;
             }
             xSemaphoreGive(mutex_);
 
-            if (resume_playback)
+            // Reload the current chunk from the new backend to keep playback aligned
+            if (ok && reload_current_chunk && chunk_to_reload != INVALID_CHUNK_ABS_ID)
             {
-                auto_pause_callback_(false);
+                if (!load_chunk_to_playback(chunk_to_reload))
+                {
+                    LOG_WARN("After backend switch, failed to reload current chunk abs ID %u", chunk_to_reload);
+                }
             }
+
+            // Clear temporary cache after migration
+            xSemaphoreTake(mutex_, portMAX_DELAY);
+            using_switch_cache_ = false;
+            switch_cache_.clear();
+            switch_cache_cur_id_ = INVALID_CHUNK_ABS_ID;
+            switch_cache_next_id_ = INVALID_CHUNK_ABS_ID;
+            switch_cache_cur_len_ = 0;
+            switch_cache_next_len_ = 0;
+            xSemaphoreGive(mutex_);
         }
 
         // SAFETY: Check stream validity before using
@@ -1776,19 +2072,26 @@ bool TimeshiftManager::preload_next_chunk(uint32_t current_abs_chunk_id)
     if (storage_mode_ == StorageMode::SD_CARD)
     {
         File file = SD_MMC.open(next_chunk.filename.c_str(), FILE_READ);
-        if (!file)
+        if (file)
+        {
+            // Carica nella seconda metà del buffer
+            size_t read = file.read(playback_buffer_ + dynamic_chunk_size_, next_chunk.length);
+            file.close();
+
+            if (read != next_chunk.length)
+            {
+                LOG_ERROR("Preload read mismatch: expected %u, got %u", next_chunk.length, read);
+                return false;
+            }
+        }
+        else if (next_chunk.psram_ptr)
+        {
+            LOG_DEBUG("Preload fallback: chunk %u still in PSRAM (not yet migrated)", next_abs_chunk_id);
+            memcpy(playback_buffer_ + dynamic_chunk_size_, next_chunk.psram_ptr, next_chunk.length);
+        }
+        else
         {
             LOG_ERROR("Preload failed: cannot open %s", next_chunk.filename.c_str());
-            return false;
-        }
-
-        // Carica nella seconda metà del buffer
-        size_t read = file.read(playback_buffer_ + dynamic_chunk_size_, next_chunk.length);
-        file.close();
-
-        if (read != next_chunk.length)
-        {
-            LOG_ERROR("Preload read mismatch: expected %u, got %u", next_chunk.length, read);
             return false;
         }
     }
@@ -1876,19 +2179,26 @@ bool TimeshiftManager::load_chunk_to_playback(uint32_t abs_chunk_id)
     {
         // Open chunk file
         File file = SD_MMC.open(chunk.filename.c_str(), FILE_READ);
-        if (!file)
+        if (file)
+        {
+            // Read entire chunk into playback_buffer_
+            size_t read = file.read(playback_buffer_, chunk.length);
+            file.close();
+
+            if (read != chunk.length)
+            {
+                LOG_ERROR("Chunk read mismatch: expected %u, got %u", chunk.length, read);
+                return false;
+            }
+        }
+        else if (chunk.psram_ptr)
+        {
+            LOG_DEBUG("Playback fallback: chunk %u still in PSRAM (not yet migrated)", chunk.id);
+            memcpy(playback_buffer_, chunk.psram_ptr, chunk.length);
+        }
+        else
         {
             LOG_ERROR("Failed to open chunk for playback: %s", chunk.filename.c_str());
-            return false;
-        }
-
-        // Read entire chunk into playback_buffer_
-        size_t read = file.read(playback_buffer_, chunk.length);
-        file.close();
-
-        if (read != chunk.length)
-        {
-            LOG_ERROR("Chunk read mismatch: expected %u, got %u", chunk.length, read);
             return false;
         }
     }
@@ -1923,6 +2233,12 @@ bool TimeshiftManager::load_chunk_to_playback(uint32_t abs_chunk_id)
 
 size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void *buffer, size_t size)
 {
+    size_t cached_bytes = 0;
+    if (try_read_from_switch_cache(offset, buffer, size, cached_bytes))
+    {
+        return cached_bytes;
+    }
+
     // Find chunk containing this offset (returns ABSOLUTE chunk ID)
     uint32_t abs_chunk_id = find_chunk_for_offset(offset);
     if (abs_chunk_id == INVALID_CHUNK_ABS_ID)
@@ -2012,13 +2328,13 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void *buffer, 
     }
     else if (current_playback_chunk_abs_id_ != abs_chunk_id)
     {
-        // Seek o situazione anomala: carica il chunk richiesto da SD (potrebbe causare stutter)
-        LOG_WARN("Chunk abs ID %u not preloaded, loading now (may cause stutter)", abs_chunk_id);
+    // Seek o situazione anomala: carica il chunk richiesto da SD (potrebbe causare stutter)
+    LOG_WARN("Chunk abs ID %u not preloaded, loading now (may cause stutter)", abs_chunk_id);
 
-        // Attiva la pausa automatica per buffering se il callback è registrato
-        if (auto_pause_callback_ && !is_auto_paused_)
-        {
-            LOG_INFO("Auto-pausing playback for buffering...");
+    // Attiva la pausa automatica per buffering se il callback è registrato
+    if (auto_pause_callback_ && !is_auto_paused_)
+    {
+        LOG_INFO("Auto-pausing playback for buffering...");
             is_auto_paused_ = true;
             auto_pause_callback_(true); // true = pause
         }

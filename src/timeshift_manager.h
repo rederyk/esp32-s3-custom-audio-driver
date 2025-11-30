@@ -142,6 +142,15 @@ private:
     size_t playback_chunk_loaded_size_ = 0;                // Size of loaded chunk
     uint32_t last_preload_check_chunk_abs_id_ = UINT32_MAX;   // Per evitare controlli di preload ripetuti
     uint32_t preloaded_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;          // Chunk ID that was copied into playback_buffer_+chunk_size
+    // Temporary cache used during backend switch to keep playback stable
+    std::vector<uint8_t> switch_cache_;
+    bool using_switch_cache_ = false;
+    uint32_t switch_cache_cur_id_ = INVALID_CHUNK_ABS_ID;
+    uint32_t switch_cache_next_id_ = INVALID_CHUNK_ABS_ID;
+    size_t switch_cache_cur_start_ = 0;
+    size_t switch_cache_cur_len_ = 0;
+    size_t switch_cache_next_start_ = 0;
+    size_t switch_cache_next_len_ = 0;
     
     // Global stream state
     std::string uri_;
@@ -151,7 +160,11 @@ private:
     StorageMode pending_storage_mode_ = StorageMode::SD_CARD;
     bool storage_switch_requested_ = false;
     bool backend_switch_in_progress_ = false;         // True while migrating chunks between backends
-    bool switch_pause_was_paused_ = false;            // Track playback pause state before migration
+    bool seek_blocked_for_switch_ = false;            // Block seeks during migration
+    bool background_migration_in_progress_ = false;   // Copy remaining chunks after fast switch
+    bool retain_psram_until_migrated_ = false;        // Keep PSRAM pool alive during PSRAM->SD migration
+    StorageMode background_migration_target_ = StorageMode::SD_CARD;
+    std::vector<uint32_t> migration_queue_;            // Chunks still to migrate after fast switch
 
     // Download task
     TaskHandle_t download_task_handle_ = nullptr;
@@ -220,6 +233,10 @@ private:
     bool preload_next_chunk(uint32_t current_abs_chunk_id);
     size_t read_from_playback_buffer(size_t offset, void* buffer, size_t size);
     size_t find_chunk_index_by_id(uint32_t abs_chunk_id);  // Convert abs ID to array index
+    bool copy_chunk_into_buffer(const ChunkInfo& chunk, uint8_t* dest); // Switch cache helpers
+    bool snapshot_playback_window();
+    bool try_read_from_switch_cache(size_t offset, void* buffer, size_t size, size_t& out_bytes);
+    bool migrate_chunk_psram_to_sd(ChunkInfo& chunk);
 
     // CLEANUP
     void cleanup_old_chunks();                      // Remove old chunks beyond window
