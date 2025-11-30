@@ -261,6 +261,7 @@ private:
     // CLEANUP
     void cleanup_old_chunks();                      // Remove old chunks beyond window
     void enforce_capacity_limits(size_t max_bytes, size_t max_slots); // Drop oldest chunks to fit target capacity
+    void trim_ready_chunks_for_psram_pool();         // Keep only the most recent chunks that fit within the PSRAM pool
     bool move_chunk_to_export_folder(const ChunkInfo& chunk, bool& out_missing_file);
     std::string build_export_directory(uint32_t chunk_id) const;
 

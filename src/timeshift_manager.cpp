@@ -1128,7 +1128,7 @@ void TimeshiftManager::download_task_loop()
                 else
                 {
                     xSemaphoreTake(mutex_, portMAX_DELAY);
-                    enforce_capacity_limits(psram_pool_size_, psram_pool_slots_);
+                    trim_ready_chunks_for_psram_pool();
                     xSemaphoreGive(mutex_);
 
                     for (size_t i = 0; i < ready_chunks_.size() && ok; ++i)
@@ -2100,6 +2100,70 @@ void TimeshiftManager::cleanup_old_chunks()
 
     LOG_DEBUG("Remaining ready chunks: %u", (unsigned)ready_chunks_.size());
     LOG_DEBUG("=== CLEANUP END ===");
+}
+
+void TimeshiftManager::trim_ready_chunks_for_psram_pool()
+{
+    if (psram_pool_slots_ == 0 && psram_pool_size_ == 0)
+    {
+        return;
+    }
+
+    size_t total_ready_bytes = 0;
+    for (const auto &chunk : ready_chunks_)
+    {
+        total_ready_bytes += chunk.length;
+    }
+
+    size_t removed_count = 0;
+    bool playback_chunk_removed = false;
+
+    while (!ready_chunks_.empty() &&
+           ((psram_pool_slots_ > 0 && ready_chunks_.size() > psram_pool_slots_) ||
+            (psram_pool_size_ > 0 && total_ready_bytes > psram_pool_size_)))
+    {
+        const ChunkInfo &oldest = ready_chunks_.front();
+
+        if (!oldest.filename.empty() && SD_MMC.exists(oldest.filename.c_str()))
+        {
+            SD_MMC.remove(oldest.filename.c_str());
+        }
+
+        if (oldest.id == current_playback_chunk_abs_id_)
+        {
+            playback_chunk_removed = true;
+        }
+
+        total_ready_bytes = (total_ready_bytes >= oldest.length) ? (total_ready_bytes - oldest.length) : 0;
+        ready_chunks_.erase(ready_chunks_.begin());
+        removed_count++;
+    }
+
+    if (removed_count > 0)
+    {
+        LOG_INFO("PSRAM trim: removed %u oldest chunks (%u remain)",
+                 (unsigned)removed_count,
+                 (unsigned)ready_chunks_.size());
+    }
+
+    bool offset_reset_needed = playback_chunk_removed ||
+                               (!ready_chunks_.empty() && current_read_offset_ < ready_chunks_.front().start_offset);
+
+    if (offset_reset_needed)
+    {
+        if (!ready_chunks_.empty())
+        {
+            current_read_offset_ = ready_chunks_.front().start_offset;
+        }
+        else
+        {
+            current_read_offset_ = 0;
+        }
+        current_playback_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;
+        playback_chunk_loaded_size_ = 0;
+        last_preload_check_chunk_abs_id_ = INVALID_CHUNK_ABS_ID;
+        LOG_WARN("Playback position reset after trimming for PSRAM migration");
+    }
 }
 
 bool TimeshiftManager::cleanup_timeshift_directory()
