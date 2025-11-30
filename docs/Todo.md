@@ -17,12 +17,12 @@
 ## 📚 Trasformazione in Libreria Arduino e Miglioramento Documentazione
 
 ### 🏗️ Trasformazione in Libreria Arduino
-- [ ] Spostare il core logico (AudioPlayer, AudioOutput, AudioStream, TimeshiftManager, etc.) in cartella src della libreria
-- [ ] Creare file library.properties per IDE Arduino e PlatformIO
-- [ ] Spostare main.cpp in examples/serial_control/serial_control.ino
-- [ ] Creare esempio play_local_file: examples/play_local_file/play_local_file.ino (riproduzione semplice da LittleFS/SD)
-- [ ] Creare esempio http_timeshift_radio: examples/http_timeshift_radio/http_timeshift_radio.ino (focalizzato su timeshift)
-- [ ] Creare esempio web_interface: examples/web_interface/web_interface.ino (controllo via AsyncWebServer)
+- [V] Spostare il core logico (AudioPlayer, AudioOutput, AudioStream, TimeshiftManager, etc.) in cartella src della libreria
+- [V] Creare file library.properties per IDE Arduino e PlatformIO
+- [V] Spostare main.cpp in examples/serial_control/serial_control.ino
+- [V] Creare esempio play_local_file: examples/play_local_file/play_local_file.ino (riproduzione semplice da LittleFS/SD)
+- [V] Creare esempio http_timeshift_radio: examples/http_timeshift_radio/http_timeshift_radio.ino (focalizzato su timeshift)
+- [V] Creare esempio web_interface: examples/web_interface/web_interface.ino (controllo via AsyncWebServer)
 
 ### 📖 Miglioramento Documentazione
 - [ ] Aggiornare README.md con struttura completa:
