@@ -8,7 +8,7 @@
         {
             "name": "PlatformIO",
             "includePath": [
-                "/home/reder/Documents/openESPaudio/src",
+                "/home/reder/Documenti/openESPaudio/src",
                 "/home/reder/.platformio/packages/framework-arduinoespressif32/libraries/HTTPClient/src",
                 "/home/reder/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src",
                 "/home/reder/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",
@@ -246,7 +246,7 @@
             "browse": {
                 "limitSymbolsToIncludedHeaders": true,
                 "path": [
-                    "/home/reder/Documents/openESPaudio/src",
+                    "/home/reder/Documenti/openESPaudio/src",
                     "/home/reder/.platformio/packages/framework-arduinoespressif32/libraries/HTTPClient/src",
                     "/home/reder/.platformio/packages/framework-arduinoespressif32/libraries/WiFiClientSecure/src",
                     "/home/reder/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",

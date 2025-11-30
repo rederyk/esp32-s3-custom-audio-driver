@@ -1,0 +1,76 @@
+#######################################
+# Syntax Coloring Map for openESPaudio
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+AudioPlayer	KEYWORD1
+TimeshiftManager	KEYWORD1
+AudioConfig	KEYWORD1
+AudioOutput	KEYWORD1
+AudioStream	KEYWORD1
+IDataSource	KEYWORD1
+DataSourceLittleFS	KEYWORD1
+DataSourceSDCard	KEYWORD1
+DataSourceHTTP	KEYWORD1
+SdCardDriver	KEYWORD1
+PlayerState	KEYWORD1
+SourceType	KEYWORD1
+StorageMode	KEYWORD1
+AudioFormat	KEYWORD1
+Metadata	KEYWORD1
+PlayerCallbacks	KEYWORD1
+LogLevel	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+select_source	KEYWORD2
+arm_source	KEYWORD2
+start	KEYWORD2
+stop	KEYWORD2
+toggle_pause	KEYWORD2
+set_pause	KEYWORD2
+request_seek	KEYWORD2
+set_volume	KEYWORD2
+tick_housekeeping	KEYWORD2
+print_status	KEYWORD2
+is_playing	KEYWORD2
+state	KEYWORD2
+current_position_sec	KEYWORD2
+current_position_ms	KEYWORD2
+total_duration_sec	KEYWORD2
+total_duration_ms	KEYWORD2
+source_type	KEYWORD2
+setStorageMode	KEYWORD2
+getStorageMode	KEYWORD2
+buffered_bytes	KEYWORD2
+total_downloaded_bytes	KEYWORD2
+seek_to_time	KEYWORD2
+set_auto_pause_callback	KEYWORD2
+set_auto_pause_margin	KEYWORD2
+begin	KEYWORD2
+isMounted	KEYWORD2
+getInstance	KEYWORD2
+set_log_level	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+STOPPED	LITERAL1
+PLAYING	LITERAL1
+PAUSED	LITERAL1
+ENDED	LITERAL1
+ERROR	LITERAL1
+LITTLEFS	LITERAL1
+SD_CARD	LITERAL1
+HTTP_STREAM	LITERAL1
+PSRAM_ONLY	LITERAL1
+LOG_DEBUG	LITERAL1
+LOG_INFO	LITERAL1
+LOG_WARN	LITERAL1
+LOG_ERROR	LITERAL1
