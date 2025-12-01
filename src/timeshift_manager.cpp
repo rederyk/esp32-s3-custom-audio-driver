@@ -2871,6 +2871,8 @@ uint32_t TimeshiftManager::current_position_ms() const
     if (ready_chunks_.empty())
         return 0;
 
+    uint32_t base_start_time = ready_chunks_.front().start_time_ms;
+
     // Find the chunk containing current_read_offset_
     for (const auto &chunk : ready_chunks_)
     {
@@ -2885,12 +2887,17 @@ uint32_t TimeshiftManager::current_position_ms() const
             // Calculate time within chunk
             uint32_t time_in_chunk = (uint32_t)(chunk.duration_ms * progress);
 
-            return chunk.start_time_ms + time_in_chunk;
+            return (chunk.start_time_ms - base_start_time) + time_in_chunk;
         }
     }
 
-    // If not found in any chunk, return 0
-    return 0;
+    // Fallback: if not found, assume at end of buffer
+    uint32_t total = 0;
+    for (const auto &chunk : ready_chunks_)
+    {
+        total += chunk.duration_ms;
+    }
+    return total;
 }
 
 // ========== PAUSE/RESUME METHODS ==========
