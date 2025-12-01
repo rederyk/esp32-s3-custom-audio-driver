@@ -13,6 +13,7 @@
 ## 🔄 In Corso / Pianificati
 * correggere wrappare init flush chunk timeshift
 * creare funzione per estrarre registrazione.mp3 dal timeshift
+* fallback chunk a indici presenti se no si trova quello indicato e wrappare le funzioni che fanno gia questo in altri modi
 
 ## 📚 Trasformazione in Libreria Arduino e Miglioramento Documentazione
 

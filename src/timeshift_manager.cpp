@@ -386,32 +386,43 @@ bool TimeshiftManager::start()
 
 void TimeshiftManager::stop()
 {
-    if (is_running_)
-    {
-        is_running_ = false;
-        backend_switch_in_progress_ = false;
-        seek_blocked_for_switch_ = false;
-        background_migration_in_progress_ = false;
-        retain_psram_until_migrated_ = false;
-        migration_queue_.clear();
-        using_switch_cache_ = false;
-        switch_cache_.clear();
-        if (download_task_handle_)
+    // Always request a shutdown so tasks can exit cleanly
+    playback_stop_requested_ = true;
+    is_running_ = false;
+    backend_switch_in_progress_ = false;
+    seek_blocked_for_switch_ = false;
+    background_migration_in_progress_ = false;
+    retain_psram_until_migrated_ = false;
+    migration_queue_.clear();
+    using_switch_cache_ = false;
+    switch_cache_.clear();
+
+    auto wait_for_task = [&](TaskHandle_t &handle, const char *name) {
+        if (!handle)
         {
-            vTaskDelete(download_task_handle_);
-            download_task_handle_ = nullptr;
+            return;
         }
-        if (writer_task_handle_)
+
+        const uint32_t TIMEOUT_MS = 2000;
+        uint32_t waited = 0;
+        while (handle && waited < TIMEOUT_MS)
         {
-            vTaskDelete(writer_task_handle_);
-            writer_task_handle_ = nullptr;
+            vTaskDelay(pdMS_TO_TICKS(20));
+            waited += 20;
         }
-        if (preloader_task_handle_)
+
+        if (handle)
         {
-            vTaskDelete(preloader_task_handle_);
-            preloader_task_handle_ = nullptr;
+            LOG_WARN("%s task did not exit in time, forcing delete", name);
+            vTaskDelete(handle);
         }
-    }
+        handle = nullptr;
+    };
+
+    // Tasks clear their handles when exiting; wait for them before deleting resources.
+    wait_for_task(download_task_handle_, "Download");
+    wait_for_task(writer_task_handle_, "Writer");
+    wait_for_task(preloader_task_handle_, "Preloader");
 
     // Drain and destroy queue (free any pending buffers)
     if (write_queue_)
@@ -898,6 +909,7 @@ void TimeshiftManager::preloader_task_loop()
         xSemaphoreGive(mutex_);
     }
     LOG_INFO("File preloader task terminated");
+    preloader_task_handle_ = nullptr;
     vTaskDelete(nullptr);
 }
 
@@ -972,6 +984,7 @@ void TimeshiftManager::writer_task_loop()
     }
 
     LOG_INFO("Chunk writer task terminated");
+    writer_task_handle_ = nullptr;
     vTaskDelete(nullptr);
 }
 
@@ -990,6 +1003,7 @@ void TimeshiftManager::download_task_loop()
     {
         LOG_ERROR("HTTP GET failed: %d (%s)", httpCode, http.errorToString(httpCode).c_str());
         is_running_ = false;
+        download_task_handle_ = nullptr;
         http.end();
         vTaskDelete(nullptr);
         return;
@@ -1003,6 +1017,7 @@ void TimeshiftManager::download_task_loop()
     {
         LOG_ERROR("CRITICAL: getStreamPtr() returned NULL!");
         is_running_ = false;
+        download_task_handle_ = nullptr;
         http.end();
         vTaskDelete(nullptr);
         return;
@@ -1022,6 +1037,7 @@ void TimeshiftManager::download_task_loop()
     if (!buf) {
         LOG_ERROR("CRITICAL: Failed to allocate any download buffer!");
         is_running_ = false;
+        download_task_handle_ = nullptr;
         http.end();
         vTaskDelete(nullptr);
         return;
@@ -1032,6 +1048,22 @@ void TimeshiftManager::download_task_loop()
     uint32_t start_wait = millis();
     uint32_t last_data_time = millis();
     const uint32_t STREAM_TIMEOUT = 30000; // 30 seconds without data = timeout
+    const char *exit_reason = "stopped";
+
+    auto finalize_task = [&](const char *reason) {
+        const char *tag = reason ? reason : "stopped";
+        LOG_INFO("Download task ending (%s) - total downloaded: %u KB",
+                 tag,
+                 (unsigned)(total_downloaded / 1024));
+        http.end();
+        if (buf)
+        {
+            free(buf);
+            buf = nullptr;
+        }
+        download_task_handle_ = nullptr;
+        vTaskDelete(nullptr);
+    };
 
     while (is_running_)
     {
@@ -1316,12 +1348,14 @@ void TimeshiftManager::download_task_loop()
             if (httpCode != HTTP_CODE_OK)
             {
                 LOG_ERROR("Reconnection failed: %d", httpCode);
+                exit_reason = "reconnect_http";
                 break;
             }
             stream = http.getStreamPtr();
             if (!stream)
             {
                 LOG_ERROR("Reconnection failed: NULL stream");
+                exit_reason = "reconnect_stream";
                 break;
             }
             last_data_time = millis();
@@ -1340,6 +1374,7 @@ void TimeshiftManager::download_task_loop()
                 if (!flush_recording_chunk_async())
                 {
                     LOG_ERROR("Failed to flush full chunk");
+                    exit_reason = "flush_chunk";
                     break;
                 }
                 continue; // Start filling the next chunk
@@ -1443,10 +1478,7 @@ void TimeshiftManager::download_task_loop()
         }
     }
 
-    LOG_INFO("Download task ending - total downloaded: %u KB", (unsigned)(total_downloaded / 1024));
-    http.end();
-    free(buf);
-    vTaskDelete(nullptr);
+    finalize_task(exit_reason);
 }
 
 // ========== RECORDING SIDE METHODS ==========
