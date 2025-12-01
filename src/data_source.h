@@ -41,6 +41,9 @@ public:
     // Optional: Temporal seek for streamable sources
     virtual size_t seek_to_time(uint32_t target_ms) { return SIZE_MAX; }
 
+    // Optional: allow cooperative stop when playback is interrupted
+    virtual void request_stop() {}
+
     // Optional: For sources that can report temporal progress
     virtual uint32_t current_position_ms() const { return 0; }
     virtual uint32_t total_duration_ms() const { return 0; }

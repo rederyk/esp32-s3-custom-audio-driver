@@ -43,6 +43,7 @@ public:
     SourceType type() const override { return SourceType::HTTP_STREAM; } // Acts as HTTP conceptually
     const char* uri() const override;
     const Mp3SeekTable* get_seek_table() const override { return &seek_table_; }
+    void request_stop() override;
 
     // Timeshift specific control
     bool start();
@@ -164,6 +165,7 @@ private:
     StorageMode storage_mode_ = StorageMode::SD_CARD;  // Default to SD card mode
     StorageMode pending_storage_mode_ = StorageMode::SD_CARD;
     bool storage_switch_requested_ = false;
+    volatile bool playback_stop_requested_ = false;
     bool backend_switch_in_progress_ = false;         // True while migrating chunks between backends
     bool seek_blocked_for_switch_ = false;            // Block seeks during migration
     bool background_migration_in_progress_ = false;   // Copy remaining chunks after fast switch

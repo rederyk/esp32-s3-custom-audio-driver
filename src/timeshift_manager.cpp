@@ -204,6 +204,7 @@ bool TimeshiftManager::open(const char *uri)
     ready_chunks_.clear();
     pause_download_ = false;
     is_auto_paused_ = false;
+    playback_stop_requested_ = false;
     backend_switch_in_progress_ = false;
     seek_blocked_for_switch_ = false;
     background_migration_in_progress_ = false;
@@ -277,6 +278,7 @@ bool TimeshiftManager::open(const char *uri)
 void TimeshiftManager::close()
 {
     stop();
+    playback_stop_requested_ = false;
 
     // Clean up all chunks based on storage mode
     if (storage_mode_ == StorageMode::SD_CARD)
@@ -431,6 +433,8 @@ size_t TimeshiftManager::read(void *buffer, size_t size)
 {
     if (!is_open_)
         return 0;
+    if (playback_stop_requested_)
+        return 0;
 
     // --- ROBUSTO BUFFERING INIZIALE ---
     // Causa #5 & #6: Forziamo l'attesa di un buffer sano all'avvio.
@@ -443,6 +447,10 @@ size_t TimeshiftManager::read(void *buffer, size_t size)
 
         while (is_running_ && ready_chunks_.size() < MIN_CHUNKS_FOR_START)
         {
+            if (playback_stop_requested_)
+            {
+                return 0;
+            }
             if (millis() - start_wait > MAX_WAIT_MS)
             {
                 LOG_ERROR("Timeout waiting for initial buffer (%u chunks)", (unsigned)MIN_CHUNKS_FOR_START);
@@ -455,6 +463,10 @@ size_t TimeshiftManager::read(void *buffer, size_t size)
     // Se, dopo l'attesa, non ci sono chunk, è un errore grave o la fine dello stream.
     if (ready_chunks_.empty())
     {
+        if (playback_stop_requested_)
+        {
+            return 0;
+        }
         LOG_WARN("No ready chunks available for playback. End of stream?");
         return 0;
     }
@@ -530,6 +542,11 @@ bool TimeshiftManager::is_open() const
 const char *TimeshiftManager::uri() const
 {
     return uri_.c_str();
+}
+
+void TimeshiftManager::request_stop()
+{
+    playback_stop_requested_ = true;
 }
 
 size_t TimeshiftManager::buffered_bytes() const
@@ -2541,6 +2558,11 @@ bool TimeshiftManager::load_chunk_to_playback(uint32_t abs_chunk_id)
 
 size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void *buffer, size_t size)
 {
+    if (playback_stop_requested_)
+    {
+        return 0;
+    }
+
     size_t cached_bytes = 0;
     if (try_read_from_switch_cache(offset, buffer, size, cached_bytes))
     {
@@ -2571,7 +2593,7 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void *buffer, 
                 uint32_t wait_start = millis();
                 const uint32_t MAX_WAIT_MS = 3000;
 
-                while (is_running_ && (millis() - wait_start) < MAX_WAIT_MS)
+                while (!playback_stop_requested_ && is_running_ && (millis() - wait_start) < MAX_WAIT_MS)
                 {
                     xSemaphoreGive(mutex_);
                     vTaskDelay(pdMS_TO_TICKS(100));
@@ -2591,7 +2613,7 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void *buffer, 
                 }
 
                 // If still not found after waiting, it's a real problem
-                if (abs_chunk_id == INVALID_CHUNK_ABS_ID)
+                if (abs_chunk_id == INVALID_CHUNK_ABS_ID || playback_stop_requested_)
                 {
                     LOG_WARN("No chunk found for offset %u after waiting", (unsigned)offset);
                     return 0;
@@ -2647,6 +2669,11 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void *buffer, 
             auto_pause_callback_(true); // true = pause
         }
 
+        if (playback_stop_requested_)
+        {
+            return 0;
+        }
+
         if (!load_chunk_to_playback(abs_chunk_id))
         {
             LOG_ERROR("Failed to load chunk abs ID %u for playback", abs_chunk_id);
@@ -2675,6 +2702,10 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void *buffer, 
                     xSemaphoreGive(mutex_);
                     vTaskDelay(pdMS_TO_TICKS(auto_pause_delay_ms_));
                     xSemaphoreTake(mutex_, portMAX_DELAY);
+                    if (playback_stop_requested_)
+                    {
+                        return 0;
+                    }
                 }
 
                 // Verifica che ci siano abbastanza chunk pronti prima di riprendere
@@ -2684,11 +2715,17 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void *buffer, 
                     uint32_t start_wait = millis();
                     size_t target_chunks = ready_chunks_.size() + auto_pause_min_chunks_;
 
-                    while (ready_chunks_.size() < target_chunks && (millis() - start_wait) < MAX_WAIT_MS)
+                    while (!playback_stop_requested_ &&
+                           ready_chunks_.size() < target_chunks &&
+                           (millis() - start_wait) < MAX_WAIT_MS)
                     {
                         xSemaphoreGive(mutex_);
                         vTaskDelay(pdMS_TO_TICKS(100));
                         xSemaphoreTake(mutex_, portMAX_DELAY);
+                    }
+                    if (playback_stop_requested_)
+                    {
+                        return 0;
                     }
                 }
 
@@ -2699,6 +2736,10 @@ size_t TimeshiftManager::read_from_playback_buffer(size_t offset, void *buffer, 
                 xSemaphoreGive(mutex_);
                 auto_pause_callback_(false); // false = resume
                 xSemaphoreTake(mutex_, portMAX_DELAY);
+                if (playback_stop_requested_)
+                {
+                    return 0;
+                }
             }
         }
     }

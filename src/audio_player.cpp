@@ -443,6 +443,11 @@ void AudioPlayer::stop() {
         return;
     }
     String stopped_path = (stream_ && stream_->data_source()) ? stream_->data_source()->uri() : "";
+    const IDataSource* ds = (stream_) ? stream_->data_source() : nullptr;
+    if (ds) {
+        // Cooperative stop so blocking sources (e.g. timeshift) can exit immediately
+        const_cast<IDataSource*>(ds)->request_stop();
+    }
     stop_requested_ = true;
     pause_flag_ = false;
     wait_for_task_shutdown(2500);
