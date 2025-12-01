@@ -207,8 +207,8 @@ private:
     // Auto-pause callback for buffering
     std::function<void(bool)> auto_pause_callback_ = nullptr;  // Called when buffering required
     bool is_auto_paused_ = false;  // Track if we're in auto-pause state
-    uint32_t auto_pause_delay_ms_ = 1500;  // Delay before resuming (configurable)
-    size_t auto_pause_min_chunks_ = 2;      // Minimum chunks needed before resuming (configurable)
+    uint32_t auto_pause_delay_ms_ = 0;  // Delay before resuming (configurable)
+    size_t auto_pause_min_chunks_ = 0;      // Minimum chunks needed before resuming (configurable)
 
     // Seek Table (built incrementally)
     Mp3SeekTable seek_table_;
