@@ -6,6 +6,8 @@
 #include <cstdarg>
 #include <cstdio>
 
+namespace openespaudio {
+
 // Livello di logging corrente
 static LogLevel current_level = LogLevel::INFO;
 
@@ -30,3 +32,5 @@ void set_log_level(LogLevel level) {
 LogLevel get_log_level() {
     return current_level;
 }
+
+} // namespace openespaudio

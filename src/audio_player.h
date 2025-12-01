@@ -20,6 +20,7 @@
 #include "data_source_littlefs.h"
 #include "data_source_sdcard.h"
 #include "data_source_http.h"
+#include "audio_effects.h"
 
 enum class PlayerState {
     STOPPED,
@@ -117,6 +118,9 @@ bool select_source(std::unique_ptr<IDataSource> source);
     uint32_t current_bitrate() const;  // Current bitrate in kbps
     AudioFormat current_format() const;  // Current audio format
 
+    // Effects chain access
+    EffectsChain& getEffectsChain() { return effects_chain_; }
+
 private:
     // Task
     static void audio_task_entry(void *param);
@@ -187,4 +191,5 @@ private:
     // Components
     AudioOutput output_;
     Id3Parser id3_parser_;
+    EffectsChain effects_chain_;
 };

@@ -401,6 +401,7 @@ void AudioPlayer::start() {
     current_played_frames_ = 0;
     total_pcm_frames_ = stream_->total_frames();
     current_sample_rate_ = stream_->sample_rate();
+    effects_chain_.setSampleRate(current_sample_rate_);
 
     if (!playback_events_) {
         playback_events_ = xEventGroupCreate();
@@ -735,6 +736,9 @@ void AudioPlayer::audio_task() {
             }
 
             if (!pause_flag_) {
+                // Apply effects chain
+                effects_chain_.process(pcm_buffer, frames_decoded);
+
                 size_t frames_written = output_.write(pcm_buffer, frames_decoded, channels);
                 if (frames_written < frames_decoded) {
                      // Handle partial write or error if needed, but AudioOutput logs errors.

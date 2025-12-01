@@ -8,6 +8,11 @@
 #include <string>
 #include <vector>
 
+// Allow projects to provide their own SdCardDriver implementation
+#ifdef OPENESPAUDIO_USE_EXTERNAL_SD_DRIVER
+// Project must provide SdCardDriver class and SdCardEntry struct
+#else
+
 struct SdCardEntry {
     std::string name;
     bool isDirectory = false;
@@ -46,3 +51,5 @@ private:
     std::string card_type_str_;
     std::string last_error_;
 };
+
+#endif // OPENESPAUDIO_USE_EXTERNAL_SD_DRIVER

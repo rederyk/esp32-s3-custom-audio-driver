@@ -477,7 +477,7 @@ void setup()
     Serial.begin(115200);
     delay(1000);
     LOG_INFO("=== BOOT: Audio Player Ready. Use serial commands: h for help ===");
-    set_log_level(LogLevel::DEBUG); // Mostra tutte le chiamate do_seek
+    openespaudio::set_log_level(openespaudio::LogLevel::DEBUG); // Mostra tutte le chiamate do_seek
 
     if (!LittleFS.begin())
     {

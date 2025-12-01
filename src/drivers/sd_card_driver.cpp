@@ -2,6 +2,8 @@
 // Licensed under the MIT License. See LICENSE file for details.
 
 
+#ifndef OPENESPAUDIO_USE_EXTERNAL_SD_DRIVER
+
 #include "drivers/sd_card_driver.h"
 
 #include <Arduino.h>
@@ -10,7 +12,7 @@
 #include <cstring>
 #include <FS.h>
 
-#include "utils/logger.h"
+#include "logger.h"
 
 namespace {
 constexpr const char* MOUNT_POINT = "/sdcard";
@@ -52,12 +54,11 @@ bool SdCardDriver::begin() {
         // se non diversamente specificato. L'abilitazione dei pull-up è la vera modifica.
         if (!SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0, SD_D1, SD_D2, SD_D3)) {
             last_error_ = "Pin remap failed";
-            Logger::getInstance().error("[SD] Failed to configure SD_MMC pins (setPins is deprecated)");
+            openespaudio::log_message(openespaudio::LogLevel::ERROR, "[SD] Failed to configure SD_MMC pins (setPins is deprecated)\n");
         }
         pins_configured_ = true;
     }
 
-    auto& logger = Logger::getInstance();
     auto mountAttempt = [&](bool one_bit_mode) -> bool {
         // Ultimo tentativo: allineamo la chiamata a quella dell'esempio ufficiale,
         // usando il 5° parametro (ddr_mode_retries = 5) e una freq di 20MHz.
@@ -69,11 +70,11 @@ bool SdCardDriver::begin() {
     };
 
     if (!mountAttempt(false)) {
-        logger.warn("[SD] 4-line init failed, retrying in 1-bit mode");
+        openespaudio::log_message(openespaudio::LogLevel::WARN, "[SD] 4-line init failed, retrying in 1-bit mode\n");
         if (!mountAttempt(true)) {
             last_error_ = "Mount failed";
             mounted_ = false;
-            logger.warn("[SD] SD card mount failed - insert or re-seat card");
+            openespaudio::log_message(openespaudio::LogLevel::WARN, "[SD] SD card mount failed - insert or re-seat card\n");
             return false;
         }
     }
@@ -83,7 +84,7 @@ bool SdCardDriver::begin() {
     card_type_ = SD_MMC.cardType();
     updateCardTypeString();
     refreshStats();
-    logger.infof("[SD] Card mounted (%s)", card_type_str_.c_str());
+    openespaudio::log_message(openespaudio::LogLevel::INFO, "[SD] Card mounted (%s)\n", card_type_str_.c_str());
     return true;
 }
 
@@ -173,15 +174,15 @@ bool SdCardDriver::formatCard() {
         return false;
     }
 
-    Logger::getInstance().warn("[SD] Formatting card (deleting all files)");
+    openespaudio::log_message(openespaudio::LogLevel::WARN, "[SD] Formatting card (deleting all files)\n");
     bool ok = deleteRecursive("/");
     if (!ok) {
         last_error_ = "Failed to delete some entries";
-        Logger::getInstance().error("[SD] Format failed");
+        openespaudio::log_message(openespaudio::LogLevel::ERROR, "[SD] Format failed\n");
         return false;
     }
     refreshStats();
-    Logger::getInstance().info("[SD] Format completed");
+    openespaudio::log_message(openespaudio::LogLevel::INFO, "[SD] Format completed\n");
     return true;
 }
 
@@ -253,3 +254,5 @@ bool SdCardDriver::deleteRecursive(const char* path) {
     }
     return success;
 }
+
+#endif // OPENESPAUDIO_USE_EXTERNAL_SD_DRIVER
